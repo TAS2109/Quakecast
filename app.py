@@ -899,7 +899,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             # 気象庁のEEWと同じく「区域ごとの最大予想震度」を区域内の全観測点の値とする
             amx_all = np.full(max_a + 1, -99.0)
             np.maximum.at(amx_all, ST_AREA[ST_LAND], m01_p[ST_LAND])
-            pq_vals = np.where(ST_SEA, m01_p, amx_all[ST_AREA])   # 海域は自分自身の予想震度
+            pq_vals = np.where(ST_SEA, -9.0, amx_all[ST_AREA])    # 海域は予想震度の塗りつぶしの対象外
             vmax_e = float(m01_p[ST_LAND].max())
             cls_e, lb_max = shindo_class(vmax_e)
             if cls_e >= 7:            # 推定最大震度6弱以上 → 特別警報
@@ -1324,7 +1324,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="foot">
     距離減衰式による簡易推定です。実際の強震モニタ（実観測波形）や気象庁の発表とは異なります。防災・避難判断には使用しないでください。<br>
     Scratch作品「【複数対応】地震の到達時間シミュレーション v1.5.0β」のロジックを参考に作成。<br>
-    水色の輪＝海底観測点（data/seafloor.csv）。P波の検知には使いますが、区域別集計・警報対象・最大震度には含めません。<br>
+    海底観測点（data/seafloor.csv）も陸上と同じ見た目で表示します。区域別集計・警報対象・最大震度には含めません。<br>
     地図: Tiles © Esri
   </div>
 </div>
@@ -1656,12 +1656,6 @@ function draw(ts){
         for(let j=0;j<b.length;j++){ const i=b[j]; ctx.fillText(t,PX[i],PY[i]+0.5); }
       }
     }
-  }
-  if(SEAIDX.length){                                  // 海底観測点は水色の輪で区別
-    const rs=Math.max(r0,rn)+2.2;
-    ctx.beginPath(); ctx.lineWidth=1.4; ctx.strokeStyle='rgba(120,230,255,.95)';
-    for(let j=0;j<SEAIDX.length;j++){ const i=SEAIDX[j]; ctx.moveTo(PX[i]+rs,PY[i]); ctx.arc(PX[i],PY[i],rs,0,6.2832); }
-    ctx.stroke();
   }
   updateRank(ts);
   if(sim){
