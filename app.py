@@ -1842,7 +1842,20 @@ INDEX_HTML = r"""<!doctype html>
   #infoHead label{font-size:12px;color:var(--sub);display:flex;align-items:center;gap:5px}
   #infoHead input{width:auto}
   #iTime{font-size:13px;font-variant-numeric:tabular-nums;color:var(--sub);min-width:150px}
-  #infoBody{flex:1;overflow:auto;padding:14px 16px 40px}
+  #infoMain{flex:1;min-height:0;display:flex}
+  #infoMapCol{flex:1 1 55%;min-width:0;position:relative;border-right:1px solid var(--line)}
+  #imap{position:absolute;inset:0;background:#0b1220}
+  #imLegend{position:absolute;z-index:1000;left:10px;bottom:10px;display:flex;gap:3px;align-items:center;padding:5px 7px;
+    background:var(--panel);border:1px solid var(--line);border-radius:8px;font-size:11px;color:var(--sub)}
+  #imLegend .chip{min-width:0;padding:1px 5px;font-size:11px}
+  .imk{display:flex;align-items:center;justify-content:center;width:100%;height:100%;border:1px solid #0b1220;border-radius:5px;
+    font-size:11px;font-weight:800;line-height:1;box-shadow:0 0 0 1px #0008}
+  #infoBody{flex:1 1 45%;min-width:0;overflow:auto;padding:14px 16px 40px}
+  .itw{max-height:340px;overflow:auto}
+  .itbl{width:100%;border-collapse:collapse;font-size:12.5px}
+  .itbl th,.itbl td{padding:5px 12px;border-bottom:1px solid #222b3b;text-align:left}
+  .itbl th{position:sticky;top:0;background:var(--panel);font-size:11px;color:var(--sub);font-weight:700}
+  .itbl .num{text-align:right;font-variant-numeric:tabular-nums}
   #infoBody .wrap{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
   .iempty{color:var(--sub);font-size:13px;line-height:1.7;text-align:center;margin-top:60px}
   .igc{border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:hidden}
@@ -1869,6 +1882,9 @@ INDEX_HTML = r"""<!doctype html>
     #tabbar{top:50px;left:10px;right:auto}
     #infoView{padding-top:92px}
     #infoHead{padding-right:16px}
+    #infoMain{flex-direction:column}
+    #infoMapCol{flex:none;height:42%;border-right:none;border-bottom:1px solid var(--line)}
+    #infoBody{flex:1 1 auto}
     #panel{width:calc(100% - 20px);max-height:62%;top:92px;display:none}
     #panel.open{display:block}
     #toggle{display:block}
@@ -1941,7 +1957,10 @@ INDEX_HTML = r"""<!doctype html>
     <span id="iTime">—</span>
     <label><input id="infoAuto" type="checkbox" checked>更新時に自動で切り替え（強震モニタ表示中）</label>
   </div>
-  <div id="infoBody"></div>
+  <div id="infoMain">
+    <div id="infoMapCol"><div id="imap"></div><div id="imLegend"></div></div>
+    <div id="infoBody"></div>
+  </div>
 </div>
 
 <div id="hud">
@@ -2790,6 +2809,7 @@ function updateTsu(ts,st){
 const INFO_KIND={sokuho:'震度速報',gensen:'震源に関する情報',gs:'震源・震度に関する情報',kakuchi:'各地の震度に関する情報'};
 const TSU_TXT=['この地震による津波の心配はありません。','若干の海面変動があるかもしれませんが、被害の心配はありません。','津波警報等（大津波警報・津波警報・津波注意報）を発表中です。'];
 let curTab='mon', autoTimer=null, autoRet=null, infoSig='', infoCnt=0, infoPrev=null, infoUnread=0, seekStamp=-1e9, lastInfo=0;
+let imap=null, imLayer=null, imFitted=false, imState=null, AREAC=null, NAME2ID=null;
 try{ if(localStorage.getItem('infoAuto')==='0') $('infoAuto').checked=false; }catch(_){}
 $('infoAuto').addEventListener('change',()=>{ try{ localStorage.setItem('infoAuto',$('infoAuto').checked?'1':'0'); }catch(_){} });
 function renderBadge(){ const b=$('tabBadge'); b.textContent=infoUnread; b.style.display=(infoUnread>0&&curTab!=='info')?'block':'none'; }
@@ -2798,8 +2818,84 @@ function showTab(t,auto){
   curTab=t;
   $('infoView').style.display=t==='info'?'flex':'none';
   $('tabMon').classList.toggle('on',t==='mon'); $('tabInfo').classList.toggle('on',t==='info');
-  if(t==='info') infoUnread=0;
+  if(t==='info'){ infoUnread=0; ensureInfoMap(); }
   renderBadge();
+}
+/* ---------- 地震情報タブの地図 ---------- */
+// 区域の代表点: 区域内の陸上観測点の平均位置に最も近い観測点（海上や他区域に落ちないようにする）
+function areaCentroids(){
+  if(AREAC||!AREA||!N) return AREAC;
+  const sx={}, sy={}, c={};
+  for(let i=0;i<N;i++){ if(SEA&&SEA[i]) continue; const a=AREA[i]; sx[a]=(sx[a]||0)+SLON[i]; sy[a]=(sy[a]||0)+SLAT[i]; c[a]=(c[a]||0)+1; }
+  const best={};
+  for(let i=0;i<N;i++){
+    if(SEA&&SEA[i]) continue; const a=AREA[i];
+    const d=Math.pow(SLON[i]-sx[a]/c[a],2)+Math.pow(SLAT[i]-sy[a]/c[a],2);
+    if(!best[a]||d<best[a].d) best[a]={d:d,p:[SLAT[i],SLON[i]]};
+  }
+  AREAC={}; for(const a in best) AREAC[a]=best[a].p;
+  NAME2ID={}; for(const k in ANAMES) NAME2ID[ANAMES[k]]=k;
+  return AREAC;
+}
+function ensureInfoMap(){
+  if(!imap){
+    imap=L.map('imap',{zoomSnap:0.25,minZoom:4,maxZoom:11,worldCopyJump:false,zoomAnimation:false,markerZoomAnimation:false,fadeAnimation:false}).setView([36.3,137.6],5.5);
+    L.layerGroup([esri('Canvas/World_Dark_Gray_Base',ATTR_BASE),esri('Canvas/World_Dark_Gray_Reference','')]).addTo(imap);
+    imLayer=L.layerGroup().addTo(imap);
+    let lg='<span>震度</span>'; for(let c=1;c<=9;c++) lg+=chipHtml2(c);
+    $('imLegend').innerHTML=lg;
+  }
+  setTimeout(()=>{ imap.invalidateSize(); drawInfoMap(); },0);
+}
+function chipHtml2(c){ return '<span class="chip" style="background:'+clsColor(c)+';color:'+((c===2||c===3)?'#111':'#fff')+'">'+CLASS_LABEL[c]+'</span>'; }
+window.addEventListener('resize',()=>{ if(imap&&curTab==='info') imap.invalidateSize(); });
+// 公開済みの情報から、地図と表に出す内容（区域ごとの震度・震源）をまとめる
+function infoState(vis){
+  const gs=sim.info.groups, areas=new Map(), epis=[];
+  gs.forEach((G,gi)=>{
+    const rel=G.releases.slice(0,vis[gi]); if(!rel.length) return;
+    let ms=null, ar=null;
+    for(let k=rel.length-1;k>=0;k--){
+      if(!ms&&rel[k].mem) ms=rel[k].mem;
+      if(!ar&&rel[k].areas) ar=rel[k];
+      if(ms&&ar) break;
+    }
+    (ms||[]).forEach(m=>epis.push({m:m,gi:gi}));
+    if(ar) ar.areas.forEach(a=>{
+      const o=areas.get(a[0]), n=a.length>3?a[3]:null;
+      if(!o||a[1]>o.c||(a[1]===o.c&&a[2]>o.v)) areas.set(a[0],{c:a[1],v:a[2],n:n});
+    });
+  });
+  return {areas:areas,epis:epis};
+}
+function tableHtml(st){
+  const rows=Array.from(st.areas.entries()).sort((a,b)=>b[1].c-a[1].c||b[1].v-a[1].v||(a[0]<b[0]?-1:1));
+  if(!rows.length) return '';
+  const hasN=rows.some(r=>r[1].n!=null);
+  return '<div class="igc"><div class="igh"><span class="gt">各地の震度（区域別）</span><span class="gs">'+rows.length+'区域（最新の発表内容）</span></div>'
+    +'<div class="itw"><table class="itbl"><tr><th>震度</th><th>区域</th><th class="num">計測震度</th>'+(hasN?'<th class="num">観測点数</th>':'')+'</tr>'
+    +rows.map(r=>'<tr><td>'+chipHtml(r[1].c)+'</td><td>'+escH(r[0])+'</td><td class="num">'+r[1].v.toFixed(1)+'</td>'
+      +(hasN?'<td class="num">'+(r[1].n!=null?r[1].n:'')+'</td>':'')+'</tr>').join('')
+    +'</table></div></div>';
+}
+function drawInfoMap(){
+  if(!imap) return;
+  imLayer.clearLayers();
+  const st=imState; if(!st||!areaCentroids()) return;
+  const pts=[];
+  Array.from(st.areas.entries()).sort((a,b)=>a[1].c-b[1].c).forEach(r=>{
+    const nm=r[0], o=r[1], id=NAME2ID[nm], c=id!=null?AREAC[id]:null; if(!c) return;
+    const ic=L.divIcon({className:'',html:'<div class="imk" style="background:'+clsColor(o.c)+';color:'+((o.c===2||o.c===3)?'#111':'#fff')+'">'+CLASS_LABEL[o.c]+'</div>',iconSize:[o.c>=5?30:24,18],iconAnchor:[o.c>=5?15:12,9]});
+    L.marker(c,{icon:ic,keyboard:false,zIndexOffset:o.c*10}).bindTooltip(escH(nm)+'　震度'+CLASS_LABEL[o.c]+(o.n!=null?'（'+o.n+'点）':'')).addTo(imLayer);
+    pts.push(c);
+  });
+  st.epis.forEach(e=>{
+    const m=e.m;
+    L.marker([m.lat,m.lon],{icon:epiIcon(e.gi),keyboard:false,zIndexOffset:1000})
+      .bindTooltip(escH(m.epi)+'　M'+m.mag.toFixed(1)+'　深さ'+(m.depth<1?'ごく浅い':'約'+m.depth+'km')).addTo(imLayer);
+    pts.push([m.lat,m.lon]);
+  });
+  if(!imFitted&&pts.length){ imFitted=true; imap.fitBounds(L.latLngBounds(pts).pad(0.25),{maxZoom:8,animate:false}); }
 }
 $('tabMon').onclick=()=>showTab('mon',false);
 $('tabInfo').onclick=()=>showTab('info',false);
@@ -2858,7 +2954,7 @@ function updateInfo(ts){
   if((ts||0)-lastInfo<150) return; lastInfo=ts||0;
   const box=$('infoBody');
   if(!sim||!sim.info){
-    if(infoSig!=='empty'){ box.innerHTML='<div class="iempty">強震モニタ画面でシミュレーションを実行すると、ここに震度速報・地震情報が発表されます。<br>（実行ボタンはこの画面の上にもあります）</div>'; infoSig='empty'; }
+    if(infoSig!=='empty'){ box.innerHTML='<div class="iempty">強震モニタ画面でシミュレーションを実行すると、ここに震度速報・地震情報が発表されます。<br>（実行ボタンはこの画面の上にもあります）</div>'; infoSig='empty'; imState=null; drawInfoMap(); }
     return;
   }
   const gs=sim.info.groups;
@@ -2874,9 +2970,11 @@ function updateInfo(ts){
   infoSig=sig;
   const prev=(grew&&infoPrev&&infoPrev.length===vis.length)?infoPrev:null;
   const order=gs.map((g,i)=>i).filter(i=>vis[i]>0).sort((a,b)=>gs[b].t0-gs[a].t0);   // 新しい地震を上に
-  box.innerHTML='<div class="wrap">'+(order.length?order.map(i=>groupHtml(i,vis[i],prev?prev[i]:null)).join('')
+  imState=infoState(vis);
+  box.innerHTML='<div class="wrap">'+tableHtml(imState)+(order.length?order.map(i=>groupHtml(i,vis[i],prev?prev[i]:null)).join('')
     :'<div class="iempty">まだ情報は発表されていません。</div>')+'</div>';
   infoPrev=vis.slice();
+  drawInfoMap();
 }
 
 function tick(ts){
@@ -2942,7 +3040,7 @@ $('run').onclick=async()=>{
       // 地震動の計算範囲(tSeis)の後ろに、津波・地震情報の発表が終わるまで時間軸を延長する
       v.tSeis=v.tEnd; v.hasTsu=(v.tsuEnd||0)>v.tEnd+1;
       { const ext=Math.max(v.tsuEnd||0,(v.info&&v.info.end)||0); v.tsuExt=ext>v.tEnd+1; if(v.tsuExt) v.tEnd=ext; }
-      infoCnt=0; infoSig=''; infoPrev=null; infoUnread=0; renderBadge();
+      infoCnt=0; infoSig=''; infoPrev=null; infoUnread=0; imFitted=false; imState=null; drawInfoMap(); renderBadge();
       simClock0=Date.now();
       sim=v; tcur=0; buildEewCards(v.quakes.length);
       $('seek').disabled=false; $('seek').max=v.tsuExt?2000:Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
