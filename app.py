@@ -673,7 +673,7 @@ INDEX_HTML = r"""<!doctype html>
   .epi{color:#ff4d4d;font-size:26px;font-weight:900;text-shadow:0 0 4px #000,0 0 8px #000;
     line-height:26px;text-align:center}
   .foot{font-size:10.5px;color:var(--sub);line-height:1.55;margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
-  #rightcol{position:absolute;z-index:1000;right:10px;top:56px;width:310px;max-height:calc(100% - 170px);
+  #rightcol{position:absolute;z-index:1000;right:10px;top:56px;width:350px;max-height:calc(100% - 170px);
     overflow:auto;display:flex;flex-direction:column;gap:8px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.5}
   .card h3{margin:0 0 5px;font-size:11.5px;color:var(--sub);font-weight:600}
@@ -683,7 +683,22 @@ INDEX_HTML = r"""<!doctype html>
   #eewcard .t{font-size:15px;font-weight:800}
   #eewcard .rg{display:inline-block;margin:2px 10px 2px 0;white-space:nowrap}
   #eewcard .rg i{font-style:normal;font-weight:700;margin-left:3px}
-  #eewcard table.hist{margin-top:5px}
+  #eewcard .eh{display:flex;align-items:center;gap:10px;margin-bottom:6px;height:32px}
+  #eewcard .lvbadge{font-size:19px;font-weight:800;padding:2px 10px;border-radius:7px;background:#0006;min-width:112px;text-align:center}
+  #eewcard .eno{font-size:15px;font-weight:700}
+  #eewcard .tiles{display:grid;grid-template-columns:1.15fr 1.1fr .85fr;gap:6px}
+  #eewcard .tile{background:#0005;border-radius:8px;padding:4px 4px 2px;text-align:center;height:78px;overflow:hidden}
+  #eewcard .tile .k{font-size:10.5px;color:#cfd8ea}
+  #eewcard .tile .v{font-size:36px;font-weight:800;line-height:1.3;font-variant-numeric:tabular-nums;white-space:nowrap}
+  #eewcard #eewDep{font-size:28px;line-height:1.5}
+  #eewcard #eewDep small{font-size:13px;margin-left:2px;font-weight:600}
+  #eewcard .chipbig{display:inline-block;min-width:56px;border-radius:9px;padding:0 8px;font-size:30px;line-height:1.3;color:#fff;text-shadow:0 0 3px #000a}
+  #eewcard .pos{margin-top:6px;height:18px;font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap}
+  #eewcard .aretitle{margin-top:4px;font-size:11px;color:#cfd8ea}
+  #eewcard .areas{height:64px;overflow:auto;font-size:12.5px}
+  #eewcard .histbox{height:84px;overflow:hidden;margin-top:4px}
+  #eewcard table.hist{margin-top:0}
+  #eewcard table.hist td{border-bottom:none}
   #eewcard table.hist td{font-size:11px;padding:1px 4px;color:var(--sub)}
   #eewcard.lv1{background:#12304fee;border-color:#3b9cff}
   #eewcard.lv2{background:#7a1010ee;border-color:#ff4d4d;animation:eewb 1s infinite}
@@ -747,7 +762,17 @@ INDEX_HTML = r"""<!doctype html>
 <div id="rightcol">
   <div id="eewcard" class="card lv0">
     <h3>緊急地震速報</h3>
-    <div id="eewbody"><div class="sub">シミュレーション実行後に表示</div></div>
+    <div class="eh"><span id="eewLv" class="lvbadge">待機中</span><span id="eewNo" class="eno"></span></div>
+    <div class="tiles">
+      <div class="tile"><div class="k">予想最大震度</div><div class="v" id="eewMax"><span class="chipbig" style="background:#3a4357">-</span></div></div>
+      <div class="tile"><div class="k">マグニチュード</div><div class="v" id="eewMag">-</div></div>
+      <div class="tile"><div class="k">深さ</div><div class="v" id="eewDep">-</div></div>
+    </div>
+    <div class="pos" id="eewPos">シミュレーション実行後に表示</div>
+    <div class="aretitle">強い揺れ（震度4以上）の予想地域</div>
+    <div id="eewAreas" class="areas"></div>
+    <div class="histbox"><table id="eewHist" class="hist"></table></div>
+    <div class="sub">黄色の○＋＝EEW推定震源／赤✕＝設定した震源</div>
   </div>
   <div id="rank" class="card">
     <h3>リアルタイム震度ランキング（区域別）</h3>
@@ -781,6 +806,7 @@ const $ = id => document.getElementById(id);
 const CLASS_RGB = [[105,105,113],[44,142,176],[76,208,165],[246,202,81],[254,153,55],
                    [228,42,24],[195,26,29],[165,12,107],[146,11,122],[95,13,161]];
 const CLASS_LABEL = ['0','1','2','3','4','5弱','5強','6弱','6強','7'];
+const NUM_LABEL = ['0','1','2','3','4','5-','5+','6-','6+','7'];
 const STOPS = [[-3.5,10,14,36],[-3.0,20,30,70],[-2.0,24,52,120],[-1.0,28,86,176],[0.0,34,124,222],
   [0.5,40,168,226],[1.0,44,190,190],[2.0,76,208,165],[3.0,246,202,81],[4.0,254,153,55],
   [4.75,228,42,24],[5.25,195,26,29],[5.75,165,12,107],[6.25,146,11,122],[6.75,95,13,161],[7.5,70,10,150]];
@@ -933,14 +959,26 @@ function draw(ts){
     let k=Math.round((v-LUT_MIN)/LUT_STEP); if(k<0)k=0; if(k>=LUT_N)k=LUT_N-1;
     buckets[k].push(i);
   }
+  // 震度1以上の観測点は「円の中に震度階級の数字」で表示（ズームに応じて円を拡大）
+  const rn=Math.min(16,5.5+(z-4)*1.2), showTxt=rn>=6.5;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
   for(let k=0;k<LUT_N;k++){
     const b=buckets[k]; if(!b.length) continue;
     const v=LUT_MIN+k*LUT_STEP;
-    const r=r0*(v<0?0.85:v<2?1.0:v<4?1.2:v<5?1.45:1.75);
+    const num=v>=0.49, cl=num?shindoCls(v+0.01):0;
+    const r=num?rn*(cl>=5?1.2:1.0):r0*(v<0?0.85:1.0);
     ctx.fillStyle=LUT[k]; ctx.beginPath();
     for(let j=0;j<b.length;j++){ const i=b[j]; ctx.moveTo(PX[i]+r,PY[i]); ctx.arc(PX[i],PY[i],r,0,6.2832); }
     ctx.fill();
-    if(v>=4.5){ ctx.strokeStyle='rgba(255,255,255,.55)'; ctx.lineWidth=0.8; ctx.stroke(); }
+    if(num){
+      ctx.strokeStyle='rgba(255,255,255,.85)'; ctx.lineWidth=1; ctx.stroke();
+      if(showTxt){
+        ctx.font='bold '+Math.round(r*(cl>=5?1.0:1.25))+'px sans-serif';
+        ctx.fillStyle=(cl===2||cl===3)?'#111':'#fff';
+        const t=NUM_LABEL[cl];
+        for(let j=0;j<b.length;j++){ const i=b[j]; ctx.fillText(t,PX[i],PY[i]+0.5); }
+      }
+    }
   }
   updateRank(ts);
   if(sim){
@@ -972,41 +1010,45 @@ function updateRank(ts){
   });
   $('rankTbl').innerHTML=h||'<tr><td style="color:#93a0b8">震度1以上の観測なし</td></tr>';
 }
-const EEW_LBL=['','予報','警報','特別警報'];
+const EEW_LBL=['待機中','予報','警報','特別警報'];
+function eewSet(id,html){ const el=$(id); if(el._h!==html){ el.innerHTML=html; el._h=html; } }
 function updateEew(){
-  const card=$('eewcard'), body=$('eewbody'), e=sim.eew;
+  const card=$('eewcard'), e=sim.eew;
   let cur=null, lvmax=0;
   if(e){ for(let i=0;i<e.reports.length;i++){ const r=e.reports[i]; if(r.t>tcur) break; cur=r; if(r.lv>lvmax) lvmax=r.lv; } }
   eewCur=cur;
-  let h;
   if(!cur){
     card.className='card lv0';
-    h='<div class="sub">'+(e?'観測点でP波を検知中…（発表前）':'発表基準に達しませんでした')+'</div>';
-  }else{
-    card.className='card lv'+lvmax;
-    h='<div class="t">緊急地震速報（'+EEW_LBL[lvmax]+'）第'+cur.no+'報'+(cur.final?'（最終）':'')+'</div>';
-    h+='<div>推定震源 北緯'+cur.lat.toFixed(1)+'° 東経'+cur.lon.toFixed(1)+'° 深さ'+cur.depth+'km</div>';
-    h+='<div>規模 <b>M'+cur.mag.toFixed(1)+'</b> ／ 予想最大震度 <b>'+cur.maxLabel+'</b> ／ 検知 '+cur.nSt+'点</div>';
-    if(lvmax>=2){
-      if(cur.areas.length){
-        h+='<div style="margin-top:4px">強い揺れ（震度4以上）が予想される地域</div><div>';
-        cur.areas.slice(0,10).forEach(a=>{
-          const rem=(a.ts==null)?null:a.ts-tcur;
-          const s=(rem==null)?'':(rem>0?'あと'+Math.ceil(rem)+'秒':'主要動到達');
-          h+='<span class="rg">'+a.name+'<i>'+a.label+'</i> '+s+'</span>';
-        });
-        if(cur.areas.length>10) h+='<span class="rg">ほか'+(cur.areas.length-10)+'区域</span>';
-        h+='</div><div style="font-weight:700">強い揺れに警戒してください。</div>';
-      }
-    }else{
-      h+='<div>今後の情報に注意してください。</div>';
-    }
-    const hist=e.reports.filter(r=>r.t<=tcur).slice(-6).reverse();
-    h+='<table class="hist"><tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
-      +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+r.mag.toFixed(1)+'</td><td>'+r.depth+'km</td><td>'+r.maxLabel+'</td></tr>').join('')+'</table>';
-    h+='<div class="sub">黄色の○＋＝EEW推定震源／赤✕＝設定した震源</div>';
+    eewSet('eewLv',e?'発表前':'発表なし'); eewSet('eewNo','');
+    eewSet('eewMax','<span class="chipbig" style="background:#3a4357">-</span>');
+    eewSet('eewMag','-'); eewSet('eewDep','-');
+    eewSet('eewPos',e?'観測点でP波を検知中…':'発表基準に達しませんでした');
+    eewSet('eewAreas',''); eewSet('eewHist','');
+    return;
   }
-  if(body._h!==h){ body.innerHTML=h; body._h=h; }
+  card.className='card lv'+lvmax;
+  eewSet('eewLv',EEW_LBL[lvmax]);
+  eewSet('eewNo','第'+cur.no+'報'+(cur.final?'（最終）':''));
+  const tc=(cur.maxCls===2||cur.maxCls===3)?'#111':'#fff';
+  eewSet('eewMax','<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
+  eewSet('eewMag','M'+cur.mag.toFixed(1));
+  eewSet('eewDep',cur.depth+'<small>km</small>');
+  eewSet('eewPos','推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点');
+  let ah='';
+  if(lvmax>=2){
+    if(cur.areas.length){
+      cur.areas.slice(0,12).forEach(a=>{
+        const rem=(a.ts==null)?null:a.ts-tcur;
+        const s=(rem==null)?'':(rem>0?'あと'+Math.ceil(rem)+'秒':'主要動到達');
+        ah+='<span class="rg">'+a.name+'<i>'+a.label+'</i> '+s+'</span>';
+      });
+      if(cur.areas.length>12) ah+='<span class="rg">ほか'+(cur.areas.length-12)+'区域</span>';
+    }else ah='<span class="sub">該当地域なし</span>';
+  }else ah='<span class="sub">強い揺れは予想されていません。今後の情報に注意。</span>';
+  eewSet('eewAreas',ah);
+  const hist=e.reports.filter(r=>r.t<=tcur).slice(-4).reverse();
+  eewSet('eewHist','<tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
+    +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+r.mag.toFixed(1)+'</td><td>'+r.depth+'km</td><td>'+r.maxLabel+'</td></tr>').join(''));
 }
 
 function tick(ts){
