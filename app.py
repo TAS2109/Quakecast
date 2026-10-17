@@ -2201,7 +2201,7 @@ function draw(ts){
   updateRank(ts);
   if(sim){
     updateEew();
-    { const tsuS=tsuState(tcur); drawTsuCoast(tsuS,z); updateTsu(ts,tsuS); }
+    { const tsuS=tsuState(tcur); drawTsuCoast(tsuS,z); drawTsuBars(tsuS,z); updateTsu(ts,tsuS); }
     sim.quakes.forEach(q=>{                             // 各地震の実際のP波・S波（発生後のみ）
       const tl=tcur-q.delay; if(tl<0) return;
       drawCircle(q.lat,q.lon,interp(q.P,tl),'rgba(90,200,255,.95)',1.6);
@@ -2323,6 +2323,11 @@ function updateEewCard(qk,i){
 /* ---------- 津波警報・注意報・津波情報 ---------- */
 const TSU_LV=['','津波予報','津波注意報','津波警報','大津波警報'];
 const TSU_COL=['#555','#6cc8ff','#ffd23b','#ff3030','#c04bff'];
+const TSU_MSG={
+  4:'大津波警報を発表しました。巨大な津波が襲来します。ただちに高台や避難ビルなど安全な場所へ避難してください。',
+  3:'津波警報を発表しました。津波が襲来します。ただちに海岸から離れ、高台や避難ビルなど安全な場所へ避難してください。',
+  2:'津波注意報を発表しました。海の中や海岸付近は危険です。海の中にいる人はただちに海から上がって、海岸から離れてください。',
+  1:'若干の海面変動が予想されますが、被害の心配はありません。'};
 let simClock0=Date.now();
 const pad2=n=>('0'+n).slice(-2);
 function clk(t){ const d=new Date(simClock0+t*1000); return pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds()); }
@@ -2335,25 +2340,32 @@ function sToT(s){ if(!sim.tsuExt) return s/10;
   if(s<=1000) return s/1000*sim.tSeis;
   return sim.tSeis+(s-1000)/1000*(sim.tEnd-sim.tSeis); }
 function tsuState(t){
-  const list=new Map(), obs=new Map(); let last=null, any=false;
-  for(const qk of sim.quakes){
+  // 報の番号は地震ごとに1から振られているため、複数の地震があると「第1報」の表示が
+  // 更新されない。全地震の報を発表時刻順に通し番号(gno)で数え直し、最新の報を last とする。
+  const list=new Map(), obs=new Map(); let last=null, any=false, gno=0;
+  for(let qi=0;qi<sim.quakes.length;qi++){
+    const qk=sim.quakes[qi];
     const T=qk.tsu; if(!T||!T.reports.length) continue; any=true;
-    let cur=null; for(const r of T.reports){ if(r.t>t) break; cur=r; }
+    let cur=null;
+    for(const r of T.reports){
+      if(r.t>t) break; cur=r; gno++;
+      if(!last||r.t>=last.t) last=Object.assign({},r,{qi:qi});
+    }
     if(cur){
-      if(!last||cur.t>last.t) last=cur;
       for(const a of cur.areas){ const e=list.get(a.i);
         if(!e) list.set(a.i,{i:a.i,lv:a.lv,hl:a.hl,ts:a.ts,imm:a.imm});
         else{ if(a.lv>e.lv){ e.lv=a.lv; e.hl=a.hl; } if(a.ts<e.ts) e.ts=a.ts; e.imm=e.imm||a.imm; } }
     }
     for(const o of T.obs){
       if(t<o.m[0][0]) continue;
-      let e=obs.get(o.a); if(!e){ e={ft:o.m[0][0],mx:0,mt:0,fin:false}; obs.set(o.a,e); }
-      for(const x of o.m){ if(x[0]<=t&&x[1]>e.mx){ e.mx=x[1]; e.mt=x[0]; } }
+      let e=obs.get(o.a); if(!e){ e={ft:o.m[0][0],mx:0,mt:0,fin:false,segs:[]}; obs.set(o.a,e); }
+      const vis=o.m.filter(x=>x[0]<=t), lv=vis[vis.length-1];
+      if(lv && lv[1]>e.mx){ e.mx=lv[1]; e.mt=lv[0]; e.segs=vis.map(x=>x[1]); }   // segs: 観測ごとの累積最大波高（棒グラフの段）
       if(t>=o.pk) e.fin=true;
     }
   }
   const arr=Array.from(list.values()); arr.sort((p,q)=>q.lv-p.lv||p.ts-q.ts);
-  return {list:arr,obs,last,any};
+  return {list:arr,obs,last,any,gno};
 }
 /* ---------- 津波予報区の海岸線（data/tsunami_areas.geojson があるときだけ使用） ----------
    予報区名で TSU_AREAS と突き合わせ、海岸線に沿って色を付ける。
@@ -2363,25 +2375,91 @@ function loadTsuGeo(){
   fetch('/api/tsunami_geojson').then(r=>r.ok?r.json():null).then(gj=>{ if(gj&&gj.features) TSUGEO_RAW=gj; }).catch(()=>{});
 }
 function buildTsuGeo(){
-  const norm=s=>String(s||'').normalize('NFKC').replace(/\s+/g,'');
-  const byName={}; sim.tsuAreas.forEach((a,i)=>{ byName[norm(a[0])]=i; });
+  const norm=s=>String(s||'').normalize('NFKC').replace(/[\s・･·、,，]/g,'');
+  const AR=sim.tsuAreas, byName={}; AR.forEach((a,i)=>{ byName[norm(a[0])]=i; });
   const KEYS=['name','Name','NAME','area_name','AREA_NAME','regionName','Area','area','津波予報区名','予報区名','名称'];
-  const out={}; let hit=0;
+  const linesOf=g=>g.type==='LineString'?[g.coordinates]:g.type==='MultiLineString'?g.coordinates
+    :g.type==='Polygon'?g.coordinates:g.type==='MultiPolygon'?[].concat(...g.coordinates):[];
+  const out={}, left=[], skipped=[]; let hit=0;
   for(const f of TSUGEO_RAW.features){
-    const p=f.properties||{}, g=f.geometry; let id=null;
-    for(const k of KEYS){ if(p[k]!=null && byName[norm(p[k])]!=null){ id=byName[norm(p[k])]; break; } }
-    if(id==null||!g) continue;
-    let lines=[];
-    if(g.type==='LineString') lines=[g.coordinates];
-    else if(g.type==='MultiLineString') lines=g.coordinates;
-    else if(g.type==='Polygon') lines=g.coordinates;
-    else if(g.type==='MultiPolygon') lines=[].concat(...g.coordinates);
-    lines=lines.filter(l=>l.length>=2);
-    if(!lines.length) continue;
+    const p=f.properties||{}, g=f.geometry;
+    let id=null, nm='';
+    for(const k of KEYS){ if(p[k]!=null){ if(!nm) nm=String(p[k]); if(byName[norm(p[k])]!=null){ id=byName[norm(p[k])]; break; } } }
+    const lines=g?linesOf(g).filter(l=>l.length>=2):[];
+    if(!lines.length){ skipped.push(nm||'(名称なし)'); continue; }
+    if(id==null){ left.push({nm:nm,lines:lines}); continue; }
     (out[id]=out[id]||[]).push(...lines); hit++;
   }
-  TSUGEO=out;
-  console.log('tsunami_areas.geojson: '+hit+'/'+TSUGEO_RAW.features.length+' features matched, '+Object.keys(out).length+'/'+sim.tsuAreas.length+' areas');
+  // 名前が一致しなかった予報区は、(1)名称の部分一致 (2)代表点に最も近い余りの海岸線 の順で割り当てる
+  const fuzzy=[];
+  for(let i=0;i<AR.length;i++){
+    if(out[i]) continue;
+    const n=norm(AR[i][0]);
+    const k=left.findIndex(L=>{ const m=norm(L.nm); return m&&(m.includes(n)||n.includes(m)); });
+    if(k>=0){ out[i]=left[k].lines; fuzzy.push(AR[i][0]+' ← '+left[k].nm+'（名称の部分一致）'); left.splice(k,1); }
+  }
+  const dkm=(i,lines)=>{ const la=AR[i][1], lo=AR[i][2], kx=111.32*Math.cos(la*Math.PI/180); let b=1e9;
+    for(const l of lines) for(const c of l){ const d=Math.hypot((c[0]-lo)*kx,(c[1]-la)*110.57); if(d<b) b=d; } return b; };
+  const pairs=[];
+  for(let i=0;i<AR.length;i++){ if(out[i]) continue; left.forEach((L,k)=>pairs.push([dkm(i,L.lines),i,k])); }
+  pairs.sort((a,b)=>a[0]-b[0]);
+  const usedI=new Set(), usedK=new Set();
+  for(const [d,i,k] of pairs){
+    if(d>60||usedI.has(i)||usedK.has(k)) continue;
+    out[i]=left[k].lines; usedI.add(i); usedK.add(k);
+    fuzzy.push(AR[i][0]+' ← '+left[k].nm+'（最寄り '+Math.round(d)+'km）');
+  }
+  TSUGEO=out; TSU_ANCH={};
+  console.log('tsunami_areas.geojson: '+hit+'/'+TSUGEO_RAW.features.length+' features matched by name, '+Object.keys(out).length+'/'+AR.length+' areas have a coastline');
+  if(fuzzy.length) console.log('tsunami_areas.geojson: 名称が違うが割り当てた予報区:\n  '+fuzzy.join('\n  '));
+  const noGeo=AR.map(a=>a[0]).filter((n,i)=>!out[i]);
+  if(noGeo.length) console.warn('tsunami_areas.geojson: 海岸線が見つからない予報区（代表点マーカーで表示）:',noGeo);
+  const unused=left.filter((L,k)=>!usedK.has(k)).map(L=>L.nm);
+  if(unused.length) console.warn('tsunami_areas.geojson: どの予報区にも対応しなかった feature:',unused);
+  if(skipped.length) console.warn('tsunami_areas.geojson: 線・面の形状が無く使えなかった feature:',skipped);
+}
+
+/* ---------- 津波観測値の棒グラフ（観測地点から上へ積み上がる） ---------- */
+let TSU_ANCH={};
+function tsuAnchor(i){                                   // 観測地点 [lat,lon]: 海岸線があればその中ほど、無ければ代表点
+  if(TSU_ANCH[i]) return TSU_ANCH[i];
+  const a=sim.tsuAreas[i]; let r=[a[1],a[2]];
+  const L=TSUGEO&&TSUGEO[i];
+  if(L&&L.length){ let b=L[0]; for(const l of L) if(l.length>b.length) b=l; const m=b[Math.floor(b.length/2)]; r=[m[1],m[0]]; }
+  return (TSU_ANCH[i]=r);
+}
+const tsuBarColor=h=>h>=3?TSU_COL[4]:h>=1?TSU_COL[3]:h>=0.2?TSU_COL[2]:TSU_COL[1];
+const tsuBarPx=h=>h<=0?0:(h<=6?Math.max(3,h*13):78+Math.log2(h/6)*14);   // 6mまで13px/m、それ以上は対数で圧縮
+function drawTsuBars(st,z){
+  if(!st.obs.size) return;
+  if(TSUGEO_RAW && !TSUGEO) buildTsuGeo();
+  const bw=Math.max(7,Math.min(14,(z-3)*2.2));
+  const items=[];
+  for(const [i,o] of st.obs){
+    if(!(o.mx>0)||!o.segs||!o.segs.length) continue;
+    items.push([i,o,map.latLngToContainerPoint(tsuAnchor(i))]);
+  }
+  items.sort((p,q)=>p[2].y-q[2].y);                      // 画面の下（手前）の棒を上に重ねる
+  ctx.save(); ctx.textAlign='center'; ctx.textBaseline='bottom'; ctx.font='bold 11px sans-serif';
+  for(const [i,o,p] of items){
+    const x=Math.round(p.x-bw/2), y0=p.y;
+    let prev=0;
+    for(const h of o.segs){                              // 観測のたびに1段ずつ積み上がる（段の色はその時点の波高の階級）
+      if(h<=prev) continue;
+      const ya=y0-tsuBarPx(prev), yb=y0-tsuBarPx(h);
+      ctx.fillStyle=tsuBarColor(h); ctx.fillRect(x,yb,bw,ya-yb);
+      ctx.strokeStyle='rgba(0,0,0,.85)'; ctx.lineWidth=1; ctx.strokeRect(x+.5,yb+.5,bw-1,Math.max(ya-yb-1,0));
+      prev=h;
+    }
+    ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(p.x,y0,2.5,0,6.2832); ctx.fill();
+    ctx.strokeStyle='#000'; ctx.lineWidth=1; ctx.stroke();
+    if(z>=5.5){
+      const ty=y0-tsuBarPx(o.mx)-2, txt=o.mx.toFixed(1)+'m';
+      ctx.lineWidth=3; ctx.strokeStyle='rgba(0,0,0,.85)'; ctx.strokeText(txt,p.x,ty);
+      ctx.fillStyle='#fff'; ctx.fillText(txt,p.x,ty);
+    }
+  }
+  ctx.restore();
 }
 function drawTsuCoast(st,z){
   if(!st.list.length) return;
@@ -2459,11 +2537,13 @@ function updateTsu(ts,st){
   else if(st.last&&st.last.kind==='none') lab='津波の心配なし';
   else lab='発表前';
   let h='<div class="th"><span class="tt">津波警報・注意報・津波情報</span><span class="tb" style="color:'+(top===2?'#ffd23b':'#fff')+'">'+lab+'</span>'
-    +(st.last?'<span class="tm">第'+st.last.no+'報</span>':'')+'</div>';
+    +(st.last?'<span class="tm">第'+st.gno+'報</span>':'')+'</div>';
   if(st.last){
-    const r=st.last;
-    h+='<div class="tm">発表 '+clk(r.t)+(r.giant?'　※巨大地震（M8を超える）':'　M'+r.mag.toFixed(1))+'</div>'
-      +'<div class="tx">'+r.text+'</div>';
+    const r=st.last, many=sim.quakes.length>1;
+    // 発令・続報の文面は、全地震を合わせた現在の最高階級に合わせる（地震ごとの文面だと他の地震の警報と食い違うため）
+    const txt=((r.kind==='issue'||r.kind==='update')&&top)?TSU_MSG[top]:r.text;
+    h+='<div class="tm">発表 '+clk(r.t)+(many?'　地震'+(r.qi+1):'')+(r.giant?'　※巨大地震（M8を超える）':'　M'+r.mag.toFixed(1))+'</div>'
+      +'<div class="tx">'+txt+'</div>';
   }else h+='<div class="tx" style="color:#93a0b8">地震発生から約3分で第1報を発表します</div>';
   if(st.list.length){
     h+='<div class="tw"><table><tr style="color:#93a0b8"><td>予報区</td><td></td><td>予想高さ</td><td>到達予想</td><td>観測</td></tr>';
