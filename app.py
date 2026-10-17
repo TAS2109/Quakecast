@@ -329,6 +329,77 @@ def _build_area_geo():
 
 AREA_GEO = _build_area_geo()
 
+# ---------------------------------------------------------------------
+# 海底観測網（S-net・DONET・N-net・気象庁の海底地震計など）: data/seafloor.csv（任意）
+#   列: name, network, lon, lat [, arv, dep]     先頭が # の行はコメント
+#   arv/dep が空なら、最寄りの陸上観測点5点の中央値を使う（地盤増幅の実測値が無いための仮置き）。
+#   海域観測点は「P波検知（EEWの震源決定・規模推定）」と「地図表示」に使うが、
+#   区域別の震度集計・警報対象地域・最大震度・PLUM法の起点には含めない（ST_LAND で除外）。
+# ---------------------------------------------------------------------
+ST_SEA = np.zeros(N_ST, dtype=bool)
+ST_LAND = ~ST_SEA
+ST_NAME = [""] * N_ST
+SEA_AREA_ID = int(ST_AREA.max()) + 1
+
+
+def _append_seafloor():
+    global ST_LON, ST_LAT, ST_ARV, ST_DEP, ST_AREA, ST_SEA, ST_LAND, ST_NAME, N_ST
+    path = DATA_DIR / "seafloor.csv"
+    if not path.exists():
+        return
+    rows, seen = [], set()
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            lines = [ln for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+        for row in csv.DictReader(lines):
+            try:
+                lo, la = float(row["lon"]), float(row["lat"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            nm = (row.get("name") or "").strip()
+            if not (10.0 <= la <= 55.0 and 110.0 <= lo <= 170.0) or (nm and nm in seen):
+                continue
+            seen.add(nm)
+
+            def opt(k):
+                try:
+                    return float(row.get(k) or "")
+                except ValueError:
+                    return None
+            rows.append((nm, (row.get("network") or "").strip(), lo, la, opt("arv"), opt("dep")))
+    except Exception as e:
+        print("[seafloor.csv] 読み込み失敗:", e)
+        return
+    if not rows:
+        return
+    land_lon, land_lat = ST_LON, ST_LAT
+    lon, lat, arv, dep, names = [], [], [], [], []
+    for nm, nw, lo, la, a, d in rows:
+        if a is None or d is None:
+            kx = 111.32 * math.cos(math.radians(la))
+            dd = np.hypot((land_lon - lo) * kx, (land_lat - la) * 110.57)
+            near = np.argsort(dd)[:5]
+            a = float(np.median(ST_ARV[near])) if a is None else a
+            d = float(np.median(ST_DEP[near])) if d is None else d
+        lon.append(lo); lat.append(la); arv.append(a); dep.append(d)
+        names.append((nw + " " + nm).strip())
+    n_new = len(lon)
+    ST_LON = np.concatenate([ST_LON, lon])
+    ST_LAT = np.concatenate([ST_LAT, lat])
+    ST_ARV = np.concatenate([ST_ARV, arv])
+    ST_DEP = np.concatenate([ST_DEP, dep])
+    ST_AREA = np.concatenate([ST_AREA, np.full(n_new, SEA_AREA_ID, dtype=np.int64)])
+    ST_SEA = np.concatenate([ST_SEA, np.ones(n_new, dtype=bool)])
+    ST_LAND = ~ST_SEA
+    ST_NAME = ST_NAME + names
+    N_ST = len(ST_LON)
+    AREA_NAMES[SEA_AREA_ID] = "海域（海底観測網）"
+    AREA_GEO[SEA_AREA_ID] = ("海域", "海域")
+    print("[seafloor.csv] 海底観測点 %d点を追加（陸上%d点＋海底%d点）" % (n_new, N_ST - n_new, n_new))
+
+
+_append_seafloor()
+
 # 海溝・トラフ軸の近似ポリラインとその名称（経度, 緯度）。判別用の概略値
 TRENCHES = {
     "千島海溝": [(155.0, 48.5), (150.5, 45.5), (147.3, 43.3), (145.0, 41.3)],
@@ -407,7 +478,13 @@ def sanitize_p_curve(tg, p_raw):
     速度が非現実的（>14km/s または負）になった時点以降は、直前の速度で直線外挿する。
     """
     v = np.gradient(p_raw, tg)
-    bad = np.where((tg > 20.0) & ((v > 14.0) | (v < 0.0)))[0]
+    # 深発地震では震源の真上にP波が着く（震央距離が0から立ち上がる）瞬間に、震央距離の
+    # 伸びる速さが理論上いくらでも大きくなる（sqrt(hypo^2-depth^2)の微分が発散）。
+    # これを「近似式の発散」と誤判定して直線外挿に置き換えないよう、立ち上がりから
+    # 30秒間は判定対象から外す。
+    pos = np.where(p_raw > 0.0)[0]
+    t_on = float(tg[pos[0]]) if len(pos) else 0.0
+    bad = np.where((tg > max(20.0, t_on + 30.0)) & ((v > 14.0) | (v < 0.0)))[0]
     if len(bad) == 0:
         return np.maximum.accumulate(p_raw)
     i = int(bad[0])
@@ -539,7 +616,10 @@ def realtime_frames(m01, kyori, dep_p, tf, p_curve, s_curve, tatsu):
 #     7) 警報の対象地域は一度発表したら続報でも取り消さない（追加時は即続報）
 # =====================================================================
 TG = np.arange(0.0, 600.0 + 1e-9, 0.05)
-EEW_DEPTHS = [10.0, 30.0, 60.0, 120.0, 250.0, 450.0]
+# 深さ候補。深発地震（最大699km）まで、深いほど粗くなり過ぎないよう細かく刻む
+EEW_DEPTHS = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 120.0, 150.0, 200.0, 250.0,
+              300.0, 350.0, 400.0, 450.0, 500.0, 550.0, 600.0, 650.0, 690.0]
+EEW_DEPTHS_COARSE = (10.0, 60.0, 150.0, 300.0, 450.0, 600.0)   # 粗い探索（広域グリッド）で試す深さ
 EEW_DELAY = 2.0          # 観測点のデータ伝送(1秒)＋処理(1秒)の遅れ[秒]
 _TT_CACHE = {}
 
@@ -592,7 +672,7 @@ def _locate(tobs, lat_s, lon_s, lat_u, lon_u, t_data, free_depth, prior):
             clat, clon = best[1], best[2]
         la, lo = np.meshgrid(clat + offs, clon + offs, indexing="ij")
         glat, glon = la.ravel(), lo.ravel()
-        for d in (depths if stage else [x for x in depths if x in (10.0, 60.0, 250.0)] or depths):
+        for d in (depths if stage else [x for x in depths if x in EEW_DEPTHS_COARSE] or depths):
             c, t0 = _grid_cost(glat, glon, d, tobs, lat_s, lon_s, lat_u, lon_u,
                                t_data, lat1, lon1, prior)
             k = int(np.argmin(c))
@@ -667,17 +747,27 @@ def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
         kp = (-0.006 + dterm / 2000.0) - bai_dep / 300.0
         pr = np.interp(ff - t0_e, TG, pc)                  # 推定震源から見たP波の到達距離
         zp = d - pr
-        capd = (-zp * kp * 2.0) >= 2.0                     # 振幅が上限（cap）に達した区間
+        # 振幅が上限（cap）に達した区間。順方向は v = base + zp*kp*2（zp<0, kp<0 で増加）が
+        # cap_s = base + 2.0 を超えたら cap_s に張り付く。よって条件は「増加分 zp*kp*2 >= 2.0」。
+        # （以前は符号が逆で、P波通過後の経過距離が大きい点＝深発・遠地ほど上限張り付きを
+        #   見逃し、増加分を過大に引いて規模を極端に小さく見積もっていた）
+        capd = (zp * kp * 2.0) >= 2.0
         m01_i = np.where(capd, obs + 1.5 + d / 150.0 + dterm / 52.0,
                          obs - zp * kp * 2.0 + 3.5 + d / 150.0 + dterm / 52.0)
         x = np.sqrt(d * d + dep_p * dep_p)
         mws = _mw_from_m01(m01_i, x, dep_p, ST_ARV[idx], ST_DEP[idx])
-        if (~cen).any():
-            mw_p = float(np.median(mws[~cen]))
-            if cen.any():
-                mw_p = min(mw_p, float(mws[cen].min()))    # 下限以下の観測点が示す上限を超えない
-        else:
-            mw_p = float(mws.min()) - 0.4                  # 全点が下限以下: 上限より小さい規模
+        # 上限が min(cap_s, 4.4) なので、4.4に張り付いた点は規模の「下限」しか分からない
+        lbm = capd & ~cen & (obs >= 4.35)
+        exact = ~cen & ~lbm
+        if exact.any():
+            mw_p = float(np.median(mws[exact]))
+            if lbm.any():
+                mw_p = max(mw_p, float(mws[lbm].max()))
+        elif lbm.any():
+            mw_p = float(mws[lbm].max())
+        if cen.any():                                      # 下限以下の観測点が示す上限を超えない
+            ub = float(mws[cen].min())
+            mw_p = (ub - 0.4) if mw_p is None else min(mw_p, ub)
 
     # --- S波（主要動）の振幅も使う: S波が観測された点の立ち上がりフレームから逆算 ---
     # リアルタイム震度のS波側の式: v = s0 + zs*ks,  s0 = min(m01-(1.5+k2/150)-dterm/52, 4.6)
@@ -744,11 +834,12 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
     T = float(tp_n[order[0]]) + EEW_DELAY          # 最初の1点検知から開始（切り上げなし）
     T0 = T
     # 実際に最大の揺れが観測される時刻。最終報はこれより後に発表する
-    peak = float(rt.max())
-    t_peak = int(np.argmax(rt.max(axis=1) >= peak - 0.05))
+    rl = rt[:, ST_LAND]                                # 陸上観測点のみで最大震度・終了時刻を決める
+    peak = float(rl.max())
+    t_peak = int(np.argmax(rl.max(axis=1) >= peak - 0.05))
     # 発表の終了目安: 震度4以上の揺れが最後の地域に達する時刻まで（直下型で最大震度が
     # 早く出ても、遠方の地域に向けて続報を出し続ける）
-    m4 = rt >= 3.5
+    m4 = rl >= 3.5
     has4 = m4.any(axis=0)
     t_last = float(np.argmax(m4[:, has4], axis=0).max()) if has4.any() else float(t_peak)
     T_stop = min(t_end - 1.0, max(t_first + 60.0, t_last + 6.0))
@@ -794,7 +885,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             # --- PLUM法（実際の気象庁EEWでも併用）---
             fr = min(int(math.floor(t_data)), rt.shape[0] - 1)
             ob = np.nan_to_num(rt[fr].astype(np.float64), nan=-9.0, neginf=-9.0, posinf=-9.0)
-            trig = np.where(ob >= 4.5)[0]          # 震度5弱以上を観測した点のみ起点
+            trig = np.where((ob >= 4.5) & ST_LAND)[0]          # 震度5弱以上を観測した点のみ起点
             plum_used = False
             if len(trig):
                 dd = _planar_km(ST_LAT[trig][:, None], ST_LON[trig][:, None],
@@ -807,9 +898,9 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             # 予想震度の塗りつぶし用: 観測点ごとのばらつき(地盤増幅の差)で地図がまだらにならないよう、
             # 気象庁のEEWと同じく「区域ごとの最大予想震度」を区域内の全観測点の値とする
             amx_all = np.full(max_a + 1, -99.0)
-            np.maximum.at(amx_all, ST_AREA, m01_p)
-            pq_vals = amx_all[ST_AREA]
-            vmax_e = float(m01_p.max())
+            np.maximum.at(amx_all, ST_AREA[ST_LAND], m01_p[ST_LAND])
+            pq_vals = np.where(ST_SEA, m01_p, amx_all[ST_AREA])   # 海域は自分自身の予想震度
+            vmax_e = float(m01_p[ST_LAND].max())
             cls_e, lb_max = shindo_class(vmax_e)
             if cls_e >= 7:            # 推定最大震度6弱以上 → 特別警報
                 lv = 3
@@ -828,11 +919,11 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             areas = []
             if lv >= 2:
                 amx = np.full(max_a + 1, -99.0)
-                np.maximum.at(amx, ST_AREA, m01_p)
+                np.maximum.at(amx, ST_AREA[ST_LAND], m01_p[ST_LAND])
                 de = hubeny_km(lat_e, lon_e, ST_LAT, ST_LON)
                 ts_all = t0_e + np.interp(de, _tt(dep_e)[1], TG, right=600.0)
                 ats = np.full(max_a + 1, np.inf)
-                np.minimum.at(ats, ST_AREA, ts_all)
+                np.minimum.at(ats, ST_AREA[ST_LAND], ts_all[ST_LAND])
                 for a in np.argsort(-amx):
                     c, lb = shindo_class(float(amx[a]))
                     if c < 4:
@@ -866,7 +957,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     changed = (lv != last["lv"]) or area_added or (moved and T - last["t"] >= (1 if lv >= 2 else 2))
                 if (changed and len(reports) < 80) or after_peak:
                     # 震源地名: 推定震源に最も近い観測点の区域名。25km超離れていれば「○○県沖」
-                    de_ = _planar_km(lat_e, lon_e, ST_LAT, ST_LON)
+                    de_ = np.where(ST_LAND, _planar_km(lat_e, lon_e, ST_LAT, ST_LON), 1e9)   # 地名は陸上観測点基準
                     j_ = int(np.argmin(de_))
                     epi_geo = epicenter_region(lat_e, lon_e)      # 気象庁の震央地名（データがあれば）
                     if epi_geo:
@@ -946,7 +1037,9 @@ def sim_core(lat0, lon0, mag, depth, dt=1.0, gz=False):
 
     # 区域別の最大震度
     area_max = {}
-    for a, v in zip(ST_AREA, m01):
+    for a, v, sea in zip(ST_AREA, m01, ST_SEA):
+        if sea:
+            continue                                      # 海底観測点は区域集計に含めない
         if a not in area_max or v > area_max[a]:
             area_max[a] = float(v)
     areas = []
@@ -1019,6 +1112,7 @@ def api_stations():
             "lon": [round(float(x), 4) for x in ST_LON],
             "lat": [round(float(x), 4) for x in ST_LAT],
             "area": [int(x) for x in ST_AREA],
+            "sea": [int(x) for x in ST_SEA],
             "anames": {str(k): v for k, v in AREA_NAMES.items()},
         }
     return _json_response(_STATIONS_CACHE)
@@ -1071,7 +1165,7 @@ def api_areas_geojson():
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "stations": N_ST}
+    return {"status": "ok", "stations": N_ST, "seafloor": int(ST_SEA.sum())}
 
 
 @app.get("/")
@@ -1230,6 +1324,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="foot">
     距離減衰式による簡易推定です。実際の強震モニタ（実観測波形）や気象庁の発表とは異なります。防災・避難判断には使用しないでください。<br>
     Scratch作品「【複数対応】地震の到達時間シミュレーション v1.5.0β」のロジックを参考に作成。<br>
+    水色の輪＝海底観測点（data/seafloor.csv）。P波の検知には使いますが、区域別集計・警報対象・最大震度には含めません。<br>
     地図: Tiles © Esri
   </div>
 </div>
@@ -1372,10 +1467,10 @@ $('toggle').onclick=()=>$('panel').classList.toggle('open');
 if(window.innerWidth<=700) $('panel').classList.remove('open');
 
 /* ---------- 観測点 ---------- */
-let N=0, SLON=null, SLAT=null, PX=null, PY=null, VALS=null, viewDirty=true, AREA=null, ANAMES={}, AM=null;
+let N=0, SLON=null, SLAT=null, PX=null, PY=null, VALS=null, viewDirty=true, AREA=null, ANAMES={}, AM=null, SEA=null, SEAIDX=[];
 fetch('/api/stations').then(r=>r.json()).then(j=>{
   SLON=Float32Array.from(j.lon); SLAT=Float32Array.from(j.lat); N=SLON.length;
-  AREA=Int32Array.from(j.area); ANAMES=j.anames; let mx=0; for(const a of AREA) if(a>mx) mx=a; AM=new Float32Array(mx+1);
+  AREA=Int32Array.from(j.area); ANAMES=j.anames; SEA=Uint8Array.from(j.sea||new Array(N).fill(0)); SEAIDX=[]; for(let i=0;i<N;i++) if(SEA[i]) SEAIDX.push(i); let mx=0; for(const a of AREA) if(a>mx) mx=a; AM=new Float32Array(mx+1);
   PX=new Float32Array(N); PY=new Float32Array(N); VALS=new Float32Array(N).fill(-3.1); viewDirty=true; loadGeo();
 });
 
@@ -1534,8 +1629,8 @@ function draw(ts){
   const buckets=new Array(LUT_N); for(let k=0;k<LUT_N;k++) buckets[k]=[];
   let vmax=-99; AM.fill(-99);
   for(let i=0;i<N;i++){
-    const v=VALS[i]; if(v>vmax) vmax=v;
-    const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v;
+    const v=VALS[i];
+    if(!(SEA&&SEA[i])){ if(v>vmax) vmax=v; const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v; }   // 海底観測点は最大・ランキングに含めない
     let k=Math.round((v-LUT_MIN)/LUT_STEP); if(k<0)k=0; if(k>=LUT_N)k=LUT_N-1;
     buckets[k].push(i);
   }
@@ -1561,6 +1656,12 @@ function draw(ts){
         for(let j=0;j<b.length;j++){ const i=b[j]; ctx.fillText(t,PX[i],PY[i]+0.5); }
       }
     }
+  }
+  if(SEAIDX.length){                                  // 海底観測点は水色の輪で区別
+    const rs=Math.max(r0,rn)+2.2;
+    ctx.beginPath(); ctx.lineWidth=1.4; ctx.strokeStyle='rgba(120,230,255,.95)';
+    for(let j=0;j<SEAIDX.length;j++){ const i=SEAIDX[j]; ctx.moveTo(PX[i]+rs,PY[i]); ctx.arc(PX[i],PY[i],rs,0,6.2832); }
+    ctx.stroke();
   }
   updateRank(ts);
   if(sim){
