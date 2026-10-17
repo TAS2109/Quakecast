@@ -325,7 +325,7 @@ def _locate(tobs, lat_s, lon_s, lat_u, lon_u, t_data, free_depth, prior):
             k = int(np.argmin(c))
             if best is None or c[k] < best[0]:
                 best = (float(c[k]), float(glat[k]), float(glon[k]), d, float(t0[k]))
-    return best[1], best[2], best[3], best[4]
+    return best[1], best[2], best[3], best[4], best[0]
 
 
 def _mw_of_mag(mag):
@@ -345,7 +345,7 @@ def _mag_of_mw(mw):
 
 def _mw_from_m01(m01_i, x, depth_p, arv, sdep):
     """観測点の計測震度から、距離減衰式を逆算してMwを求める（二分法）"""
-    lo = np.full(m01_i.shape, 1.0)
+    lo = np.full(m01_i.shape, -5.0)      # 元の式のMw換算ではM4でも約-1.6になるため下限を広く取る
     hi = np.full(m01_i.shape, 10.5)
     for _ in range(40):
         mid = (lo + hi) / 2.0
@@ -359,33 +359,46 @@ def _mw_from_m01(m01_i, x, depth_p, arv, sdep):
 
 
 def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
-    """P波検知後3秒間の振幅からマグニチュードを推定。使える観測点が無ければNone"""
+    """P波到達後〜S波到達前の振幅からマグニチュードを推定。使える観測点が無ければNone"""
     pc, sc = _tt(dep_e)
     t_ceil = np.ceil(tp_n[avail]).astype(int)
-    f = np.minimum(np.minimum(int(math.floor(t_data)), t_ceil + 3), rt.shape[0] - 1)
+    d_all = np.maximum(hubeny_km(lat_e, lon_e, ST_LAT[avail], ST_LON[avail]), 8.0)
+    ts_e = t0_e + np.interp(d_all, sc, TG, right=600.0)
+    # 各観測点で「P波が届いてからS波が届く前」の最新フレームの振幅を使う
+    f = np.minimum(np.minimum(int(math.floor(t_data)), np.floor(ts_e - 1.5).astype(int)),
+                   rt.shape[0] - 1)
     ok = f >= t_ceil + 1
-    idx, f = avail[ok], f[ok]
-    if len(idx) == 0:
+    if not ok.any():
         return None
+    sel = np.where(ok)[0]
+    sel = sel[np.argsort(d_all[sel])[:10]]            # 震源に近い観測点ほど信号が強い（上位10点）
+    idx, f, d = avail[sel], f[sel], d_all[sel]
     obs = rt[f, idx].astype(np.float64) + rng.normal(0.0, 0.25, len(idx))   # 振幅の観測ノイズ
-    d = np.maximum(hubeny_km(lat_e, lon_e, ST_LAT[idx], ST_LON[idx]), 15.0)
-    ts_e = t0_e + np.interp(d, sc, TG, right=600.0)
-    good = (obs > -2.5) & (f < ts_e - 0.5)            # ノイズ以上かつP波区間の観測点のみ
-    if not good.any():
-        return None
-    idx, f, obs, d = idx[good], f[good], obs[good], d[good]
+    bai = ((1.0 + ST_ARV[idx]) / 2.2) / 2.0
+    fthr = -3.3 + (1.0 + bai * 3.0) / 4.0             # 検出下限（これ以下は規模の上限しか分からない）
+    cen = obs <= fthr + 0.3
+    obs = np.maximum(obs, fthr + 0.3)
     dep_p = dep_e - 10.0
     dterm = min(max(dep_p - 10.0, 0.0), 30.0)
     bai_dep = (ST_DEP[idx] + 1200.0) / 600.0
     kp = (-0.006 + dterm / 2000.0) - bai_dep / 300.0
     pr = np.interp(f - t0_e, TG, pc)                   # 推定震源から見たP波の到達距離
     zp = d - pr
-    m01_i = obs - zp * kp * 2.0 + (3.5 + d / 150.0) + dterm / 52.0
+    capd = (-zp * kp * 2.0) >= 2.0                     # 振幅が上限（cap）に達した区間
+    m01_i = np.where(capd, obs + 1.5 + d / 150.0 + dterm / 52.0,
+                     obs - zp * kp * 2.0 + 3.5 + d / 150.0 + dterm / 52.0)
     x = np.sqrt(d * d + dep_p * dep_p)
-    mw = float(np.median(_mw_from_m01(m01_i, x, dep_p, ST_ARV[idx], ST_DEP[idx])))
+    mws = _mw_from_m01(m01_i, x, dep_p, ST_ARV[idx], ST_DEP[idx])
+    if (~cen).any():
+        mw = float(np.median(mws[~cen]))
+        if cen.any():
+            mw = min(mw, float(mws[cen].min()))        # 下限以下の観測点が示す上限を超えない
+    else:
+        mw = float(mws.min()) - 0.4                    # 全点が下限以下: 上限より小さい規模
     mag = min(max(_mag_of_mw(mw), 2.0), 9.5)
     # 観測波形が短いうちは大地震の規模を過小評価する（経過時間とともに上限が上がる）
-    return min(mag, 6.2 + 0.95 * math.log2(1.0 + max(tau, 0.0) / 3.0))
+    msat = 6.2 + 0.95 * math.log2(1.0 + max(tau, 0.0) / 3.0)
+    return min(mag, msat), mag > msat      # (推定M, 上限に頭打ち中=まだ規模が成長中か)
 
 
 def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
@@ -400,11 +413,14 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
     t_first = float(tp_n[order[0]])
     T = int(math.ceil(float(tp_n[order[1]]) + EEW_DELAY))
     T0 = T
-    T_stop = min(t_end - 1.0, t_first + 100.0)
+    # 実際に最大の揺れが観測される時刻。最終報はこれより後に発表する
+    peak = float(rt.max())
+    t_peak = int(np.argmax(rt.max(axis=1) >= peak - 0.05))
+    T_stop = min(t_end - 1.0, max(t_first + 60.0, t_peak + 6.0))
     max_a = int(ST_AREA.max())
     reports, last, lv_max = [], None, 0
 
-    while T <= T_stop and len(reports) < 40:
+    while T <= T_stop:
         t_data = T - EEW_DELAY
         avail = order[tp_n[order] <= t_data]
         n = len(avail)
@@ -415,21 +431,24 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
             cand = np.where(mask)[0]
             dc = _planar_km(ST_LAT[use[0]], ST_LON[use[0]], ST_LAT[cand], ST_LON[cand])
             unt = cand[np.argsort(dc)[:50]]
-            lat_e, lon_e, dep_e, t0_e = _locate(
+            lat_e, lon_e, dep_e, t0_e, cost_e = _locate(
                 tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
                 t_data, n >= 4, 0.003 if n < 4 else 0.0005)
-            mag_e = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
-                                  T - t_first, rng)
-            if mag_e is None:
-                mag_e = last["mag"] if last else 5.0
+            est = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
+                                T - t_first, rng)
+            if est is None:
+                mag_e, capped = (last["mag"] if last else 5.0), False
+            else:
+                mag_e, capped = est
 
             m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e)
             vmax_e = float(m01_p.max())
-            if vmax_e >= 6.0:
+            cls_e, lb_max = shindo_class(vmax_e)
+            if cls_e >= 7:            # 推定最大震度6弱以上 → 特別警報
                 lv = 3
-            elif vmax_e >= 5.0:
+            elif cls_e >= 5:          # 推定最大震度5弱以上 → 警報
                 lv = 2
-            elif vmax_e >= 3.0 or mag_e >= 3.5:
+            elif cls_e >= 3 or mag_e >= 3.5:   # 震度3以上またはM3.5以上 → 予報
                 lv = 1
             else:
                 lv = 0
@@ -454,21 +473,29 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
                         break
 
             if lv >= 1:
+                after_peak = T >= t_peak + 1          # 最大震度の観測後 → これが最終報
                 if last is None:
                     changed = True
                 else:
+                    # 発表基準: 規模が大きい/成長中、または震源の推定が不確か（検知点が少ない・
+                    # 走時残差が大きい）なほど細かく更新。確定的な推定では更新しない。
+                    unsure = (n < 8) or (cost_e > 0.05)
+                    dm_th = 0.1 if (mag_e >= 7.0 or capped) else (0.2 if mag_e >= 5.5 else 0.3)
+                    pos_th = 10.0 if unsure else 25.0
                     dpos = float(_planar_km(lat_e, lon_e, last["lat"], last["lon"]))
-                    changed = (abs(mag_e - last["mag"]) >= 0.2 or dpos >= 20.0
-                               or abs(dep_e - last["depth"]) >= 20.0 or lv != last["lv"]
-                               or abs(len(areas) - len(last["areas"])) >= 3)
-                if changed:
-                    cls_max, lb_max = shindo_class(vmax_e)
+                    moved = (abs(mag_e - last["mag"]) >= dm_th or dpos >= pos_th
+                             or abs(dep_e - last["depth"]) >= 20.0
+                             or abs(len(areas) - len(last["areas"])) >= 3)
+                    changed = (lv != last["lv"]) or (moved and T - last["t"] >= 2)
+                if (changed and len(reports) < 49) or after_peak:
                     last = {"no": len(reports) + 1, "t": int(T), "lat": round(lat_e, 2),
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "max": round(vmax_e, 1), "maxLabel": lb_max,
-                            "maxCls": cls_max, "lv": lv, "areas": areas, "final": False}
+                            "maxCls": cls_e, "lv": lv, "areas": areas, "final": after_peak}
                     reports.append(last)
                     lv_max = lv
+                    if after_peak:
+                        break
         T += 1 if T < T0 + 40 else 3
 
     if not reports:
