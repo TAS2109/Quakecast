@@ -63,6 +63,42 @@ def _load_data():
 ST_LON, ST_LAT, ST_ARV, ST_DEP, ST_AREA, AREA_NAMES, JMA = _load_data()
 N_ST = len(ST_LON)
 
+# 海溝・トラフ軸の近似ポリラインとその名称（経度, 緯度）。判別用の概略値
+TRENCHES = {
+    "千島海溝": [(155.0, 48.5), (150.5, 45.5), (147.3, 43.3), (145.0, 41.3)],
+    "日本海溝": [(144.5, 41.0), (144.0, 39.5), (143.7, 38.0), (143.0, 36.5), (142.5, 35.3)],
+    "伊豆・小笠原海溝": [(142.5, 35.3), (142.1, 33.5), (141.9, 31.5), (142.3, 29.0), (143.0, 26.0)],
+    "相模トラフ": [(139.2, 34.9), (139.9, 34.4), (140.9, 34.3)],
+    "南海トラフ": [(138.5, 34.6), (137.7, 33.9), (136.7, 33.3), (135.7, 32.7),
+                (134.5, 32.2), (133.2, 31.7), (132.2, 31.2)],
+    "琉球海溝": [(132.2, 31.2), (131.0, 29.7), (129.8, 28.0), (128.5, 26.0),
+               (126.5, 24.2), (124.5, 23.4), (122.5, 23.2)],
+}
+
+
+def classify_source(mag, depth, lat0, lon0):
+    # 震源が海溝軸の近く、かつプレート境界の深さ以浅なら「海溝型」と自動判別する。
+    # 海溝型かつM7以上は、震源断層の広がり（断層長L=10^(0.5M-1.85) km）を海溝走向に沿って考慮する。
+    kx = 111.32 * math.cos(math.radians(lat0))
+    ky = 110.57
+    best = None
+    for name, pts in TRENCHES.items():
+        for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+            ax, ay = (x1 - lon0) * kx, (y1 - lat0) * ky
+            bx, by = (x2 - lon0) * kx, (y2 - lat0) * ky
+            vx, vy = bx - ax, by - ay
+            l2 = vx * vx + vy * vy
+            t = 0.0 if l2 == 0 else min(max(-(ax * vx + ay * vy) / l2, 0.0), 1.0)
+            d = math.hypot(ax + t * vx, ay + t * vy)
+            if best is None or d < best[0]:
+                n = math.sqrt(l2) or 1.0
+                best = (d, name, vx / n, vy / n)
+    d, name, ux, uy = best
+    is_trench = (d <= 250.0 and mag >= 5.5 and depth <= min(20.0 + 0.3 * d, 60.0))
+    length = min(10.0 ** (0.5 * mag - 1.85), 600.0) if (is_trench and mag >= 7.0) else 0.0
+    return {"type": "海溝型" if is_trench else "内陸・その他", "name": name if is_trench else "",
+            "L": length, "ux": ux, "uy": uy, "kx": kx, "ky": ky}
+
 
 # =====================================================================
 # 2. 計算エンジン
@@ -137,7 +173,14 @@ def final_intensity(mag, depth, lat0, lon0):
     depth_p = depth - 10.0
 
     dist = hubeny_km(lat0, lon0, ST_LAT, ST_LON)          # 震央距離
-    x_hypo = np.sqrt(dist ** 2 + depth_p ** 2)            # 震源距離
+    src = classify_source(mag, depth, lat0, lon0)
+    dfault = dist
+    if src["L"] > 0:                                      # 海溝型の大地震: 断層面までの距離で減衰を評価
+        sx = (ST_LON - lon0) * src["kx"]
+        sy = (ST_LAT - lat0) * src["ky"]
+        tt = np.clip(sx * src["ux"] + sy * src["uy"], -src["L"] / 2, src["L"] / 2)
+        dfault = np.minimum(dist, np.hypot(sx - tt * src["ux"], sy - tt * src["uy"]))
+    x_hypo = np.sqrt(dfault ** 2 + depth_p ** 2)          # 震源距離
 
     area_a = 10.0 ** (0.91 * m_arg - 3.49)                # 断層面積 [km2]
     slip_d = 10.0 ** (0.69 * m_arg - 4.8)                 # 平均すべり量 [m]
@@ -153,7 +196,7 @@ def final_intensity(mag, depth, lat0, lon0):
     pgv600 = 10.0 ** log_pgv600
     pgv = pgv600 * ST_ARV * (4000.0 - ST_DEP)             # 地盤増幅を考慮
     m01 = 2.68 + 1.72 * np.log10(pgv)                     # PGV → 計測震度
-    return m01, dist, depth_p
+    return m01, dist, depth_p, src
 
 
 def realtime_frames(m01, kyori, dep_p, tf, p_curve, s_curve, tatsu):
@@ -211,7 +254,7 @@ def realtime_frames(m01, kyori, dep_p, tf, p_curve, s_curve, tatsu):
 
 
 def simulate(lat0, lon0, mag, depth, dt=1.0):
-    m01, dist, dep_p = final_intensity(mag, depth, lat0, lon0)
+    m01, dist, dep_p, src = final_intensity(mag, depth, lat0, lon0)
 
     # 細かい時間軸でP/S波の到達距離曲線を作る（単調増加に整える）
     tg = np.arange(0.0, 600.0 + 1e-9, 0.05)
@@ -259,6 +302,39 @@ def simulate(lat0, lon0, mag, depth, dt=1.0):
     vmax = float(m01.max())
     cls, label = shindo_class(vmax)
 
+    # --- 緊急地震速報（簡易判定） ---
+    #   特別警報: 予想最大震度6弱以上 / 警報: 5弱以上 / 予報: 震度3以上またはM3.5以上
+    #   発表時刻: 2番目に近い観測点にP波が届いてから3秒後と仮定
+    if vmax >= 6.0:
+        e_lv, e_label = 3, "緊急地震速報（特別警報）"
+    elif vmax >= 5.0:
+        e_lv, e_label = 2, "緊急地震速報（警報）"
+    elif vmax >= 3.0 or mag >= 3.5:
+        e_lv, e_label = 1, "緊急地震速報（予報）"
+    else:
+        e_lv, e_label = 0, ""
+    eew = None
+    if e_lv:
+        fin_tp = np.sort(tp[np.isfinite(tp)])
+        t_issue = (float(fin_tp[1]) if len(fin_tp) > 1 else (float(fin_tp[0]) if len(fin_tp) else 0.0)) + 3.0
+        area_ts = {}
+        for a, t_ in zip(ST_AREA, tatsu):
+            if a not in area_ts or t_ < area_ts[a]:
+                area_ts[a] = t_
+        e_areas = []
+        if e_lv >= 2:
+            for a, v in sorted(area_max.items(), key=lambda kv: -kv[1]):
+                c, lb = shindo_class(v)
+                if c < 4:
+                    break
+                ts_ = float(area_ts.get(a, float("inf")))
+                e_areas.append({"name": AREA_NAMES.get(a, "区域%d" % a), "label": lb, "cls": c,
+                                "ts": round(ts_, 1) if math.isfinite(ts_) else None})
+                if len(e_areas) >= 40:
+                    break
+        eew = {"level": e_lv, "label": e_label, "tIssue": round(t_issue, 1),
+               "maxLabel": label, "areas": e_areas}
+
     def _clean(a, nd=1):
         return [None if not math.isfinite(x) else round(float(x), nd) for x in a]
 
@@ -278,6 +354,8 @@ def simulate(lat0, lon0, mag, depth, dt=1.0):
         "areas": areas,
         "epi": {"lat": lat0, "lon": lon0, "mag": mag, "depth": depth},
         "tEnd": t_end,
+        "src": {"type": src["type"], "name": src["name"], "L": round(src["L"])},
+        "eew": eew,
     }
 
 
@@ -304,6 +382,8 @@ def api_stations():
         _STATIONS_CACHE = {
             "lon": [round(float(x), 4) for x in ST_LON],
             "lat": [round(float(x), 4) for x in ST_LAT],
+            "area": [int(x) for x in ST_AREA],
+            "anames": {str(k): v for k, v in AREA_NAMES.items()},
         }
     return _json_response(_STATIONS_CACHE)
 
@@ -399,12 +479,27 @@ INDEX_HTML = r"""<!doctype html>
   .epi{color:#ff4d4d;font-size:26px;font-weight:900;text-shadow:0 0 4px #000,0 0 8px #000;
     line-height:26px;text-align:center}
   .foot{font-size:10.5px;color:var(--sub);line-height:1.55;margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
+  #rank{position:absolute;z-index:1000;right:10px;top:96px;width:200px;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px}
+  #rank h3{margin:0 0 5px;font-size:11.5px;color:var(--sub);font-weight:600}
+  #rank td.no{color:var(--sub);width:14px}
+  #eew{position:absolute;z-index:1050;top:54px;left:50%;transform:translateX(-50%);display:none;
+    width:min(520px,calc(100% - 20px));border-radius:10px;padding:8px 14px;border:2px solid;font-size:13px;line-height:1.5}
+  #eew .t{font-size:16px;font-weight:800}
+  #eew .rg{display:inline-block;margin:2px 10px 2px 0;white-space:nowrap}
+  #eew .rg i{font-style:normal;font-weight:700;margin-left:3px}
+  #eew.lv1{background:#12304fee;border-color:#3b9cff}
+  #eew.lv2{background:#7a1010ee;border-color:#ff4d4d;animation:eewb 1s infinite}
+  #eew.lv3{background:#2a0a3eee;border-color:#c04bff;animation:eewb .6s infinite}
+  @keyframes eewb{50%{box-shadow:0 0 18px 4px #ff3b3b99}}
   @media (max-width:700px){
     #panel{width:calc(100% - 20px);max-height:62%;top:52px;display:none}
     #panel.open{display:block}
     #toggle{display:block}
     #hud{top:10px;left:auto;right:60px;transform:none;padding:5px 9px;gap:8px;font-size:12px}
     #hud .lbl{display:none}
+    #rank{top:96px;width:158px;font-size:11px;padding:6px 7px}
+    #eew{top:48px}
   }
 </style>
 </head>
@@ -436,6 +531,7 @@ INDEX_HTML = r"""<!doctype html>
   <div id="result" style="display:none">
     <h2>予想される最大震度</h2>
     <div id="maxbox"><span class="big" id="maxbig"></span><span id="maxsub" class="hint" style="margin:0"></span></div>
+    <div id="srcinfo" class="hint"></div>
     <h2>区域別の最大震度（上位）</h2>
     <table id="areas"></table>
   </div>
@@ -453,6 +549,12 @@ INDEX_HTML = r"""<!doctype html>
   <span><span class="lbl">S波</span><b id="hS">-</b> km</span>
   <span><span class="lbl">現在の最大</span><b id="hM">-</b></span>
 </div>
+
+<div id="rank">
+  <h3>リアルタイム震度ランキング（区域別）</h3>
+  <table id="rankTbl"><tr><td style="color:var(--sub)">シミュレーション実行後に表示</td></tr></table>
+</div>
+<div id="eew"></div>
 
 <div id="bar">
   <div id="ctl">
@@ -508,7 +610,7 @@ function clsColor(k){ const c=CLASS_RGB[k]; return 'rgb('+c[0]+','+c[1]+','+c[2]
 })();
 
 /* ---------- 地図 ---------- */
-const map = L.map('map',{zoomSnap:0.25,minZoom:4,maxZoom:11,worldCopyJump:false}).setView([36.3,137.6],5.5);
+const map = L.map('map',{zoomSnap:0.25,minZoom:4,maxZoom:11,worldCopyJump:false,zoomAnimation:false,markerZoomAnimation:false,fadeAnimation:false}).setView([36.3,137.6],5.5);
 const ESRI='https://server.arcgisonline.com/ArcGIS/rest/services/';
 const esri=(path,attr,maxNative)=>L.tileLayer(ESRI+path+'/MapServer/tile/{z}/{y}/{x}',
   {attribution:attr,maxNativeZoom:maxNative||16,maxZoom:19});
@@ -556,9 +658,10 @@ $('toggle').onclick=()=>$('panel').classList.toggle('open');
 if(window.innerWidth<=700) $('panel').classList.remove('open');
 
 /* ---------- 観測点 ---------- */
-let N=0, SLON=null, SLAT=null, PX=null, PY=null, VALS=null, viewDirty=true;
+let N=0, SLON=null, SLAT=null, PX=null, PY=null, VALS=null, viewDirty=true, AREA=null, ANAMES={}, AM=null;
 fetch('/api/stations').then(r=>r.json()).then(j=>{
   SLON=Float32Array.from(j.lon); SLAT=Float32Array.from(j.lat); N=SLON.length;
+  AREA=Int32Array.from(j.area); ANAMES=j.anames; let mx=0; for(const a of AREA) if(a>mx) mx=a; AM=new Float32Array(mx+1);
   PX=new Float32Array(N); PY=new Float32Array(N); VALS=new Float32Array(N).fill(-3.1); viewDirty=true;
 });
 
@@ -618,15 +721,16 @@ function interp(arr,t){
 function draw(ts){
   const s=map.getSize(); ctx.clearRect(0,0,s.x,s.y);
   if(!N) return;
-  if(viewDirty) updatePoints();
+  updatePoints();   // 毎フレーム再投影（ズーム/パン中も地図とずれない）
   if(sim) valuesAt(tcur);
   else { const tk=Math.floor((ts||0)/160); for(let i=0;i<N;i++) VALS[i]=-3.1+(frac(Math.sin(i*12.9898+tk*78.233)*43758.5453)-0.5)*0.14; }
 
   const z=map.getZoom(), r0=Math.max(2.0,(z-3.6)*0.95);
   const buckets=new Array(LUT_N); for(let k=0;k<LUT_N;k++) buckets[k]=[];
-  let vmax=-99;
+  let vmax=-99; AM.fill(-99);
   for(let i=0;i<N;i++){
     const v=VALS[i]; if(v>vmax) vmax=v;
+    const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v;
     let k=Math.round((v-LUT_MIN)/LUT_STEP); if(k<0)k=0; if(k>=LUT_N)k=LUT_N-1;
     buckets[k].push(i);
   }
@@ -639,7 +743,9 @@ function draw(ts){
     ctx.fill();
     if(v>=4.5){ ctx.strokeStyle='rgba(255,255,255,.55)'; ctx.lineWidth=0.8; ctx.stroke(); }
   }
+  updateRank(ts);
   if(sim){
+    updateEew();
     drawCircle(interp(sim.P,tcur),'rgba(90,200,255,.95)',1.6);
     drawCircle(interp(sim.S,tcur),'rgba(255,95,95,.98)',2.2);
     $('hT').textContent=tcur.toFixed(1);
@@ -649,6 +755,40 @@ function draw(ts){
     if(m<0.5){ hm.textContent='—'; hm.style.color='#93a0b8'; }
     else { hm.textContent=m.toFixed(1)+'（'+CLASS_LABEL[shindoCls(m)]+'）'; hm.style.color=clsColor(shindoCls(m)); }
   }
+}
+
+let lastRank=0;
+function updateRank(ts){
+  if(!sim||!AM||(ts||0)-lastRank<250) return; lastRank=ts||0;
+  const arr=[]; for(let a=0;a<AM.length;a++){ if(AM[a]>=0.5) arr.push([a,AM[a]]); }
+  arr.sort((p,q)=>q[1]-p[1]);
+  let h='';
+  arr.slice(0,10).forEach((e,i)=>{
+    const c=shindoCls(e[1]);
+    h+='<tr><td class="no">'+(i+1)+'</td><td>'+(ANAMES[e[0]]||('区域'+e[0]))+'</td><td class="num">'+e[1].toFixed(1)+
+       '</td><td class="num"><span class="chip" style="background:'+clsColor(c)+'">'+CLASS_LABEL[c]+'</span></td></tr>';
+  });
+  $('rankTbl').innerHTML=h||'<tr><td style="color:#93a0b8">震度1以上の観測なし</td></tr>';
+}
+function updateEew(){
+  const e=sim.eew, box=$('eew');
+  if(!e||tcur<e.tIssue){ box.style.display='none'; return; }
+  const ep=sim.epi;
+  let h='<div class="t">'+e.label+'</div><div>M'+ep.mag.toFixed(1)+' ／ 深さ'+ep.depth+'km ／ 予想最大震度 '+e.maxLabel+'</div>';
+  if(e.level>=2){
+    h+='<div style="margin-top:3px">強い揺れ（震度4以上）が予想される地域：</div>';
+    const rows=e.areas.slice(0,8).map(a=>{
+      const rem=a.ts==null?null:a.ts-tcur;
+      const s=rem==null?'':(rem>0?'あと'+Math.ceil(rem)+'秒':'主要動到達');
+      return '<span class="rg">'+a.name+'<i>'+a.label+'</i> '+s+'</span>';
+    });
+    h+='<div>'+rows.join('')+(e.areas.length>8?'<span class="rg">ほか'+(e.areas.length-8)+'区域</span>':'')+'</div>';
+    h+='<div style="font-weight:700">強い揺れに警戒してください。</div>';
+  }else{
+    h+='<div>今後の情報に注意してください。</div>';
+  }
+  box.className='lv'+e.level; box.style.display='block';
+  if(box._h!==h){ box.innerHTML=h; box._h=h; }
 }
 
 function tick(ts){
@@ -696,6 +836,7 @@ function showResult(j){
   $('result').style.display='block';
   const big=$('maxbig'); big.textContent=j.maxLabel; big.style.background=clsColor(j.maxCls);
   $('maxsub').textContent='最大計測震度 '+j.max.toFixed(1)+'（M'+j.epi.mag.toFixed(1)+' / 深さ'+j.epi.depth+'km）';
+  $('srcinfo').textContent='震源タイプ: '+j.src.type+(j.src.name?'（'+j.src.name+'）':'')+(j.src.L>0?' ／ 想定断層長 約'+j.src.L+'km（断層の広がりを考慮して震度を計算）':'');
   const t=$('areas'); t.innerHTML='';
   if(!j.areas.length){ t.innerHTML='<tr><td>震度1以上の区域はありません</td></tr>'; return; }
   j.areas.forEach(a=>{
