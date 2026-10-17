@@ -63,6 +63,109 @@ def _load_data():
 ST_LON, ST_LAT, ST_ARV, ST_DEP, ST_AREA, AREA_NAMES, JMA = _load_data()
 N_ST = len(ST_LON)
 
+# ---------------------------------------------------------------------
+# 区域 → 都道府県 → 地域区分 の対応（警報対象範囲の表示用）
+#   各都道府県の代表点（県庁所在地ほか）への最寄りで観測点の都道府県を決め、
+#   区域内で多数決。区域名に都道府県名が含まれていればそちらを優先する。
+# ---------------------------------------------------------------------
+_PREF_PTS = {
+    "北海道": [(141.35, 43.06), (140.73, 41.77), (142.37, 43.77), (144.38, 43.0), (143.2, 42.9),
+             (144.27, 44.02), (141.65, 45.42), (145.58, 43.33), (141.5, 42.6)],
+    "青森県": [(140.74, 40.82), (141.49, 40.51), (140.47, 40.61)],
+    "岩手県": [(141.15, 39.70), (141.97, 39.64), (141.13, 38.99)],
+    "宮城県": [(140.87, 38.27), (141.3, 38.9)],
+    "秋田県": [(140.10, 39.72), (140.55, 40.2)],
+    "山形県": [(140.36, 38.24), (139.84, 38.91)],
+    "福島県": [(140.47, 37.75), (139.93, 37.49), (140.89, 37.05)],
+    "茨城県": [(140.45, 36.34), (140.3, 36.0)],
+    "栃木県": [(139.88, 36.57), (139.7, 36.9)],
+    "群馬県": [(139.06, 36.39), (138.9, 36.6)],
+    "埼玉県": [(139.65, 35.86), (139.2, 36.0)],
+    "千葉県": [(140.12, 35.61), (140.2, 35.2), (139.9, 35.0)],
+    "東京都": [(139.69, 35.69), (139.8, 33.1), (142.2, 27.1)],
+    "神奈川県": [(139.64, 35.45), (139.2, 35.3)],
+    "新潟県": [(139.02, 37.90), (138.25, 37.1), (138.4, 38.05), (139.4, 37.6)],
+    "富山県": [(137.21, 36.70), (137.0, 36.8)],
+    "石川県": [(136.63, 36.59), (136.9, 37.4), (136.8, 37.0)],
+    "福井県": [(136.22, 36.07), (135.9, 35.65)],
+    "山梨県": [(138.57, 35.66), (138.6, 35.5)],
+    "長野県": [(138.18, 36.65), (137.97, 36.23), (138.0, 35.7), (138.3, 36.0)],
+    "岐阜県": [(136.72, 35.39), (137.2, 36.2), (137.25, 35.5)],
+    "静岡県": [(138.38, 34.98), (137.73, 34.71), (139.0, 35.0), (138.9, 34.75)],
+    "愛知県": [(136.91, 35.18), (137.15, 34.85)],
+    "三重県": [(136.51, 34.73), (136.35, 34.2), (136.5, 33.8)],
+    "滋賀県": [(135.87, 35.00), (136.1, 35.3)],
+    "京都府": [(135.76, 35.02), (135.2, 35.4)],
+    "大阪府": [(135.52, 34.69)],
+    "兵庫県": [(135.18, 34.69), (134.8, 35.3), (134.7, 34.9), (134.85, 34.35)],
+    "奈良県": [(135.83, 34.69), (135.9, 34.3)],
+    "和歌山県": [(135.17, 34.23), (135.8, 33.6)],
+    "鳥取県": [(134.24, 35.50), (133.5, 35.4)],
+    "島根県": [(133.05, 35.47), (132.1, 35.0), (133.3, 36.2)],
+    "岡山県": [(133.93, 34.66), (133.7, 35.0)],
+    "広島県": [(132.46, 34.40), (133.2, 34.5)],
+    "山口県": [(131.47, 34.19), (131.2, 34.0), (131.0, 34.4)],
+    "徳島県": [(134.56, 34.07), (134.3, 33.8)],
+    "香川県": [(134.04, 34.34)],
+    "愛媛県": [(132.77, 33.84), (132.5, 33.3), (133.1, 33.6)],
+    "高知県": [(133.53, 33.56), (133.0, 33.0), (134.0, 33.5)],
+    "福岡県": [(130.42, 33.61), (130.8, 33.3)],
+    "佐賀県": [(130.30, 33.25)],
+    "長崎県": [(129.87, 32.75), (129.9, 33.2), (129.0, 33.0), (128.3, 34.6)],
+    "熊本県": [(130.74, 32.79), (130.8, 32.3), (131.1, 32.9)],
+    "大分県": [(131.61, 33.24), (131.2, 33.2)],
+    "宮崎県": [(131.42, 31.91), (131.1, 32.1)],
+    "鹿児島県": [(130.56, 31.56), (130.3, 31.2), (129.5, 28.4), (130.5, 30.4)],
+    "沖縄県": [(127.68, 26.21), (127.9, 26.6), (124.15, 24.34), (123.0, 24.45)],
+}
+_PREF_REGION = {}
+for _reg, _prefs in {
+    "北海道": ["北海道"],
+    "東北": ["青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県"],
+    "関東": ["茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県"],
+    "北陸・甲信越": ["新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県"],
+    "東海": ["岐阜県", "静岡県", "愛知県"],
+    "近畿": ["三重県", "滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県"],
+    "中国": ["鳥取県", "島根県", "岡山県", "広島県", "山口県"],
+    "四国": ["徳島県", "香川県", "愛媛県", "高知県"],
+    "九州": ["福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県"],
+    "沖縄": ["沖縄県"],
+}.items():
+    for _p in _prefs:
+        _PREF_REGION[_p] = _reg
+
+
+def _build_area_geo():
+    names, plon, plat = [], [], []
+    for p, pts in _PREF_PTS.items():
+        for lo_, la_ in pts:
+            names.append(p)
+            plon.append(lo_)
+            plat.append(la_)
+    plon, plat = np.array(plon), np.array(plat)
+    kx = 111.32 * math.cos(math.radians(36.0))
+    d = ((ST_LON[:, None] - plon[None, :]) * kx) ** 2 + ((ST_LAT[:, None] - plat[None, :]) * 110.57) ** 2
+    st_pref = [names[j] for j in np.argmin(d, axis=1)]
+    out = {}
+    for a in np.unique(ST_AREA):
+        votes = {}
+        for i in np.where(ST_AREA == a)[0]:
+            votes[st_pref[i]] = votes.get(st_pref[i], 0) + 1
+        pref = max(votes, key=votes.get)
+        nm = AREA_NAMES.get(int(a), "")
+        for p in _PREF_PTS:                       # 区域名に都道府県名があれば優先
+            if nm.startswith(p):
+                pref = p
+                break
+        else:
+            if nm.startswith("伊豆諸島") or nm.startswith("小笠原"):
+                pref = "東京都"
+        out[int(a)] = (pref, _PREF_REGION[pref])
+    return out
+
+
+AREA_GEO = _build_area_geo()
+
 # 海溝・トラフ軸の近似ポリラインとその名称（経度, 緯度）。判別用の概略値
 TRENCHES = {
     "千島海溝": [(155.0, 48.5), (150.5, 45.5), (147.3, 43.3), (145.0, 41.3)],
@@ -162,10 +265,12 @@ def shindo_class(x):
     return k, labels[k]
 
 
-def final_intensity(mag, depth, lat0, lon0):
+def final_intensity(mag, depth, lat0, lon0, min_x=0.0):
     """
     各観測点の最終的な計測震度（Scratch版 震度計算 の非予想側の式）を返す。
-    戻り値: (m01, 震央距離km, depth_p)
+    戻り値: (m01, 震央距離km, depth_p, src)
+    min_x: 震源距離の下限[km]。EEWの予測では、推定震源が観測点の直下にあるとき
+           距離≈0で式が発散し震度7になるのを防ぐために使う（シミュレーション本体は0）。
     """
     # Scratch版の「震度計算処理」と同じ入力補正
     #   M引数 = M - (7.1-2.2),  深さ引数 = 深さ - 10
@@ -181,6 +286,8 @@ def final_intensity(mag, depth, lat0, lon0):
         tt = np.clip(sx * src["ux"] + sy * src["uy"], -src["L"] / 2, src["L"] / 2)
         dfault = np.minimum(dist, np.hypot(sx - tt * src["ux"], sy - tt * src["uy"]))
     x_hypo = np.sqrt(dfault ** 2 + depth_p ** 2)          # 震源距離
+    if min_x > 0.0:
+        x_hypo = np.maximum(x_hypo, min_x)
 
     area_a = 10.0 ** (0.91 * m_arg - 3.49)                # 断層面積 [km2]
     slip_d = 10.0 ** (0.69 * m_arg - 4.8)                 # 平均すべり量 [m]
@@ -466,12 +573,16 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     t_data, n >= 4, 0.002 if n < 4 else 0.0001)
             est = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
                                 T - t_first, rng)
+            # 規模がまだ推定できない間（P波検知直後で振幅が得られない）は、仮の固定値を
+            # 発表せず、直前の報の値を引き継ぐ。最初の報は規模が推定できてから発表する。
+            mag_known = (est is not None) or (last is not None)
             if est is None:
-                mag_e, capped = (last["mag"] if last else 5.0), False
+                mag_e, capped = (last["mag"] if last else 3.0), False
             else:
                 mag_e, capped = est
 
-            m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e)
+            # 推定震源が観測点直下でも式が発散しないよう、震源距離に下限(10km)を設ける
+            m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e, min_x=10.0)
             # --- PLUM法（実際の気象庁EEWでも併用）---
             fr = min(int(math.floor(t_data)), rt.shape[0] - 1)
             ob = np.nan_to_num(rt[fr].astype(np.float64), nan=-9.0, neginf=-9.0, posinf=-9.0)
@@ -497,6 +608,8 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 lv = 0
             if n == 1:
                 lv = min(lv, 1)                       # 1点検知では警報は出さない
+            if not mag_known:
+                lv = 0                                # 規模未確定の間は発表しない
             lv = max(lv, lv_max)                      # 警報・特別警報は途中で引き下げない
 
             areas = []
@@ -511,7 +624,9 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     c, lb = shindo_class(float(amx[a]))
                     if c < 4:
                         break
+                    pf, rg = AREA_GEO.get(int(a), ("その他", "その他"))
                     areas.append({"name": AREA_NAMES.get(int(a), "区域%d" % int(a)),
+                                  "pref": pf, "region": rg,
                                   "label": lb, "cls": c,
                                   "ts": round(float(ats[a]), 1) if np.isfinite(ats[a]) else None})
                     if len(areas) >= 60:
@@ -540,7 +655,10 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     last = {"no": len(reports) + 1, "t": round(float(T), 1), "lat": round(lat_e, 2),
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
-                            "maxCls": cls_e, "plum": bool(plum_used), "lv": lv, "areas": areas, "final": after_peak}
+                            "maxCls": cls_e, "plum": bool(plum_used), "lv": lv, "areas": areas, "final": after_peak,
+                            # 観測点ごとの予想震度（×10, int8, base64）: 地図の塗りつぶし用
+                            "pq": base64.b64encode(np.clip(np.round(np.nan_to_num(m01_p, nan=-9.0) * 10.0), -127, 127)
+                                                   .astype(np.int8).tobytes()).decode("ascii")}
                     reports.append(last)
                     yield ("report", last)
                     lv_max = lv
@@ -807,7 +925,10 @@ INDEX_HTML = r"""<!doctype html>
   #eewcard .chipbig{display:inline-block;min-width:56px;border-radius:9px;padding:0 8px;font-size:30px;line-height:1.3;color:#fff;text-shadow:0 0 3px #000a}
   #eewcard .pos{margin-top:6px;height:18px;font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap}
   #eewcard .aretitle{margin-top:4px;font-size:11px;color:#cfd8ea}
-  #eewcard .areas{height:64px;overflow:auto;font-size:12.5px}
+  #eewcard .areas{height:18px;overflow:hidden;white-space:nowrap;font-size:12px;margin-top:4px}
+  #warncard .warnbox{max-height:190px;overflow:auto}
+  #warncard table td{font-size:12px;padding:2px 4px}
+  #warncard table td.sm{color:var(--sub);font-size:11px;white-space:nowrap}
   #eewcard .histbox{height:84px;overflow:hidden;margin-top:4px}
   #eewcard table.hist{margin-top:0}
   #eewcard table.hist td{border-bottom:none}
@@ -845,6 +966,8 @@ INDEX_HTML = r"""<!doctype html>
   <label>震源の深さ（km）</label>
   <input id="depth" type="number" min="0" max="699" step="1" value="20">
 
+  <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
+
   <h2>プリセット</h2>
   <div class="presets" id="presets"></div>
 
@@ -881,10 +1004,13 @@ INDEX_HTML = r"""<!doctype html>
       <div class="tile"><div class="k">深さ</div><div class="v" id="eewDep">-</div></div>
     </div>
     <div class="pos" id="eewPos">シミュレーション実行後に表示</div>
-    <div class="aretitle">強い揺れ（震度4以上）の予想地域</div>
     <div id="eewAreas" class="areas"></div>
     <div class="histbox"><table id="eewHist" class="hist"></table></div>
-    <div class="sub">黄色の○＋＝EEW推定震源／赤✕＝設定した震源</div>
+    <div class="sub">黄色の○＋＝EEW推定震源／赤✕＝設定した震源／地図の薄い塗り＝予想震度</div>
+  </div>
+  <div id="warncard" class="card">
+    <h3>警報対象範囲（震度4以上を予想）<span id="warnMode" class="sub" style="margin-left:6px"></span></h3>
+    <div id="warnBox" class="warnbox"><span class="sub">警報・特別警報の発表後に表示</span></div>
   </div>
   <div id="rank" class="card">
     <h3>リアルタイム震度ランキング（区域別）</h3>
@@ -1063,6 +1189,33 @@ function interp(arr,t){
   return arr[f0]+(arr[f1]-arr[f0])*(f-f0);
 }
 
+let predCv=null;
+function drawPredFill(rep,z){
+  if(!rep._pv){                                        // 予想震度(×10, int8)を初回だけ展開
+    const bin=atob(rep.pq); const a=new Int8Array(bin.length);
+    for(let i=0;i<bin.length;i++) a[i]=(bin.charCodeAt(i)<<24)>>24;
+    rep._pv=a;
+  }
+  const pv=rep._pv; if(pv.length!==N) return;
+  const dpr=window.devicePixelRatio||1, w=cv.width, h=cv.height;
+  if(!predCv) predCv=document.createElement('canvas');
+  if(predCv.width!==w||predCv.height!==h){ predCv.width=w; predCv.height=h; }
+  const g=predCv.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w/dpr,h/dpr);
+  const mpp=156543.03*Math.cos(36*Math.PI/180)/Math.pow(2,z);   // m/px
+  const r=Math.max(6,22000/mpp);                                // 観測点1つが受け持つ半径≈22km
+  const byCls=[]; for(let k=0;k<10;k++) byCls.push([]);
+  for(let i=0;i<N;i++){ const v=pv[i]/10; if(v>=0.5) byCls[shindoCls(v)].push(i); }
+  for(let k=1;k<10;k++){                                        // 弱い階級から順に、強い階級を上書き
+    const b=byCls[k]; if(!b.length) continue;
+    g.fillStyle=clsColor(k); g.beginPath();
+    for(let j=0;j<b.length;j++){ const i=b[j]; g.moveTo(PX[i]+r,PY[i]); g.arc(PX[i],PY[i],r,0,6.2832); }
+    g.fill();
+  }
+  ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=0.3;
+  ctx.drawImage(predCv,0,0); ctx.restore();
+}
+
 function draw(ts){
   const s=map.getSize(); ctx.clearRect(0,0,s.x,s.y);
   if(!N) return;
@@ -1079,6 +1232,8 @@ function draw(ts){
     let k=Math.round((v-LUT_MIN)/LUT_STEP); if(k<0)k=0; if(k>=LUT_N)k=LUT_N-1;
     buckets[k].push(i);
   }
+  // EEWの予想震度で地図を薄く塗りつぶす（観測点ごとの予想震度の階級色。高い階級を上に重ねる）
+  if(sim && eewCur && eewCur.pq && $('showPred').checked) drawPredFill(eewCur,z);
   // 震度1以上の観測点は「円の中に震度階級の数字」で表示（ズームに応じて円を拡大）
   const rn=Math.min(16,5.5+(z-4)*1.2), showTxt=rn>=6.5;
   ctx.textAlign='center'; ctx.textBaseline='middle';
@@ -1151,6 +1306,7 @@ function updateEew(){
     eewSet('eewMag','-'); eewSet('eewDep','-');
     eewSet('eewPos',e?'観測点でP波を検知中…':'発表基準に達しませんでした');
     eewSet('eewAreas',''); eewSet('eewHist','');
+    eewSet('warnBox','<span class="sub">警報・特別警報の発表後に表示</span>'); eewSet('warnMode','');
     return;
   }
   card.className='card lv'+lvmax;
@@ -1161,18 +1317,33 @@ function updateEew(){
   eewSet('eewMag','M'+cur.mag.toFixed(1));
   eewSet('eewDep',cur.depth+'<small>km</small>');
   eewSet('eewPos','推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?' ／PLUM併用':''));
-  let ah='';
-  if(lvmax>=2){
-    if(cur.areas.length){
-      cur.areas.slice(0,12).forEach(a=>{
-        const rem=(a.ts==null)?null:a.ts-tcur;
-        const s=(rem==null)?'':(rem>0?'あと'+Math.ceil(rem)+'秒':'主要動到達');
-        ah+='<span class="rg">'+a.name+'<i>'+a.label+'</i> '+s+'</span>';
-      });
-      if(cur.areas.length>12) ah+='<span class="rg">ほか'+(cur.areas.length-12)+'区域</span>';
-    }else ah='<span class="sub">該当地域なし</span>';
-  }else ah='<span class="sub">強い揺れは予想されていません。今後の情報に注意。</span>';
-  eewSet('eewAreas',ah);
+  // 警報対象範囲の表: 範囲が狭ければ都道府県別、広ければ地域区分別にまとめる
+  let ah='', wh='', mode='';
+  if(lvmax>=2 && cur.areas.length){
+    ah='<span class="sub">警報対象 '+cur.areas.length+'区域（下表）</span>';
+    const prefs=new Set(cur.areas.map(a=>a.pref));
+    const byRegion=prefs.size>6;
+    mode=byRegion?'（地域区分別）':'（都道府県別）';
+    const grp={};
+    cur.areas.forEach(a=>{
+      const key=byRegion?a.region:a.pref;
+      const g=grp[key]||(grp[key]={key:key,cls:0,label:'',n:0,ts:null});
+      g.n++;
+      if(a.cls>g.cls){ g.cls=a.cls; g.label=a.label; }
+      if(a.ts!=null && (g.ts==null||a.ts<g.ts)) g.ts=a.ts;
+    });
+    const rows=Object.values(grp).sort((p,q)=>q.cls-p.cls||(p.ts==null?1e9:p.ts)-(q.ts==null?1e9:q.ts));
+    wh='<table><tr><td class="sm">'+(byRegion?'地域':'都道府県')+'</td><td class="sm" style="text-align:right">予想最大</td><td class="sm" style="text-align:right">区域</td><td class="sm" style="text-align:right">主要動</td></tr>';
+    rows.forEach(g=>{
+      const rem=(g.ts==null)?null:g.ts-tcur;
+      const s=(rem==null)?'-':(rem>0?'あと'+Math.ceil(rem)+'秒':'到達');
+      const tc=(g.cls===2||g.cls===3)?'#111':'#fff';
+      wh+='<tr><td>'+g.key+'</td><td class="num"><span class="chip" style="background:'+clsColor(g.cls)+';color:'+tc+'">'+g.label+'</span></td><td class="num">'+g.n+'</td><td class="num">'+s+'</td></tr>';
+    });
+    wh+='</table>';
+  }else if(lvmax>=2){ ah='<span class="sub">該当地域なし</span>'; wh='<span class="sub">該当地域なし</span>'; }
+  else{ ah='<span class="sub">強い揺れは予想されていません。今後の情報に注意。</span>'; wh='<span class="sub">警報・特別警報の発表後に表示</span>'; }
+  eewSet('eewAreas',ah); eewSet('warnBox',wh); eewSet('warnMode',mode);
   const hist=e.reports.filter(r=>r.t<=tcur).slice(-4).reverse();
   eewSet('eewHist','<tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
     +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+r.mag.toFixed(1)+'</td><td>'+r.depth+'km</td><td>'+r.maxLabel+'</td></tr>').join(''));
