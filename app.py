@@ -253,6 +253,230 @@ def realtime_frames(m01, kyori, dep_p, tf, p_curve, s_curve, tatsu):
     return out
 
 
+# =====================================================================
+# 2b. 緊急地震速報（EEW）: 観測された揺れから震源・規模・深さを逐次推定する
+#   実際のEEWと同様の流れ:
+#     1) 観測点がP波を検知（検知時刻にはピック誤差を含める）
+#     2) 検知済み観測点の到達時刻差＋「まだ検知していない周辺観測点」の制約から、
+#        グリッドサーチで震源（緯度・経度・深さ・発生時刻）を決定
+#        （検知点が少ないうちは観測点付近に仮定、4点以上で深さも推定）
+#     3) P波検知後3秒間の振幅から、推定震源までの距離で補正してマグニチュードを推定
+#        （波形が増えるほど大きな地震の規模を推定できる＝初期は過小評価になりやすい）
+#     4) 推定した震源・Mから各区域の震度を予測し、予報/警報/特別警報を判定
+#     5) 推定値が変化するたびに続報（第N報）を発表
+# =====================================================================
+TG = np.arange(0.0, 600.0 + 1e-9, 0.05)
+EEW_DEPTHS = [10.0, 30.0, 60.0, 120.0, 250.0, 450.0]
+EEW_DELAY = 3.0          # 観測点のデータ伝送(1秒)＋処理(2秒)の遅れ[秒]
+_TT_CACHE = {}
+
+
+def _tt(depth):
+    """深さdepth[km]のP波・S波の (震央距離[km]の曲線) を返す。時刻軸はTG"""
+    if depth not in _TT_CACHE:
+        dp = depth - 10.0
+        p = sanitize_p_curve(TG, wave_epicentral_km(TG, dp, True))
+        s_ = np.maximum.accumulate(wave_epicentral_km(TG, dp, False))
+        _TT_CACHE[depth] = (p, s_)
+    return _TT_CACHE[depth]
+
+
+def _planar_km(lat1, lon1, lat2, lon2):
+    """高速な簡易距離[km]（等距円筒近似。EEWの探索用）"""
+    dy = (lat1 - lat2) * 111.2
+    dx = (lon1 - lon2) * 111.2 * np.cos(np.radians((lat1 + lat2) / 2.0))
+    return np.sqrt(dx * dx + dy * dy)
+
+
+def _grid_cost(glat, glon, depth, tobs, lat_s, lon_s, lat_u, lon_u, t_data, lat1, lon1, prior):
+    pc = _tt(depth)[0]
+    ds = _planar_km(glat[:, None], glon[:, None], lat_s[None, :], lon_s[None, :])
+    tt_ = np.interp(ds, pc, TG, right=600.0)
+    t0 = np.mean(tobs[None, :] - tt_, axis=1)                 # 発生時刻（最小二乗）
+    res = tobs[None, :] - tt_ - t0[:, None]
+    cost = np.mean(res * res, axis=1)
+    if len(lat_u):
+        # まだ検知していない観測点: 予測到達時刻が現在より前なら矛盾（ペナルティ）
+        du = _planar_km(glat[:, None], glon[:, None], lat_u[None, :], lon_u[None, :])
+        arr = t0[:, None] + np.interp(du, pc, TG, right=600.0)
+        pen = np.maximum(t_data - arr, 0.0)
+        cost = cost + 0.1 * np.sum(pen * pen, axis=1)
+    cost = cost + prior * _planar_km(glat, glon, lat1, lon1) + 0.0002 * depth
+    return cost, t0
+
+
+def _locate(tobs, lat_s, lon_s, lat_u, lon_u, t_data, free_depth, prior):
+    """粗いグリッド→細かいグリッドの2段階で震源を探索。戻り値 (lat, lon, depth, t0)"""
+    lat1, lon1 = float(lat_s[0]), float(lon_s[0])
+    depths = EEW_DEPTHS if free_depth else [10.0]
+    best = None
+    clat, clon = lat1, lon1
+    for stage in (0, 1):
+        if stage == 0:
+            offs = np.arange(-6.0, 6.0001, 0.5)
+        else:
+            offs = np.arange(-0.5, 0.5001, 0.1)
+            clat, clon = best[1], best[2]
+        la, lo = np.meshgrid(clat + offs, clon + offs, indexing="ij")
+        glat, glon = la.ravel(), lo.ravel()
+        for d in depths:
+            c, t0 = _grid_cost(glat, glon, d, tobs, lat_s, lon_s, lat_u, lon_u,
+                               t_data, lat1, lon1, prior)
+            k = int(np.argmin(c))
+            if best is None or c[k] < best[0]:
+                best = (float(c[k]), float(glat[k]), float(glon[k]), d, float(t0[k]))
+    return best[1], best[2], best[3], best[4]
+
+
+def _mw_of_mag(mag):
+    m_arg = mag - (7.1 - 2.2)
+    a = 10.0 ** (0.91 * m_arg - 3.49)
+    d = 10.0 ** (0.69 * m_arg - 4.8)
+    return (2.0 / 3.0) * math.log10(3.0e10 * (a * 1.0e6) * d) - 6.07
+
+
+_MW_B = _mw_of_mag(4.9)
+_MW_A = _mw_of_mag(5.9) - _MW_B
+
+
+def _mag_of_mw(mw):
+    return 4.9 + (mw - _MW_B) / _MW_A
+
+
+def _mw_from_m01(m01_i, x, depth_p, arv, sdep):
+    """観測点の計測震度から、距離減衰式を逆算してMwを求める（二分法）"""
+    lo = np.full(m01_i.shape, 1.0)
+    hi = np.full(m01_i.shape, 10.5)
+    for _ in range(40):
+        mid = (lo + hi) / 2.0
+        lp = (0.58 * mid + 0.0038 * depth_p
+              - np.log10(x + 0.0028 * 10.0 ** (0.5 * mid)) - 0.002 * x - 1.29)
+        m = 2.68 + 1.72 * (lp + np.log10(arv * (4000.0 - sdep)))
+        up = m > m01_i
+        hi = np.where(up, mid, hi)
+        lo = np.where(up, lo, mid)
+    return (lo + hi) / 2.0
+
+
+def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
+    """P波検知後3秒間の振幅からマグニチュードを推定。使える観測点が無ければNone"""
+    pc, sc = _tt(dep_e)
+    t_ceil = np.ceil(tp_n[avail]).astype(int)
+    f = np.minimum(np.minimum(int(math.floor(t_data)), t_ceil + 3), rt.shape[0] - 1)
+    ok = f >= t_ceil + 1
+    idx, f = avail[ok], f[ok]
+    if len(idx) == 0:
+        return None
+    obs = rt[f, idx].astype(np.float64) + rng.normal(0.0, 0.25, len(idx))   # 振幅の観測ノイズ
+    d = np.maximum(hubeny_km(lat_e, lon_e, ST_LAT[idx], ST_LON[idx]), 15.0)
+    ts_e = t0_e + np.interp(d, sc, TG, right=600.0)
+    good = (obs > -2.5) & (f < ts_e - 0.5)            # ノイズ以上かつP波区間の観測点のみ
+    if not good.any():
+        return None
+    idx, f, obs, d = idx[good], f[good], obs[good], d[good]
+    dep_p = dep_e - 10.0
+    dterm = min(max(dep_p - 10.0, 0.0), 30.0)
+    bai_dep = (ST_DEP[idx] + 1200.0) / 600.0
+    kp = (-0.006 + dterm / 2000.0) - bai_dep / 300.0
+    pr = np.interp(f - t0_e, TG, pc)                   # 推定震源から見たP波の到達距離
+    zp = d - pr
+    m01_i = obs - zp * kp * 2.0 + (3.5 + d / 150.0) + dterm / 52.0
+    x = np.sqrt(d * d + dep_p * dep_p)
+    mw = float(np.median(_mw_from_m01(m01_i, x, dep_p, ST_ARV[idx], ST_DEP[idx])))
+    mag = min(max(_mag_of_mw(mw), 2.0), 9.5)
+    # 観測波形が短いうちは大地震の規模を過小評価する（経過時間とともに上限が上がる）
+    return min(mag, 6.2 + 0.95 * math.log2(1.0 + max(tau, 0.0) / 3.0))
+
+
+def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
+    """緊急地震速報の発表列（第1報, 第2報, ...）を生成する"""
+    rng = np.random.default_rng(int(abs(lat0) * 1000 + abs(lon0) * 100 + mag * 10 + depth) % (2 ** 31))
+    tp_n = tp + rng.normal(0.0, 0.1, N_ST)            # P波ピックの誤差
+    order = np.argsort(tp_n)
+    n_fin = int(np.isfinite(tp_n).sum())
+    if n_fin < 2:
+        return None
+    order = order[:n_fin]
+    t_first = float(tp_n[order[0]])
+    T = int(math.ceil(float(tp_n[order[1]]) + EEW_DELAY))
+    T0 = T
+    T_stop = min(t_end - 1.0, t_first + 100.0)
+    max_a = int(ST_AREA.max())
+    reports, last, lv_max = [], None, 0
+
+    while T <= T_stop and len(reports) < 40:
+        t_data = T - EEW_DELAY
+        avail = order[tp_n[order] <= t_data]
+        n = len(avail)
+        if n >= 2:
+            use = avail[:20]
+            mask = np.ones(N_ST, dtype=bool)
+            mask[avail] = False
+            cand = np.where(mask)[0]
+            dc = _planar_km(ST_LAT[use[0]], ST_LON[use[0]], ST_LAT[cand], ST_LON[cand])
+            unt = cand[np.argsort(dc)[:50]]
+            lat_e, lon_e, dep_e, t0_e = _locate(
+                tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
+                t_data, n >= 4, 0.003 if n < 4 else 0.0005)
+            mag_e = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
+                                  T - t_first, rng)
+            if mag_e is None:
+                mag_e = last["mag"] if last else 5.0
+
+            m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e)
+            vmax_e = float(m01_p.max())
+            if vmax_e >= 6.0:
+                lv = 3
+            elif vmax_e >= 5.0:
+                lv = 2
+            elif vmax_e >= 3.0 or mag_e >= 3.5:
+                lv = 1
+            else:
+                lv = 0
+            lv = max(lv, lv_max)                      # 警報・特別警報は途中で引き下げない
+
+            areas = []
+            if lv >= 2:
+                amx = np.full(max_a + 1, -99.0)
+                np.maximum.at(amx, ST_AREA, m01_p)
+                de = hubeny_km(lat_e, lon_e, ST_LAT, ST_LON)
+                ts_all = t0_e + np.interp(de, _tt(dep_e)[1], TG, right=600.0)
+                ats = np.full(max_a + 1, np.inf)
+                np.minimum.at(ats, ST_AREA, ts_all)
+                for a in np.argsort(-amx):
+                    c, lb = shindo_class(float(amx[a]))
+                    if c < 4:
+                        break
+                    areas.append({"name": AREA_NAMES.get(int(a), "区域%d" % int(a)),
+                                  "label": lb, "cls": c,
+                                  "ts": round(float(ats[a]), 1) if np.isfinite(ats[a]) else None})
+                    if len(areas) >= 30:
+                        break
+
+            if lv >= 1:
+                if last is None:
+                    changed = True
+                else:
+                    dpos = float(_planar_km(lat_e, lon_e, last["lat"], last["lon"]))
+                    changed = (abs(mag_e - last["mag"]) >= 0.2 or dpos >= 20.0
+                               or abs(dep_e - last["depth"]) >= 20.0 or lv != last["lv"]
+                               or abs(len(areas) - len(last["areas"])) >= 3)
+                if changed:
+                    cls_max, lb_max = shindo_class(vmax_e)
+                    last = {"no": len(reports) + 1, "t": int(T), "lat": round(lat_e, 2),
+                            "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
+                            "nSt": int(n), "max": round(vmax_e, 1), "maxLabel": lb_max,
+                            "maxCls": cls_max, "lv": lv, "areas": areas, "final": False}
+                    reports.append(last)
+                    lv_max = lv
+        T += 1 if T < T0 + 40 else 3
+
+    if not reports:
+        return None
+    reports[-1]["final"] = True
+    return {"reports": reports}
+
+
 def simulate(lat0, lon0, mag, depth, dt=1.0):
     m01, dist, dep_p, src = final_intensity(mag, depth, lat0, lon0)
 
@@ -302,38 +526,8 @@ def simulate(lat0, lon0, mag, depth, dt=1.0):
     vmax = float(m01.max())
     cls, label = shindo_class(vmax)
 
-    # --- 緊急地震速報（簡易判定） ---
-    #   特別警報: 予想最大震度6弱以上 / 警報: 5弱以上 / 予報: 震度3以上またはM3.5以上
-    #   発表時刻: 2番目に近い観測点にP波が届いてから3秒後と仮定
-    if vmax >= 6.0:
-        e_lv, e_label = 3, "緊急地震速報（特別警報）"
-    elif vmax >= 5.0:
-        e_lv, e_label = 2, "緊急地震速報（警報）"
-    elif vmax >= 3.0 or mag >= 3.5:
-        e_lv, e_label = 1, "緊急地震速報（予報）"
-    else:
-        e_lv, e_label = 0, ""
-    eew = None
-    if e_lv:
-        fin_tp = np.sort(tp[np.isfinite(tp)])
-        t_issue = (float(fin_tp[1]) if len(fin_tp) > 1 else (float(fin_tp[0]) if len(fin_tp) else 0.0)) + 3.0
-        area_ts = {}
-        for a, t_ in zip(ST_AREA, tatsu):
-            if a not in area_ts or t_ < area_ts[a]:
-                area_ts[a] = t_
-        e_areas = []
-        if e_lv >= 2:
-            for a, v in sorted(area_max.items(), key=lambda kv: -kv[1]):
-                c, lb = shindo_class(v)
-                if c < 4:
-                    break
-                ts_ = float(area_ts.get(a, float("inf")))
-                e_areas.append({"name": AREA_NAMES.get(a, "区域%d" % a), "label": lb, "cls": c,
-                                "ts": round(ts_, 1) if math.isfinite(ts_) else None})
-                if len(e_areas) >= 40:
-                    break
-        eew = {"level": e_lv, "label": e_label, "tIssue": round(t_issue, 1),
-               "maxLabel": label, "areas": e_areas}
+    # 緊急地震速報: 観測点の検知データから震源・規模・深さを逐次推定した速報列
+    eew = build_eew(mag, depth, lat0, lon0, tp, rt, t_end)
 
     def _clean(a, nd=1):
         return [None if not math.isfinite(x) else round(float(x), nd) for x in a]
@@ -479,18 +673,21 @@ INDEX_HTML = r"""<!doctype html>
   .epi{color:#ff4d4d;font-size:26px;font-weight:900;text-shadow:0 0 4px #000,0 0 8px #000;
     line-height:26px;text-align:center}
   .foot{font-size:10.5px;color:var(--sub);line-height:1.55;margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
-  #rank{position:absolute;z-index:1000;right:10px;top:96px;width:200px;background:var(--panel);
-    border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px}
-  #rank h3{margin:0 0 5px;font-size:11.5px;color:var(--sub);font-weight:600}
+  #rightcol{position:absolute;z-index:1000;right:10px;top:56px;width:310px;max-height:calc(100% - 170px);
+    overflow:auto;display:flex;flex-direction:column;gap:8px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.5}
+  .card h3{margin:0 0 5px;font-size:11.5px;color:var(--sub);font-weight:600}
+  .card .sub{color:var(--sub);font-size:11px;margin-top:3px}
   #rank td.no{color:var(--sub);width:14px}
-  #eew{position:absolute;z-index:1050;top:54px;left:50%;transform:translateX(-50%);display:none;
-    width:min(520px,calc(100% - 20px));border-radius:10px;padding:8px 14px;border:2px solid;font-size:13px;line-height:1.5}
-  #eew .t{font-size:16px;font-weight:800}
-  #eew .rg{display:inline-block;margin:2px 10px 2px 0;white-space:nowrap}
-  #eew .rg i{font-style:normal;font-weight:700;margin-left:3px}
-  #eew.lv1{background:#12304fee;border-color:#3b9cff}
-  #eew.lv2{background:#7a1010ee;border-color:#ff4d4d;animation:eewb 1s infinite}
-  #eew.lv3{background:#2a0a3eee;border-color:#c04bff;animation:eewb .6s infinite}
+  #eewcard{border-width:2px}
+  #eewcard .t{font-size:15px;font-weight:800}
+  #eewcard .rg{display:inline-block;margin:2px 10px 2px 0;white-space:nowrap}
+  #eewcard .rg i{font-style:normal;font-weight:700;margin-left:3px}
+  #eewcard table.hist{margin-top:5px}
+  #eewcard table.hist td{font-size:11px;padding:1px 4px;color:var(--sub)}
+  #eewcard.lv1{background:#12304fee;border-color:#3b9cff}
+  #eewcard.lv2{background:#7a1010ee;border-color:#ff4d4d;animation:eewb 1s infinite}
+  #eewcard.lv3{background:#2a0a3eee;border-color:#c04bff;animation:eewb .6s infinite}
   @keyframes eewb{50%{box-shadow:0 0 18px 4px #ff3b3b99}}
   @media (max-width:700px){
     #panel{width:calc(100% - 20px);max-height:62%;top:52px;display:none}
@@ -498,8 +695,7 @@ INDEX_HTML = r"""<!doctype html>
     #toggle{display:block}
     #hud{top:10px;left:auto;right:60px;transform:none;padding:5px 9px;gap:8px;font-size:12px}
     #hud .lbl{display:none}
-    #rank{top:96px;width:158px;font-size:11px;padding:6px 7px}
-    #eew{top:48px}
+    #rightcol{top:92px;width:min(320px,calc(100% - 20px));max-height:calc(100% - 230px)}
   }
 </style>
 </head>
@@ -529,10 +725,8 @@ INDEX_HTML = r"""<!doctype html>
   <div id="status"></div>
 
   <div id="result" style="display:none">
-    <h2>予想される最大震度</h2>
-    <div id="maxbox"><span class="big" id="maxbig"></span><span id="maxsub" class="hint" style="margin:0"></span></div>
     <div id="srcinfo" class="hint"></div>
-    <h2>区域別の最大震度（上位）</h2>
+    <h2>最終的な区域別最大震度（シミュレーション結果・上位）</h2>
     <table id="areas"></table>
   </div>
 
@@ -550,11 +744,16 @@ INDEX_HTML = r"""<!doctype html>
   <span><span class="lbl">現在の最大</span><b id="hM">-</b></span>
 </div>
 
-<div id="rank">
-  <h3>リアルタイム震度ランキング（区域別）</h3>
-  <table id="rankTbl"><tr><td style="color:var(--sub)">シミュレーション実行後に表示</td></tr></table>
+<div id="rightcol">
+  <div id="eewcard" class="card lv0">
+    <h3>緊急地震速報</h3>
+    <div id="eewbody"><div class="sub">シミュレーション実行後に表示</div></div>
+  </div>
+  <div id="rank" class="card">
+    <h3>リアルタイム震度ランキング（区域別）</h3>
+    <table id="rankTbl"><tr><td style="color:var(--sub)">シミュレーション実行後に表示</td></tr></table>
+  </div>
 </div>
-<div id="eew"></div>
 
 <div id="bar">
   <div id="ctl">
@@ -748,6 +947,9 @@ function draw(ts){
     updateEew();
     drawCircle(interp(sim.P,tcur),'rgba(90,200,255,.95)',1.6);
     drawCircle(interp(sim.S,tcur),'rgba(255,95,95,.98)',2.2);
+    if(eewCur){ const p=map.latLngToContainerPoint([eewCur.lat,eewCur.lon]);
+      ctx.strokeStyle='#ffd23b'; ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(p.x,p.y,9,0,6.2832);
+      ctx.moveTo(p.x-14,p.y); ctx.lineTo(p.x+14,p.y); ctx.moveTo(p.x,p.y-14); ctx.lineTo(p.x,p.y+14); ctx.stroke(); }
     $('hT').textContent=tcur.toFixed(1);
     $('hP').textContent=interp(sim.P,tcur).toFixed(0);
     $('hS').textContent=interp(sim.S,tcur).toFixed(0);
@@ -757,7 +959,7 @@ function draw(ts){
   }
 }
 
-let lastRank=0;
+let lastRank=0, eewCur=null;
 function updateRank(ts){
   if(!sim||!AM||(ts||0)-lastRank<250) return; lastRank=ts||0;
   const arr=[]; for(let a=0;a<AM.length;a++){ if(AM[a]>=0.5) arr.push([a,AM[a]]); }
@@ -770,25 +972,41 @@ function updateRank(ts){
   });
   $('rankTbl').innerHTML=h||'<tr><td style="color:#93a0b8">震度1以上の観測なし</td></tr>';
 }
+const EEW_LBL=['','予報','警報','特別警報'];
 function updateEew(){
-  const e=sim.eew, box=$('eew');
-  if(!e||tcur<e.tIssue){ box.style.display='none'; return; }
-  const ep=sim.epi;
-  let h='<div class="t">'+e.label+'</div><div>M'+ep.mag.toFixed(1)+' ／ 深さ'+ep.depth+'km ／ 予想最大震度 '+e.maxLabel+'</div>';
-  if(e.level>=2){
-    h+='<div style="margin-top:3px">強い揺れ（震度4以上）が予想される地域：</div>';
-    const rows=e.areas.slice(0,8).map(a=>{
-      const rem=a.ts==null?null:a.ts-tcur;
-      const s=rem==null?'':(rem>0?'あと'+Math.ceil(rem)+'秒':'主要動到達');
-      return '<span class="rg">'+a.name+'<i>'+a.label+'</i> '+s+'</span>';
-    });
-    h+='<div>'+rows.join('')+(e.areas.length>8?'<span class="rg">ほか'+(e.areas.length-8)+'区域</span>':'')+'</div>';
-    h+='<div style="font-weight:700">強い揺れに警戒してください。</div>';
+  const card=$('eewcard'), body=$('eewbody'), e=sim.eew;
+  let cur=null, lvmax=0;
+  if(e){ for(let i=0;i<e.reports.length;i++){ const r=e.reports[i]; if(r.t>tcur) break; cur=r; if(r.lv>lvmax) lvmax=r.lv; } }
+  eewCur=cur;
+  let h;
+  if(!cur){
+    card.className='card lv0';
+    h='<div class="sub">'+(e?'観測点でP波を検知中…（発表前）':'発表基準に達しませんでした')+'</div>';
   }else{
-    h+='<div>今後の情報に注意してください。</div>';
+    card.className='card lv'+lvmax;
+    h='<div class="t">緊急地震速報（'+EEW_LBL[lvmax]+'）第'+cur.no+'報'+(cur.final?'（最終）':'')+'</div>';
+    h+='<div>推定震源 北緯'+cur.lat.toFixed(1)+'° 東経'+cur.lon.toFixed(1)+'° 深さ'+cur.depth+'km</div>';
+    h+='<div>規模 <b>M'+cur.mag.toFixed(1)+'</b> ／ 予想最大震度 <b>'+cur.maxLabel+'</b> ／ 検知 '+cur.nSt+'点</div>';
+    if(lvmax>=2){
+      if(cur.areas.length){
+        h+='<div style="margin-top:4px">強い揺れ（震度4以上）が予想される地域</div><div>';
+        cur.areas.slice(0,10).forEach(a=>{
+          const rem=(a.ts==null)?null:a.ts-tcur;
+          const s=(rem==null)?'':(rem>0?'あと'+Math.ceil(rem)+'秒':'主要動到達');
+          h+='<span class="rg">'+a.name+'<i>'+a.label+'</i> '+s+'</span>';
+        });
+        if(cur.areas.length>10) h+='<span class="rg">ほか'+(cur.areas.length-10)+'区域</span>';
+        h+='</div><div style="font-weight:700">強い揺れに警戒してください。</div>';
+      }
+    }else{
+      h+='<div>今後の情報に注意してください。</div>';
+    }
+    const hist=e.reports.filter(r=>r.t<=tcur).slice(-6).reverse();
+    h+='<table class="hist"><tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
+      +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+r.mag.toFixed(1)+'</td><td>'+r.depth+'km</td><td>'+r.maxLabel+'</td></tr>').join('')+'</table>';
+    h+='<div class="sub">黄色の○＋＝EEW推定震源／赤✕＝設定した震源</div>';
   }
-  box.className='lv'+e.level; box.style.display='block';
-  if(box._h!==h){ box.innerHTML=h; box._h=h; }
+  if(body._h!==h){ body.innerHTML=h; body._h=h; }
 }
 
 function tick(ts){
@@ -834,8 +1052,6 @@ $('run').onclick=async()=>{
 
 function showResult(j){
   $('result').style.display='block';
-  const big=$('maxbig'); big.textContent=j.maxLabel; big.style.background=clsColor(j.maxCls);
-  $('maxsub').textContent='最大計測震度 '+j.max.toFixed(1)+'（M'+j.epi.mag.toFixed(1)+' / 深さ'+j.epi.depth+'km）';
   $('srcinfo').textContent='震源タイプ: '+j.src.type+(j.src.name?'（'+j.src.name+'）':'')+(j.src.L>0?' ／ 想定断層長 約'+j.src.L+'km（断層の広がりを考慮して震度を計算）':'');
   const t=$('areas'); t.innerHTML='';
   if(!j.areas.length){ t.innerHTML='<tr><td>震度1以上の区域はありません</td></tr>'; return; }
