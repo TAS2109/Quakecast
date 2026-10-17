@@ -270,7 +270,7 @@ def realtime_frames(m01, kyori, dep_p, tf, p_curve, s_curve, tatsu):
 # =====================================================================
 TG = np.arange(0.0, 600.0 + 1e-9, 0.05)
 EEW_DEPTHS = [10.0, 30.0, 60.0, 120.0, 250.0, 450.0]
-EEW_DELAY = 3.0          # 観測点のデータ伝送(1秒)＋処理(2秒)の遅れ[秒]
+EEW_DELAY = 2.0          # 観測点のデータ伝送(1秒)＋処理(1秒)の遅れ[秒]
 _TT_CACHE = {}
 
 
@@ -426,22 +426,29 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
         return
     order = order[:n_fin]
     t_first = float(tp_n[order[0]])
-    T = int(math.ceil(float(tp_n[order[1]]) + EEW_DELAY))
+    T = float(tp_n[order[0]]) + EEW_DELAY          # 最初の1点検知から開始（切り上げなし）
     T0 = T
     # 実際に最大の揺れが観測される時刻。最終報はこれより後に発表する
     peak = float(rt.max())
     t_peak = int(np.argmax(rt.max(axis=1) >= peak - 0.05))
-    T_stop = min(t_end - 1.0, max(t_first + 60.0, t_peak + 6.0))
+    # 発表の終了目安: 震度4以上の揺れが最後の地域に達する時刻まで（直下型で最大震度が
+    # 早く出ても、遠方の地域に向けて続報を出し続ける）
+    m4 = rt >= 3.5
+    has4 = m4.any(axis=0)
+    t_last = float(np.argmax(m4[:, has4], axis=0).max()) if has4.any() else float(t_peak)
+    T_stop = min(t_end - 1.0, max(t_first + 60.0, t_last + 6.0))
     max_a = int(ST_AREA.max())
     reports, last, lv_max = [], None, 0
     warned = {}      # 警報対象地域（発表済みは続報でも保持）
     yield ("upto", T0 - 0.001)
 
     while T <= T_stop:
+        step = 1.0 if T < T0 + 60 else (2.0 if T < T0 + 180 else 4.0)
+        is_last = (T + step > T_stop)                 # この回が最後 → 最終報
         t_data = T - EEW_DELAY
         avail = order[tp_n[order] <= t_data]
         n = len(avail)
-        if n >= 2:
+        if n >= 1:
             # 最初の20点＋広く散らばった検知点（開口が広いほど遠地の距離が決まる）
             use = avail[:20] if n <= 20 else np.concatenate(
                 [avail[:20], avail[20:][::max(1, (n - 20) // 40)][:40]])
@@ -450,9 +457,13 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             cand = np.where(mask)[0]
             dc = _planar_km(ST_LAT[use[0]], ST_LON[use[0]], ST_LAT[cand], ST_LON[cand])
             unt = cand[np.argsort(dc)[:50]]
-            lat_e, lon_e, dep_e, t0_e, cost_e = _locate(
-                tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
-                t_data, n >= 4, 0.002 if n < 4 else 0.0001)
+            if n == 1:     # 1点検知: 観測点の直下(深さ10km)と仮定（テリトリー法）
+                lat_e, lon_e, dep_e = float(ST_LAT[avail[0]]), float(ST_LON[avail[0]]), 10.0
+                t0_e, cost_e = float(tp_n[avail[0]]), 1.0
+            else:
+                lat_e, lon_e, dep_e, t0_e, cost_e = _locate(
+                    tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
+                    t_data, n >= 4, 0.002 if n < 4 else 0.0001)
             est = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
                                 T - t_first, rng)
             if est is None:
@@ -484,6 +495,8 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 lv = 1
             else:
                 lv = 0
+            if n == 1:
+                lv = min(lv, 1)                       # 1点検知では警報は出さない
             lv = max(lv, lv_max)                      # 警報・特別警報は途中で引き下げない
 
             areas = []
@@ -508,7 +521,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 areas = sorted(warned.values(), key=lambda x: -x["cls"])[:60]
 
             if lv >= 1:
-                after_peak = T >= t_peak + 1          # 最大震度の観測後 → これが最終報
+                after_peak = is_last                  # 発表終了の目安に達した → 最終報
                 if last is None:
                     changed = True
                 else:
@@ -522,9 +535,9 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                              or abs(dep_e - last["depth"]) >= 20.0
                              or (cls_e != last["maxCls"] and abs(vmax_e - last["max"]) >= 0.3))
                     area_added = len(areas) > len(last["areas"])   # 警報対象地域の追加は即続報
-                    changed = (lv != last["lv"]) or area_added or (moved and T - last["t"] >= 2)
+                    changed = (lv != last["lv"]) or area_added or (moved and T - last["t"] >= (1 if lv >= 2 else 2))
                 if (changed and len(reports) < 80) or after_peak:
-                    last = {"no": len(reports) + 1, "t": int(T), "lat": round(lat_e, 2),
+                    last = {"no": len(reports) + 1, "t": round(float(T), 1), "lat": round(lat_e, 2),
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
                             "maxCls": cls_e, "plum": bool(plum_used), "lv": lv, "areas": areas, "final": after_peak}
@@ -533,7 +546,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     lv_max = lv
                     if after_peak:
                         break
-        T += 1 if T < T0 + 90 else 2
+        T += step
         yield ("upto", T - 0.001)
 
     if not reports:
