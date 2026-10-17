@@ -641,27 +641,66 @@ def _planar_km(lat1, lon1, lat2, lon2):
     return 12742.0 * np.arcsin(np.sqrt(np.minimum(a, 1.0)))
 
 
-def _grid_cost(glat, glon, depth, tobs, lat_s, lon_s, lat_u, lon_u, t_data, lat1, lon1, prior):
-    pc = _tt(depth)[0]
-    ds = _planar_km(glat[:, None], glon[:, None], lat_s[None, :], lon_s[None, :])
-    tt_ = np.interp(ds, pc, TG, right=600.0)
+_INV_STEP = 0.5          # 走時テーブルの距離刻み[km]
+_INV_CACHE = {}
+
+
+def _tt_inv(depth):
+    """深さdepthのP波について、震央距離(0, 0.5, 1.0, ...km)から伝播時間[秒]を引く等間隔テーブル。
+    np.interp（二分探索）より、配列演算だけで引ける等間隔テーブルのほうが格段に速い。"""
+    if depth not in _INV_CACHE:
+        pc = _tt(depth)[0]
+        xs = np.arange(0.0, float(pc[-1]) + 2.0 * _INV_STEP, _INV_STEP)
+        tab = np.interp(xs, pc, TG, right=600.0)
+        _INV_CACHE[depth] = (tab, np.diff(tab))
+    return _INV_CACHE[depth]
+
+
+def _lookup_tt(ds, depth):
+    tab, dtab = _tt_inv(depth)
+    x = np.minimum(ds * (1.0 / _INV_STEP), len(dtab) - 1e-6)
+    i = x.astype(np.intp)
+    return tab[i] + dtab[i] * (x - i)
+
+
+def _unit_vec(lat, lon):
+    p, l = np.radians(lat), np.radians(lon)
+    c = np.cos(p)
+    return np.stack([c * np.cos(l), c * np.sin(l), np.sin(p)], axis=-1)
+
+
+def _gc_dist(ua, ub):
+    """単位ベクトル (A,3) と (B,3) の全組み合わせの大圏距離[km] (A,B)（_planar_kmと同じ値）"""
+    d2 = np.maximum(2.0 - 2.0 * (ua @ ub.T), 0.0)         # 弦長の2乗
+    return 12742.0 * np.arcsin(np.minimum(np.sqrt(d2) * 0.5, 1.0))
+
+
+def _grid_cost(ds, du, depth, tobs, t_data, base):
+    """ds: グリッド点→検知済み観測点の距離(G,S), du: →未検知の観測点の距離(G,U)またはNone,
+    base: グリッド点ごとの事前分布項(G,)。距離行列は深さに依存しないので呼び出し側で1回だけ作る。"""
+    tt_ = _lookup_tt(ds, depth)
     t0 = np.mean(tobs[None, :] - tt_, axis=1)                 # 発生時刻（最小二乗）
     res = tobs[None, :] - tt_ - t0[:, None]
     cost = np.mean(res * res, axis=1)
-    if len(lat_u):
+    if du is not None:
         # まだ検知していない観測点: 予測到達時刻が現在より前なら矛盾（ペナルティ）
-        du = _planar_km(glat[:, None], glon[:, None], lat_u[None, :], lon_u[None, :])
-        arr = t0[:, None] + np.interp(du, pc, TG, right=600.0)
+        arr = t0[:, None] + _lookup_tt(du, depth)
         pen = np.maximum(t_data - arr, 0.0)
         cost = cost + 0.1 * np.sum(pen * pen, axis=1)
-    cost = cost + prior * _planar_km(glat, glon, lat1, lon1) + 0.0002 * depth
-    return cost, t0
+    return cost + base + 0.0002 * depth, t0
 
 
 def _locate(tobs, lat_s, lon_s, lat_u, lon_u, t_data, free_depth, prior):
-    """粗いグリッド→細かいグリッドの2段階で震源を探索。戻り値 (lat, lon, depth, t0)"""
+    """粗いグリッド→細かいグリッドの2段階で震源を探索。戻り値 (lat, lon, depth, t0, cost)
+    粗い探索（1°刻み±24°）は代表的な観測点だけで盆地を決め、以降の細かい探索は全点で行う。"""
     lat1, lon1 = float(lat_s[0]), float(lon_s[0])
     depths = EEW_DEPTHS if free_depth else [10.0]
+    us = _unit_vec(lat_s, lon_s)
+    uu = _unit_vec(lat_u, lon_u) if len(lat_u) else None
+    u1 = us[:1]
+    ns = len(tobs)
+    sub = (np.unique(np.concatenate([np.arange(10), np.linspace(10, ns - 1, 18).astype(int)]))
+           if ns > 28 else np.arange(ns))                    # 早い検知10点＋広く散らばった点
     best = None
     clat, clon = lat1, lon1
     for stage in (0, 1, 2):                              # 1°刻み(±24°) → 0.2°刻み → 0.05°刻み
@@ -672,12 +711,21 @@ def _locate(tobs, lat_s, lon_s, lat_u, lon_u, t_data, free_depth, prior):
             clat, clon = best[1], best[2]
         la, lo = np.meshgrid(clat + offs, clon + offs, indexing="ij")
         glat, glon = la.ravel(), lo.ravel()
+        ug = _unit_vec(glat, glon)
+        if stage == 0:
+            ds, tob = _gc_dist(ug, us[sub]), tobs[sub]
+            du = _gc_dist(ug, uu[:20]) if uu is not None else None
+        else:
+            ds, tob = _gc_dist(ug, us), tobs
+            du = _gc_dist(ug, uu) if uu is not None else None
+        base = prior * _gc_dist(ug, u1)[:, 0]
+        best_st = None
         for d in (depths if stage else [x for x in depths if x in EEW_DEPTHS_COARSE] or depths):
-            c, t0 = _grid_cost(glat, glon, d, tobs, lat_s, lon_s, lat_u, lon_u,
-                               t_data, lat1, lon1, prior)
+            c, t0 = _grid_cost(ds, du, d, tob, t_data, base)
             k = int(np.argmin(c))
-            if best is None or c[k] < best[0]:
-                best = (float(c[k]), float(glat[k]), float(glon[k]), d, float(t0[k]))
+            if best_st is None or c[k] < best_st[0]:
+                best_st = (float(c[k]), float(glat[k]), float(glon[k]), d, float(t0[k]))
+        best = best_st      # 段ごとに最良を取り直す（粗い探索は部分集合のコストなので段をまたいで比べない）
     return best[1], best[2], best[3], best[4], best[0]
 
 
@@ -1906,9 +1954,23 @@ function tick(ts){
   if(sim && playing){
     const d=Math.min((ts-lastTs)/1000,0.1);
     tcur+=d*parseFloat($('speed').value);
-    const lim=limT();                                  // EEWの演算が追いつくまで待つ
-    if(tcur>lim){ tcur=lim; if(!waitFlag){ waitFlag=true; $('status').textContent='EEW演算待ち…'; } }
-    else if(waitFlag){ waitFlag=false; $('status').textContent='再生中（EEW演算中）'; }
+    const lim=limT();                                  // EEWの演算が確定している時刻（これ以降は再生できない）
+    const speed=parseFloat($('speed').value), done=lim>=sim.tEnd-0.01;
+    if(waitFlag){
+      // 演算待ちで止まっている間は、先読みが少し貯まる（または演算完了）まで再開しない。
+      // 1フレームごとに止まったり進んだりを繰り返さず、まとめて待ってから滑らかに再生する。
+      if(done || lim-tcur>=Math.max(3,2*speed)){
+        waitFlag=false;
+        if(!sim.quakes.every(x=>x.eewDone)) $('status').textContent='再生中（EEW演算中）';
+      }
+    }
+    if(!waitFlag){
+      tcur+=d*speed;
+      if(tcur>lim){
+        tcur=lim;
+        if(!done){ waitFlag=true; $('status').textContent='EEW演算待ち…（先読みを確保中）'; }
+      }
+    }
     if(tcur>=sim.tEnd){ tcur=sim.tEnd; playing=false; $('play').textContent='▶'; }
     $('seek').value=Math.round(tcur*10); $('tlabel').textContent=tcur.toFixed(1)+' s';
   }
