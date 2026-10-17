@@ -443,7 +443,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="foot">
     距離減衰式による簡易推定です。実際の強震モニタ（実観測波形）や気象庁の発表とは異なります。防災・避難判断には使用しないでください。<br>
     Scratch作品「【複数対応】地震の到達時間シミュレーション v1.5.0β」のロジックを参考に作成。<br>
-    地図: 地理院タイル / © OpenStreetMap contributors © CARTO
+    地図: Tiles © Esri
   </div>
 </div>
 
@@ -509,12 +509,16 @@ function clsColor(k){ const c=CLASS_RGB[k]; return 'rgb('+c[0]+','+c[1]+','+c[2]
 
 /* ---------- 地図 ---------- */
 const map = L.map('map',{zoomSnap:0.25,minZoom:4,maxZoom:11,worldCopyJump:false}).setView([36.3,137.6],5.5);
-const dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png',
-  {attribution:'© OpenStreetMap contributors © CARTO',subdomains:'abcd',maxZoom:19});
-const gsi = L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png',
-  {attribution:'<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">地理院タイル</a>',maxZoom:18});
+const ESRI='https://server.arcgisonline.com/ArcGIS/rest/services/';
+const esri=(path,attr,maxNative)=>L.tileLayer(ESRI+path+'/MapServer/tile/{z}/{y}/{x}',
+  {attribution:attr,maxNativeZoom:maxNative||16,maxZoom:19});
+const ATTR_BASE='Tiles © Esri — Esri, DeLorme, NAVTEQ, USGS, METI, Esri Japan and the GIS User Community';
+const ATTR_IMG='Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community';
+const dark = L.layerGroup([esri('Canvas/World_Dark_Gray_Base',ATTR_BASE),esri('Canvas/World_Dark_Gray_Reference','')]);
+const light = L.layerGroup([esri('Canvas/World_Light_Gray_Base',ATTR_BASE),esri('Canvas/World_Light_Gray_Reference','')]);
+const imagery = L.layerGroup([esri('World_Imagery',ATTR_IMG,19),esri('Reference/World_Boundaries_and_Places','',16)]);
 dark.addTo(map);
-L.control.layers({'ダーク':dark,'淡色（地理院）':gsi},null,{position:'topright'}).addTo(map);
+L.control.layers({'ダーク（Esri）':dark,'ライト（Esri）':light,'衛星写真（Esri）':imagery},null,{position:'topright'}).addTo(map);
 
 const epiIcon = L.divIcon({className:'',html:'<div class="epi">✕</div>',iconSize:[26,26],iconAnchor:[13,13]});
 let epiMarker=null;
