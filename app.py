@@ -1260,14 +1260,14 @@ INDEX_HTML = r"""<!doctype html>
   #eewcard .pos{margin-top:6px;height:18px;font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap}
   #eewcard .aretitle{margin-top:4px;font-size:11px;color:#cfd8ea}
   #eewcard .areas{height:18px;overflow:hidden;white-space:nowrap;font-size:12px;margin-top:4px}
-  #warncard.alert{background:#7a1010ee;border-color:#ff4d4d;border-width:2px;animation:eewb 1s infinite}
-  #warncard.alert3{animation-duration:.6s}
-  #warncard .warnmsg{font-size:14px;font-weight:800;line-height:1.5}
-  #warncard .warnlist{font-size:12.5px;line-height:1.5;margin:3px 0 6px}
-  #warncard .warnbox{max-height:190px;overflow:auto}
-  #warncard table td{font-size:12px;padding:2px 4px}
-  #warncard table td.sm{color:var(--sub);font-size:11px;white-space:nowrap}
-  #eewcard .histbox{height:84px;overflow:hidden;margin-top:4px}
+  #eewcard .warnmsg{font-size:14px;font-weight:800;line-height:1.5;margin-top:6px}
+  #eewcard .warnlist{font-size:12.5px;line-height:1.5;margin:3px 0 6px}
+  #eewcard .warnbox{max-height:190px;overflow:auto;margin-top:4px}
+  #eewcard .warnbox table td{font-size:12px;padding:2px 4px}
+  #eewcard .warnbox table td.sm{color:var(--sub);font-size:11px;white-space:nowrap}
+  #eewcard .warnttl{margin-top:6px;font-size:11.5px;color:#cfd8ea;font-weight:600}
+  #eewcard details.histbox{margin-top:6px}
+  #eewcard details.histbox>summary{cursor:pointer;font-size:11.5px;color:#cfd8ea;font-weight:600;user-select:none}
   #eewcard table.hist{margin-top:0}
   #eewcard table.hist td{border-bottom:none}
   #eewcard table.hist td{font-size:11px;padding:1px 4px;color:var(--sub)}
@@ -1347,13 +1347,11 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div class="pos" id="eewPos">シミュレーション実行後に表示</div>
     <div id="eewAreas" class="areas"></div>
-    <div class="histbox"><table id="eewHist" class="hist"></table></div>
-    <div class="sub">黄色の○＋＝EEW推定震源／赤✕＝設定した震源／地図の薄い塗り＝予想震度</div>
-  </div>
-  <div id="warncard" class="card">
-    <h3>警報対象範囲（震度4以上を予想）<span id="warnMode" class="sub" style="margin-left:6px"></span></h3>
     <div id="warnHead"></div>
+    <div class="warnttl">警報対象範囲（震度4以上を予想）<span id="warnMode" class="sub" style="margin-left:6px"></span></div>
     <div id="warnBox" class="warnbox"><span class="sub">警報・特別警報の発表後に表示</span></div>
+    <details class="histbox"><summary>報の履歴</summary><table id="eewHist" class="hist"></table></details>
+    <div class="sub">黄色の○＋＝EEW推定震源／赤✕＝設定した震源／地図の薄い塗り＝予想震度</div>
   </div>
   <div id="rank" class="card">
     <h3>リアルタイム震度ランキング（区域別）</h3>
@@ -1709,7 +1707,7 @@ function updateEew(){
     eewSet('eewPos',e?'観測点でP波を検知中…':'発表基準に達しませんでした');
     eewSet('eewAreas',''); eewSet('eewHist','');
     eewSet('warnBox','<span class="sub">警報・特別警報の発表後に表示</span>'); eewSet('warnMode','');
-    eewSet('warnHead',''); $('warncard').className='card';
+    eewSet('warnHead','');
     return;
   }
   card.className='card lv'+lvmax;
@@ -1722,7 +1720,6 @@ function updateEew(){
   eewSet('eewPos','推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?' ／PLUM併用':''));
   // 警報対象範囲の表: 範囲が狭ければ都道府県別、広ければ地域区分別にまとめる
   let ah='', wh='', mode='', head='';
-  $('warncard').className='card'+(lvmax>=2?' alert'+(lvmax>=3?' alert3':''):'');   // 警報・特別警報で赤く点滅
   if(lvmax>=2 && cur.areas.length){
     ah='<span class="sub">警報対象 '+cur.areas.length+'区域（下表）</span>';
     const prefs=new Set(cur.areas.map(a=>a.pref));
