@@ -1512,6 +1512,20 @@ def api_areas_geojson():
     return Response(body, mimetype="application/json", headers=headers)
 
 
+@app.get("/api/tsunami_geojson")
+def api_tsunami_geojson():
+    """津波予報区の海岸線（任意）。data/tsunami_areas.geojson があれば返す（無ければ404）"""
+    p = DATA_DIR / "tsunami_areas.geojson"
+    if not p.exists():
+        return _json_response({"error": "no geojson"}, 404)
+    body = p.read_bytes()
+    headers = {"Cache-Control": "public, max-age=3600"}
+    if "gzip" in request.headers.get("Accept-Encoding", ""):
+        body = gzip.compress(body, compresslevel=6)
+        headers["Content-Encoding"] = "gzip"
+    return Response(body, mimetype="application/json", headers=headers)
+
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "stations": N_ST, "seafloor": int(ST_SEA.sum())}
@@ -1631,6 +1645,8 @@ INDEX_HTML = r"""<!doctype html>
   .tsucard .tw{max-height:210px;overflow:auto;margin-top:2px}
   .tsucard table{width:100%;border-collapse:collapse}
   .tsucard td{font-size:11px;padding:1px 3px;border-bottom:1px solid #ffffff18;white-space:nowrap}
+  .tsucard td:first-child{white-space:normal;min-width:5em}
+  .tsucard .tw{overflow-x:auto}
   .tsucard .chip{padding:0 5px;border-radius:5px;font-weight:700;font-size:10.5px}
   .tsucard.tl0{background:#1a2030ee;border-color:#3b4a66}
   .tsucard.tl1{background:#12304fee;border-color:#3b9cff}
@@ -1961,7 +1977,7 @@ let N=0, SLON=null, SLAT=null, PX=null, PY=null, VALS=null, viewDirty=true, AREA
 fetch('/api/stations').then(r=>r.json()).then(j=>{
   SLON=Float32Array.from(j.lon); SLAT=Float32Array.from(j.lat); N=SLON.length;
   AREA=Int32Array.from(j.area); ANAMES=j.anames; SEA=Uint8Array.from(j.sea||new Array(N).fill(0)); SEAIDX=[]; for(let i=0;i<N;i++) if(SEA[i]) SEAIDX.push(i); let mx=0; for(const a of AREA) if(a>mx) mx=a; AM=new Float32Array(mx+1);
-  PX=new Float32Array(N); PY=new Float32Array(N); VALS=new Float32Array(N).fill(-3.1); viewDirty=true; loadGeo();
+  PX=new Float32Array(N); PY=new Float32Array(N); VALS=new Float32Array(N).fill(-3.1); viewDirty=true; loadGeo(); loadTsuGeo();
 });
 
 /* ---------- キャンバス ---------- */
@@ -2185,7 +2201,7 @@ function draw(ts){
   updateRank(ts);
   if(sim){
     updateEew();
-    { const tsuS=tsuState(tcur); drawTsu(tsuS,z); updateTsu(ts,tsuS); }
+    { const tsuS=tsuState(tcur); drawTsuCoast(tsuS,z); updateTsu(ts,tsuS); }
     sim.quakes.forEach(q=>{                             // 各地震の実際のP波・S波（発生後のみ）
       const tl=tcur-q.delay; if(tl<0) return;
       drawCircle(q.lat,q.lon,interp(q.P,tl),'rgba(90,200,255,.95)',1.6);
@@ -2339,6 +2355,75 @@ function tsuState(t){
   const arr=Array.from(list.values()); arr.sort((p,q)=>q.lv-p.lv||p.ts-q.ts);
   return {list:arr,obs,last,any};
 }
+/* ---------- 津波予報区の海岸線（data/tsunami_areas.geojson があるときだけ使用） ----------
+   予報区名で TSU_AREAS と突き合わせ、海岸線に沿って色を付ける。
+   名前が一致しない予報区・ファイルが無い場合は、従来の代表点マーカーで描く。 */
+let TSUGEO_RAW=null, TSUGEO=null;
+function loadTsuGeo(){
+  fetch('/api/tsunami_geojson').then(r=>r.ok?r.json():null).then(gj=>{ if(gj&&gj.features) TSUGEO_RAW=gj; }).catch(()=>{});
+}
+function buildTsuGeo(){
+  const norm=s=>String(s||'').normalize('NFKC').replace(/\s+/g,'');
+  const byName={}; sim.tsuAreas.forEach((a,i)=>{ byName[norm(a[0])]=i; });
+  const KEYS=['name','Name','NAME','area_name','AREA_NAME','regionName','Area','area','津波予報区名','予報区名','名称'];
+  const out={}; let hit=0;
+  for(const f of TSUGEO_RAW.features){
+    const p=f.properties||{}, g=f.geometry; let id=null;
+    for(const k of KEYS){ if(p[k]!=null && byName[norm(p[k])]!=null){ id=byName[norm(p[k])]; break; } }
+    if(id==null||!g) continue;
+    let lines=[];
+    if(g.type==='LineString') lines=[g.coordinates];
+    else if(g.type==='MultiLineString') lines=g.coordinates;
+    else if(g.type==='Polygon') lines=g.coordinates;
+    else if(g.type==='MultiPolygon') lines=[].concat(...g.coordinates);
+    lines=lines.filter(l=>l.length>=2);
+    if(!lines.length) continue;
+    (out[id]=out[id]||[]).push(...lines); hit++;
+  }
+  TSUGEO=out;
+  console.log('tsunami_areas.geojson: '+hit+'/'+TSUGEO_RAW.features.length+' features matched, '+Object.keys(out).length+'/'+sim.tsuAreas.length+' areas');
+}
+function drawTsuCoast(st,z){
+  if(!st.list.length) return;
+  if(TSUGEO_RAW && !TSUGEO) buildTsuGeo();
+  if(!TSUGEO){ drawTsu(st,z); return; }
+  const rest=[];
+  ctx.save(); ctx.lineCap='round'; ctx.lineJoin='round'; ctx.textBaseline='middle';
+  const lw=Math.max(3,Math.min(7,(z-3)*1.2));
+  const placed=[];
+  for(const e of st.list){
+    const lines=TSUGEO[e.i];
+    if(!lines){ rest.push(e); continue; }
+    const paths=[]; let best=null, bestN=0;
+    for(const ln of lines){
+      const pts=[]; let lx=-1e9, ly=-1e9;
+      for(let k=0;k<ln.length;k++){
+        const p=map.latLngToContainerPoint([ln[k][1],ln[k][0]]);
+        if(k===0||k===ln.length-1||Math.abs(p.x-lx)+Math.abs(p.y-ly)>=2){ pts.push(p); lx=p.x; ly=p.y; }
+      }
+      if(pts.length<2) continue;
+      paths.push(pts);
+      if(ln.length>bestN){ bestN=ln.length; best=pts; }
+    }
+    if(!paths.length) continue;
+    ctx.beginPath();
+    for(const pts of paths){ ctx.moveTo(pts[0].x,pts[0].y); for(let k=1;k<pts.length;k++) ctx.lineTo(pts[k].x,pts[k].y); }
+    ctx.strokeStyle='rgba(0,0,0,.75)'; ctx.lineWidth=lw+3; ctx.stroke();
+    ctx.strokeStyle=TSU_COL[e.lv]; ctx.lineWidth=lw; ctx.stroke();
+    if(z>=5.5 && best){                                  // ラベルは最長の海岸線の中ほどに表示
+      const o=st.obs.get(e.i), a=sim.tsuAreas[e.i], m=best[Math.floor(best.length/2)];
+      const txt=(z>=7?a[0]+' ':'')+e.hl+(o&&o.mx>0?' ／観測'+o.mx.toFixed(1)+'m':'');
+      ctx.font='bold 11px sans-serif'; const w=ctx.measureText(txt).width;
+      let tx=m.x+8, ty=m.y;
+      for(const q of placed){ if(Math.abs(q[0]-tx)<w+6 && Math.abs(q[1]-ty)<13) ty=q[1]+13; }   // ラベル同士の重なりを避ける
+      placed.push([tx,ty]);
+      ctx.textAlign='left'; ctx.lineWidth=3; ctx.strokeStyle='rgba(0,0,0,.85)'; ctx.strokeText(txt,tx,ty);
+      ctx.fillStyle=o&&o.mx>0?'#9be7ff':TSU_COL[e.lv]; ctx.fillText(txt,tx,ty);
+    }
+  }
+  ctx.restore();
+  if(rest.length) drawTsu({list:rest,obs:st.obs},z);
+}
 function drawTsu(st,z){
   if(!st.list.length) return;
   const AR=sim.tsuAreas;
@@ -2398,7 +2483,6 @@ function tick(ts){
   if(sim && playing){
     const d=Math.min((ts-lastTs)/1000,0.1);
     const inTsu=tcur>=sim.tSeis;                       // 地震動の計算範囲を過ぎたら津波フェーズの速度で進める
-    if(!inTsu) tcur+=d*parseFloat($('speed').value);
     const lim=limT();                                  // EEWの演算が確定している時刻（これ以降は再生できない）
     const speed=inTsu?parseFloat($('tsuSpeed').value):parseFloat($('speed').value), done=lim>=sim.tEnd-0.01;
     if(waitFlag){
