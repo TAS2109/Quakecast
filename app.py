@@ -596,6 +596,11 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 if upm.any():
                     m01_p = np.where(upm, pl, m01_p)
                     plum_used = True
+            # 予想震度の塗りつぶし用: 観測点ごとのばらつき(地盤増幅の差)で地図がまだらにならないよう、
+            # 気象庁のEEWと同じく「区域ごとの最大予想震度」を区域内の全観測点の値とする
+            amx_all = np.full(max_a + 1, -99.0)
+            np.maximum.at(amx_all, ST_AREA, m01_p)
+            pq_vals = amx_all[ST_AREA]
             vmax_e = float(m01_p.max())
             cls_e, lb_max = shindo_class(vmax_e)
             if cls_e >= 7:            # 推定最大震度6弱以上 → 特別警報
@@ -657,7 +662,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                             "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
                             "maxCls": cls_e, "plum": bool(plum_used), "lv": lv, "areas": areas, "final": after_peak,
                             # 観測点ごとの予想震度（×10, int8, base64）: 地図の塗りつぶし用
-                            "pq": base64.b64encode(np.clip(np.round(np.nan_to_num(m01_p, nan=-9.0) * 10.0), -127, 127)
+                            "pq": base64.b64encode(np.clip(np.round(np.nan_to_num(pq_vals, nan=-9.0) * 10.0), -127, 127)
                                                    .astype(np.int8).tobytes()).decode("ascii")}
                     reports.append(last)
                     yield ("report", last)
@@ -827,6 +832,20 @@ def api_simulate():
 
     return Response(gen(), mimetype="application/x-ndjson",
                     headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/areas_geojson")
+def api_areas_geojson():
+    """区域の境界ポリゴン（任意）。data/areas.geojson があれば返す（無ければ404）"""
+    p = DATA_DIR / "areas.geojson"
+    if not p.exists():
+        return _json_response({"error": "no geojson"}, 404)
+    body = p.read_bytes()
+    headers = {"Cache-Control": "public, max-age=3600"}
+    if "gzip" in request.headers.get("Accept-Encoding", ""):
+        body = gzip.compress(body, compresslevel=6)
+        headers["Content-Encoding"] = "gzip"
+    return Response(body, mimetype="application/json", headers=headers)
 
 
 @app.get("/healthz")
@@ -1125,7 +1144,7 @@ let N=0, SLON=null, SLAT=null, PX=null, PY=null, VALS=null, viewDirty=true, AREA
 fetch('/api/stations').then(r=>r.json()).then(j=>{
   SLON=Float32Array.from(j.lon); SLAT=Float32Array.from(j.lat); N=SLON.length;
   AREA=Int32Array.from(j.area); ANAMES=j.anames; let mx=0; for(const a of AREA) if(a>mx) mx=a; AM=new Float32Array(mx+1);
-  PX=new Float32Array(N); PY=new Float32Array(N); VALS=new Float32Array(N).fill(-3.1); viewDirty=true;
+  PX=new Float32Array(N); PY=new Float32Array(N); VALS=new Float32Array(N).fill(-3.1); viewDirty=true; loadGeo();
 });
 
 /* ---------- キャンバス ---------- */
@@ -1189,6 +1208,61 @@ function interp(arr,t){
   return arr[f0]+(arr[f1]-arr[f0])*(f-f0);
 }
 
+/* ---------- 区域境界ポリゴン（data/areas.geojson があるときだけ使用） ---------- */
+let GEO=null;   // [{id, rings:[Float32Array [wx,wy,...]]}]  wx,wy は正規化メルカトル(0..1)
+function loadGeo(){
+  fetch('/api/areas_geojson').then(r=>r.ok?r.json():null).then(gj=>{
+    if(!gj||!gj.features) return;
+    const norm=s=>String(s||'').normalize('NFKC').replace(/\s+/g,'');
+    const byName={}; for(const k in ANAMES) byName[norm(ANAMES[k])]=parseInt(k);
+    const KEYS=['name','Name','NAME','area_name','AREA_NAME','regionName','Area','area'];
+    const out=[]; let hit=0;
+    const toW=(lon,lat)=>{ const s=Math.sin(lat*Math.PI/180);
+      return [(lon+180)/360, 0.5-Math.log((1+s)/(1-s))/(4*Math.PI)]; };
+    for(const f of gj.features){
+      const p=f.properties||{}; let id=null;
+      for(const k of KEYS){ if(p[k]!=null && byName[norm(p[k])]!=null){ id=byName[norm(p[k])]; break; } }
+      if(id==null && p.code!=null && ANAMES[p.code]!=null) id=parseInt(p.code);
+      if(id==null||!f.geometry) continue;
+      const polys=f.geometry.type==='Polygon'?[f.geometry.coordinates]:(f.geometry.type==='MultiPolygon'?f.geometry.coordinates:[]);
+      const rings=[];
+      for(const poly of polys) for(const ring of poly){
+        const arr=[]; let lx=-9,ly=-9;
+        for(let i=0;i<ring.length;i++){            // 約300m未満の頂点は間引いて描画を軽くする
+          const w=toW(ring[i][0],ring[i][1]);
+          if(i===0||i===ring.length-1||Math.abs(w[0]-lx)+Math.abs(w[1]-ly)>2e-5){ arr.push(w[0],w[1]); lx=w[0]; ly=w[1]; }
+        }
+        if(arr.length>=6) rings.push(Float32Array.from(arr));
+      }
+      if(rings.length){ out.push({id:id,rings:rings}); hit++; }
+    }
+    GEO=hit?out:null;
+    console.log('areas.geojson: '+hit+'/'+gj.features.length+' features matched');
+  }).catch(()=>{});
+}
+function drawPredPolygons(pv,z){
+  const val=new Float32Array(AM.length).fill(-99);
+  for(let i=0;i<N;i++) val[AREA[i]]=pv[i]/10;
+  const s=256*Math.pow(2,z), p0=map.latLngToContainerPoint([0,0]);
+  const ox=p0.x-0.5*s, oy=p0.y-0.5*s, W=cv.width/(window.devicePixelRatio||1), H=cv.height/(window.devicePixelRatio||1);
+  ctx.save(); ctx.globalAlpha=0.38;
+  for(let c=1;c<10;c++){
+    ctx.fillStyle=clsColor(c); ctx.beginPath(); let any=false;
+    for(const g of GEO){
+      const v=val[g.id]; if(!(v>=0.5) || shindoCls(v)!==c) continue;
+      for(const r of g.rings){
+        let minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
+        for(let i=0;i<r.length;i+=2){ const x=ox+r[i]*s, y=oy+r[i+1]*s;
+          if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+          if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y; }
+        ctx.closePath(); any=true;
+      }
+    }
+    if(any) ctx.fill('evenodd');
+  }
+  ctx.restore();
+}
+
 let predCv=null;
 function drawPredFill(rep,z){
   if(!rep._pv){                                        // 予想震度(×10, int8)を初回だけ展開
@@ -1197,6 +1271,7 @@ function drawPredFill(rep,z){
     rep._pv=a;
   }
   const pv=rep._pv; if(pv.length!==N) return;
+  if(GEO && GEO.length){ drawPredPolygons(pv,z); return; }   // 区域境界データがあればそちらで塗る
   const dpr=window.devicePixelRatio||1, w=cv.width, h=cv.height;
   if(!predCv) predCv=document.createElement('canvas');
   if(predCv.width!==w||predCv.height!==h){ predCv.width=w; predCv.height=h; }
