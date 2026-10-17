@@ -1405,10 +1405,21 @@ INDEX_HTML = r"""<!doctype html>
   <h2>① 地震（複数指定できます）</h2>
   <div id="qlist"></div>
   <button id="qadd" class="sec">＋ 地震を追加</button>
+  <div class="sl" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px;align-items:center">
+    <select id="slSel" style="flex:1;min-width:110px"></select>
+    <button id="slSave" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">💾 保存</button>
+    <button id="slLoad" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">📂 読込</button>
+    <button id="slDel" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">🗑</button>
+    <button id="slExp" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">⬇ ファイル</button>
+    <button id="slImp" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">⬆ ファイル</button>
+    <input id="slFile" type="file" accept=".json,application/json" style="display:none">
+  </div>
   <div class="hint">選択中の地震の震源は、地図をクリックして設定できます。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" checked style="width:auto"> その時点で観測された最大震度を表示</label>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:6px">海底震度計
+    <select id="seaMode" style="width:auto"><option value="thin" selected>薄く表示（数字なし）</option><option value="off">非表示</option><option value="normal">通常表示</option></select></label>
   <div class="hint">黄色の○＋＝EEW推定震源／✕＝設定した震源（番号は地震番号）／地図の薄い塗り＝予想震度</div>
 
   <h2>② プリセット（選択中の地震に適用）</h2>
@@ -1426,7 +1437,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="foot">
     距離減衰式による簡易推定です。実際の強震モニタ（実観測波形）や気象庁の発表とは異なります。防災・避難判断には使用しないでください。<br>
     Scratch作品「【複数対応】地震の到達時間シミュレーション v1.5.0β」のロジックを参考に作成。<br>
-    海底観測点（data/seafloor.csv）も陸上と同じ見た目で表示します。区域別集計・警報対象・最大震度には含めません。<br>
+    海底観測点（data/seafloor.csv）は初期設定では薄く表示します（設定で非表示／通常表示に変更可）。区域別集計・警報対象・最大震度には含めません。<br>
     地図: Tiles © Esri
   </div>
 </div>
@@ -1590,6 +1601,63 @@ $('qadd').onclick=()=>{
 };
 renderQuakes(); syncMarkers();
 
+/* ---------- 地震セットの保存・読込（localStorage＋JSONファイル） ---------- */
+const SL_KEY='quakeSets_v1';
+function slAll(){ try{ const o=JSON.parse(localStorage.getItem(SL_KEY)||'{}'); return (o&&typeof o==='object')?o:{}; }catch(_){ return {}; } }
+function slPut(o){ try{ localStorage.setItem(SL_KEY,JSON.stringify(o)); return true; }catch(_){ $('status').textContent='保存できませんでした（ブラウザの保存が無効）'; return false; } }
+function slClean(a){                                    // 入力検証（最大5件・範囲に丸める）
+  if(!Array.isArray(a)) return null;
+  const out=[];
+  for(const q of a.slice(0,MAX_Q)){
+    const lat=+q.lat, lon=+q.lon, mag=+q.mag, dep=+q.depth, dl=+(q.delay||0);
+    if(![lat,lon,mag,dep,dl].every(isFinite)) continue;
+    out.push({lat:clampN(lat,-90,90),lon:clampN(lon,-180,180),mag:clampN(mag,0,15),depth:clampN(dep,0,699),delay:Math.round(clampN(dl,0,300))});
+  }
+  return out.length?out:null;
+}
+function slRefresh(sel){
+  const o=slAll(), names=Object.keys(o), box=$('slSel'); box.innerHTML='';
+  if(!names.length){ const op=document.createElement('option'); op.value=''; op.textContent='（保存なし）'; box.appendChild(op); return; }
+  names.forEach(n=>{ const op=document.createElement('option'); op.value=n; op.textContent=n+'（'+o[n].length+'件）'; box.appendChild(op); });
+  if(sel&&o[sel]) box.value=sel;
+}
+function slApply(list){
+  QS=list.map(q=>({...q})); selQ=0; renderQuakes(); syncMarkers();
+  const q=QS[0]; if(q) map.panTo([q.lat,q.lon]);
+}
+$('slSave').onclick=()=>{
+  const o=slAll(), cur=$('slSel').value;
+  const nm=(prompt('保存名を入力（同じ名前は上書き）',cur||('地震セット'+(Object.keys(o).length+1)))||'').trim();
+  if(!nm) return;
+  o[nm]=QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay}));
+  if(slPut(o)){ slRefresh(nm); $('status').textContent='「'+nm+'」を保存しました（'+QS.length+'件）'; }
+};
+$('slLoad').onclick=()=>{
+  const o=slAll(), nm=$('slSel').value, l=slClean(o[nm]);
+  if(!l){ $('status').textContent='読み込める保存データがありません'; return; }
+  slApply(l); $('status').textContent='「'+nm+'」を読み込みました（'+l.length+'件）';
+};
+$('slDel').onclick=()=>{
+  const o=slAll(), nm=$('slSel').value; if(!nm||!o[nm]) return;
+  if(!confirm('「'+nm+'」を削除しますか？')) return;
+  delete o[nm]; if(slPut(o)) slRefresh();
+};
+$('slExp').onclick=()=>{
+  const blob=new Blob([JSON.stringify({version:1,quakes:QS},null,1)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='quakes.json'; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+};
+$('slImp').onclick=()=>$('slFile').click();
+$('slFile').addEventListener('change',async()=>{
+  const f=$('slFile').files[0]; $('slFile').value=''; if(!f) return;
+  try{
+    const j=JSON.parse(await f.text()), l=slClean(Array.isArray(j)?j:j.quakes);
+    if(!l) throw new Error('形式が不正です');
+    slApply(l); $('status').textContent='ファイルから '+l.length+'件を読み込みました';
+  }catch(e){ $('status').textContent='読込エラー: '+e.message; }
+});
+slRefresh();
+
 const PRESETS=[
   {n:'阪神・淡路(1995)',lat:34.60,lon:135.04,m:7.3,d:16},
   {n:'東北沖(2011)',lat:38.10,lon:142.86,m:9.0,d:24},
@@ -1667,6 +1735,7 @@ function drawCircleAt(lat,lon,rkm,style,width,dash){
 function frac(x){ return x-Math.floor(x); }
 
 /* ---------- シミュレーション状態 ---------- */
+let CUMV=null, CUMI=null;   // フレームごとの「その時点までの最大震度(×10)」と観測点
 let sim=null, Q=null, tcur=0, playing=false, lastTs=0, runCtl=null, waitFlag=false;
 // EEWの演算が追いついていない地震があれば、その地震の確定済み時刻までしか再生しない
 const limT=()=>{ if(!sim) return 0; let lim=sim.tEnd; for(const q of sim.quakes) if(!q.eewDone) lim=Math.min(lim,q.eewUpto||0); return lim; };
@@ -1791,12 +1860,24 @@ function draw(ts){
   let vmax=-99, vmaxI=-1; AM.fill(-99);
   for(let i=0;i<N;i++){
     const v=VALS[i];
-    if(!(SEA&&SEA[i])){ if(v>vmax){ vmax=v; vmaxI=i; } const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v; }   // 海底観測点は最大・ランキングに含めない
+    const isSea=!!(SEA&&SEA[i]);
+    if(!isSea){ if(v>vmax){ vmax=v; vmaxI=i; } const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v; }   // 海底観測点は最大・ランキングに含めない
+    if(isSea && seaMode!=='normal') continue;           // 海底は「薄く/非表示」のとき通常描画から外す
     let k=Math.round((v-LUT_MIN)/LUT_STEP); if(k<0)k=0; if(k>=LUT_N)k=LUT_N-1;
     buckets[k].push(i);
   }
   // EEWの予想震度で地図を薄く塗りつぶす（観測点ごとの予想震度の階級色。高い階級を上に重ねる）
   if(sim && $('showPred').checked){ const pv=mergedPred(); if(pv) drawPredFill(pv,z); }
+  // 海底震度計: 薄く（数字・縁取りなし、小さめ）。陸上の観測点より先に描いて下に敷く
+  if(seaMode==='thin' && SEAIDX.length){
+    ctx.save(); ctx.globalAlpha=0.3;
+    for(const i of SEAIDX){
+      const v=VALS[i]; let k=Math.round((v-LUT_MIN)/LUT_STEP); if(k<0)k=0; if(k>=LUT_N)k=LUT_N-1;
+      const rr=v>=0.49?Math.max(2.5,Math.min(16,5.5+(z-4)*1.2)*0.5):r0*0.7;
+      ctx.fillStyle=LUT[k]; ctx.beginPath(); ctx.arc(PX[i],PY[i],rr,0,6.2832); ctx.fill();
+    }
+    ctx.restore();
+  }
   // 震度1以上の観測点は「円の中に震度階級の数字」で表示（ズームに応じて円を拡大）
   const rn=Math.min(16,5.5+(z-4)*1.2), showTxt=rn>=6.5;
   ctx.textAlign='center'; ctx.textBaseline='middle';
@@ -1844,12 +1925,17 @@ function draw(ts){
     $('hP').textContent=hv('P');
     $('hS').textContent=hv('S');
     const hm=$('hM'); const m=Math.max(vmax,-3);
-    updateObs(m,vmaxI);
+    { const nf=sim.nf; let f=Math.round(tcur/sim.dt); if(f<0)f=0; if(f>nf-1)f=nf-1;
+      if(CUMV&&CUMV.length===nf) updateObs(CUMV[f]*0.1,CUMI[f]); else updateObs(-9,-1); }
     if(m<0.5){ hm.textContent='—'; hm.style.color='#93a0b8'; }
     else { hm.textContent=m.toFixed(1)+'（'+CLASS_LABEL[shindoCls(m)]+'）'; hm.style.color=clsColor(shindoCls(m)); }
   }
 }
 
+let seaMode='thin';
+try{ const m=localStorage.getItem('seaMode'); if(m==='off'||m==='thin'||m==='normal') seaMode=m; }catch(_){}
+$('seaMode').value=seaMode;
+$('seaMode').addEventListener('change',()=>{ seaMode=$('seaMode').value; try{ localStorage.setItem('seaMode',seaMode); }catch(_){} });
 let lastRank=0, eewCurs=[], eewCards=[];
 function updateRank(ts){
   if(!sim||!AM||(ts||0)-lastRank<250) return; lastRank=ts||0;
@@ -1985,6 +2071,8 @@ $('run').onclick=async()=>{
       for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
       if(v.gz) u=new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
       Q=new Int8Array(u.buffer,u.byteOffset,u.length);
+      { const nf=v.nf; CUMV=new Int16Array(nf); CUMI=new Int32Array(nf); let mv=-999, mi=-1;   // 陸上観測点の累積最大
+        for(let f=0;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++){ if(SEA&&SEA[i]) continue; const x=Q[o+i]; if(x>mv){ mv=x; mi=i; } } CUMV[f]=mv; CUMI[f]=mi; } }
       v.quakes.forEach(q=>{ q.eew={reports:[]}; q.eewUpto=0; q.eewDone=false; });
       sim=v; tcur=0; buildEewCards(v.quakes.length);
       $('seek').disabled=false; $('seek').max=Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
