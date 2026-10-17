@@ -1004,7 +1004,9 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
     return {"reports": reports} if reports else None
 
 
-def sim_core(lat0, lon0, mag, depth, dt=1.0, gz=False):
+def quake_core(lat0, lon0, mag, depth, dt=1.0):
+    """1つの地震の計算（最終震度・P/S波の到達距離曲線・リアルタイム震度フレーム）。
+    震源の発生時刻を0秒とした「その地震だけのローカル時間」で返す。"""
     m01, dist, dep_p, src = final_intensity(mag, depth, lat0, lon0)
 
     # 細かい時間軸でP/S波の到達距離曲線を作る（単調増加に整える）
@@ -1033,9 +1035,12 @@ def sim_core(lat0, lon0, mag, depth, dt=1.0, gz=False):
     s_curve = np.interp(tf, tg, s_curve_f)
 
     rt = realtime_frames(m01, dist, dep_p, tf, p_curve, s_curve, tatsu)
-    q = np.clip(np.round(rt * 10.0), -127, 127).astype(np.int8)
+    return {"m01": m01, "src": src, "p_curve": p_curve, "s_curve": s_curve,
+            "tp": tp, "rt": rt, "t_end": t_end, "nf": nf}
 
-    # 区域別の最大震度
+
+def _area_list(m01):
+    """区域別の最大震度（上位20区域・震度1以上）"""
     area_max = {}
     for a, v, sea in zip(ST_AREA, m01, ST_SEA):
         if sea:
@@ -1051,41 +1056,69 @@ def sim_core(lat0, lon0, mag, depth, dt=1.0, gz=False):
                       "v": round(v, 2), "cls": cls, "label": label})
         if len(areas) >= 20:
             break
+    return areas
 
-    vmax = float(m01.max())
+
+def _clean(a, nd=1):
+    return [None if not math.isfinite(x) else round(float(x), nd) for x in a]
+
+
+def sim_multi(quakes, dt=1.0, gz=False):
+    """複数の地震を同時に扱う。quakes: [{lat, lon, mag, depth, delay(秒, 整数)}, ...]
+    各地震を独立に計算し、delay秒ずらして重ね合わせる。
+    観測点ごとのリアルタイム震度・最終震度は、全地震の最大値を採用する。
+    戻り値: (基本データdict, [各地震の (tp, rt, t_end)])"""
+    cores = [quake_core(q["lat"], q["lon"], q["mag"], q["depth"], dt) for q in quakes]
+    t_end = max(q["delay"] + c["t_end"] for q, c in zip(quakes, cores))
+    nf = int(t_end / dt) + 1
+
+    rt_all, m01_all = None, None
+    for q, c in zip(quakes, cores):
+        d = int(round(q["delay"] / dt))
+        rt = c["rt"]
+        sh = np.empty((nf, N_ST), dtype=np.float32)
+        sh[:d] = rt[0]                                    # 発生前: 揺れなし（観測点ごとの下限値）
+        sh[d:d + len(rt)] = rt
+        sh[d + len(rt):] = rt[-1]                         # 計算範囲の終了後は最終フレームを保持
+        rt_all = sh if rt_all is None else np.fmax(rt_all, sh)
+        m01_all = c["m01"] if m01_all is None else np.maximum(m01_all, c["m01"])
+
+    qz = np.clip(np.round(rt_all * 10.0), -127, 127).astype(np.int8)
+    vmax = float(m01_all.max())
     cls, label = shindo_class(vmax)
-
-    def _clean(a, nd=1):
-        return [None if not math.isfinite(x) else round(float(x), nd) for x in a]
-
     out = {
         "dt": dt,
         "nf": nf,
         "ns": N_ST,
-        "q": base64.b64encode(gzip.compress(q.tobytes(), compresslevel=6) if gz else q.tobytes()).decode("ascii"),
+        "q": base64.b64encode(gzip.compress(qz.tobytes(), compresslevel=6) if gz else qz.tobytes()).decode("ascii"),
         "gz": bool(gz),
-        "P": _clean(p_curve, 2),
-        "S": _clean(s_curve, 2),
-        "tp": _clean(tp, 1),
-        "ts": _clean(tatsu, 1),
-        "final": _clean(m01, 2),
+        "final": _clean(m01_all, 2),
         "max": round(vmax, 2),
         "maxCls": cls,
         "maxLabel": label,
-        "areas": areas,
-        "epi": {"lat": lat0, "lon": lon0, "mag": mag, "depth": depth},
+        "areas": _area_list(m01_all),
         "tEnd": t_end,
-        "src": {"type": src["type"], "name": src["name"], "L": round(src["L"])},
         "ett": _eew_tt_payload(nf),
+        "quakes": [{
+            "lat": q["lat"], "lon": q["lon"], "mag": q["mag"], "depth": q["depth"],
+            "delay": q["delay"],
+            "P": _clean(c["p_curve"], 2),                 # その地震のローカル時間でのP波到達距離
+            "S": _clean(c["s_curve"], 2),
+            "tEnd": c["t_end"],
+            "src": {"type": c["src"]["type"], "name": c["src"]["name"], "L": round(c["src"]["L"])},
+        } for q, c in zip(quakes, cores)],
     }
-    return out, (tp, rt, t_end)
+    return out, [(c["tp"], c["rt"], c["t_end"]) for c in cores]
 
 
-def simulate(lat0, lon0, mag, depth, dt=1.0):
-    """一括版（従来互換）: 基本データ＋EEW全報"""
-    out, (tp, rt, t_end) = sim_core(lat0, lon0, mag, depth, dt)
-    out["eew"] = build_eew(mag, depth, lat0, lon0, tp, rt, t_end)
-    return out
+def _shift_report(r, delay):
+    """EEWの報（その地震のローカル時間）を、全体の時間軸へdelay秒ずらしたコピーにする"""
+    r = dict(r)
+    r["t"] = round(r["t"] + delay, 1)
+    r["t0"] = round(r["t0"] + delay, 2)
+    r["areas"] = [dict(a, ts=(None if a["ts"] is None else round(a["ts"] + delay, 1)))
+                  for a in r["areas"]]
+    return r
 
 
 # =====================================================================
@@ -1118,32 +1151,56 @@ def api_stations():
     return _json_response(_STATIONS_CACHE)
 
 
+MAX_QUAKES = 5
+
+
 @app.post("/api/simulate")
 def api_simulate():
     try:
         j = request.get_json(force=True, silent=False) or {}
-        lat = float(j["lat"])
-        lon = float(j["lon"])
-        mag = float(j["mag"])
-        depth = float(j["depth"])
+        raw = j.get("quakes")
+        if raw is None:
+            raw = [j]                                     # 単発（従来の {lat, lon, mag, depth} 形式）
+        quakes = [{"lat": float(r["lat"]), "lon": float(r["lon"]),
+                   "mag": float(r["mag"]), "depth": float(r["depth"]),
+                   "delay": float(r.get("delay") or 0.0)} for r in raw]
     except Exception:
         return _json_response({"error": "入力が不正です"}, 400)
-    if not (10.0 <= lat <= 55.0 and 110.0 <= lon <= 165.0):
-        return _json_response({"error": "震源は日本周辺（緯度10〜55, 経度110〜165）で指定してください"}, 400)
-    mag = min(max(mag, 0.0), 15.0)
-    depth = min(max(depth, 0.0), 699.0)
+    if not (1 <= len(quakes) <= MAX_QUAKES):
+        return _json_response({"error": "地震は1〜%d個まで指定できます" % MAX_QUAKES}, 400)
+    for q in quakes:
+        if not (10.0 <= q["lat"] <= 55.0 and 110.0 <= q["lon"] <= 165.0):
+            return _json_response({"error": "震源は日本周辺（緯度10〜55, 経度110〜165）で指定してください"}, 400)
+        q["mag"] = min(max(q["mag"], 0.0), 15.0)
+        q["depth"] = min(max(q["depth"], 0.0), 699.0)
+        q["delay"] = float(int(round(min(max(q["delay"], 0.0), 300.0))))   # 発生時刻（秒後）: 整数秒
     gz = bool(j.get("gz"))
-    base, (tp, rt, t_end) = sim_core(lat, lon, mag, depth, gz=gz)
+    base, cores = sim_multi(quakes, gz=gz)
 
     def gen():
         def dump(o):
             return (json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-        yield dump({"k": "base", "v": base})          # まず震度フレームを返して再生開始
-        try:
-            for kind, v in eew_stream(mag, depth, lat, lon, tp, rt, t_end):
-                yield dump({"k": kind, "v": v})       # EEWは演算できた順に送る
-        except Exception as e:
-            yield dump({"k": "error", "v": str(e)})
+        yield dump({"k": "base", "v": base})              # まず震度フレームを返して再生開始
+        # 各地震のEEWを交互に1ステップずつ進め、演算できた順に送る（時刻は全体の時間軸へずらす）
+        streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end)
+                   for i, (q, (tp, rt, t_end)) in enumerate(zip(quakes, cores))}
+        while streams:
+            for i in list(streams):
+                try:
+                    kind, v = next(streams[i])
+                except StopIteration:
+                    del streams[i]
+                    continue
+                except Exception as e:
+                    del streams[i]
+                    yield dump({"k": "error", "q": i, "v": str(e)})
+                    continue
+                d = quakes[i]["delay"]
+                if kind == "upto":
+                    v = v + d
+                elif kind == "report":
+                    v = _shift_report(v, d)
+                yield dump({"k": kind, "q": i, "v": v})
 
     return Response(gen(), mimetype="application/x-ndjson",
                     headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
@@ -1243,38 +1300,49 @@ INDEX_HTML = r"""<!doctype html>
   .card h3{margin:0 0 5px;font-size:11.5px;color:var(--sub);font-weight:600}
   .card .sub{color:var(--sub);font-size:11px;margin-top:3px}
   #rank td.no{color:var(--sub);width:14px}
-  #eewcard{border-width:2px}
-  #eewcard .t{font-size:15px;font-weight:800}
-  #eewcard .rg{display:inline-block;margin:2px 10px 2px 0;white-space:nowrap}
-  #eewcard .rg i{font-style:normal;font-weight:700;margin-left:3px}
-  #eewcard .eh{display:flex;align-items:center;gap:10px;margin-bottom:6px;height:32px}
-  #eewcard .lvbadge{font-size:19px;font-weight:800;padding:2px 10px;border-radius:7px;background:#0006;min-width:112px;text-align:center}
-  #eewcard .eno{font-size:15px;font-weight:700}
-  #eewcard .tiles{display:grid;grid-template-columns:1.15fr 1.1fr .85fr;gap:6px}
-  #eewcard .tile{background:#0005;border-radius:8px;padding:4px 4px 2px;text-align:center;height:78px;overflow:hidden}
-  #eewcard .tile .k{font-size:10.5px;color:#cfd8ea}
-  #eewcard .tile .v{font-size:36px;font-weight:800;line-height:1.3;font-variant-numeric:tabular-nums;white-space:nowrap}
-  #eewcard #eewDep{font-size:28px;line-height:1.5}
-  #eewcard #eewDep small{font-size:13px;margin-left:2px;font-weight:600}
-  #eewcard .chipbig{display:inline-block;min-width:56px;border-radius:9px;padding:0 8px;font-size:30px;line-height:1.3;color:#fff;text-shadow:0 0 3px #000a}
-  #eewcard .pos{margin-top:6px;height:18px;font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap}
-  #eewcard .aretitle{margin-top:4px;font-size:11px;color:#cfd8ea}
-  #eewcard .areas{height:18px;overflow:hidden;white-space:nowrap;font-size:12px;margin-top:4px}
-  #eewcard .warnmsg{font-size:14px;font-weight:800;line-height:1.5;margin-top:6px}
-  #eewcard .warnlist{font-size:12.5px;line-height:1.5;margin:3px 0 6px}
-  #eewcard .warnbox{max-height:190px;overflow:auto;margin-top:4px}
-  #eewcard .warnbox table td{font-size:12px;padding:2px 4px}
-  #eewcard .warnbox table td.sm{color:var(--sub);font-size:11px;white-space:nowrap}
-  #eewcard .warnttl{margin-top:6px;font-size:11.5px;color:#cfd8ea;font-weight:600}
-  #eewcard details.histbox{margin-top:6px}
-  #eewcard details.histbox>summary{cursor:pointer;font-size:11.5px;color:#cfd8ea;font-weight:600;user-select:none}
-  #eewcard table.hist{margin-top:0}
-  #eewcard table.hist td{border-bottom:none}
-  #eewcard table.hist td{font-size:11px;padding:1px 4px;color:var(--sub)}
-  #eewcard.lv1{background:#12304fee;border-color:#3b9cff}
-  #eewcard.lv2{background:#7a1010ee;border-color:#ff4d4d;animation:eewb 1s infinite}
-  #eewcard.lv3{background:#2a0a3eee;border-color:#c04bff;animation:eewb .6s infinite}
+  .eewcard{border-width:2px}
+  .eewcard .t{font-size:15px;font-weight:800}
+  .eewcard .rg{display:inline-block;margin:2px 10px 2px 0;white-space:nowrap}
+  .eewcard .rg i{font-style:normal;font-weight:700;margin-left:3px}
+  .eewcard .eh{display:flex;align-items:center;gap:10px;margin-bottom:6px;height:32px}
+  .eewcard .lvbadge{font-size:19px;font-weight:800;padding:2px 10px;border-radius:7px;background:#0006;min-width:112px;text-align:center}
+  .eewcard .eno{font-size:15px;font-weight:700}
+  .eewcard .tiles{display:grid;grid-template-columns:1.15fr 1.1fr .85fr;gap:6px}
+  .eewcard .tile{background:#0005;border-radius:8px;padding:4px 4px 2px;text-align:center;height:78px;overflow:hidden}
+  .eewcard .tile .k{font-size:10.5px;color:#cfd8ea}
+  .eewcard .tile .v{font-size:36px;font-weight:800;line-height:1.3;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .eewcard .eewDep{font-size:28px;line-height:1.5}
+  .eewcard .eewDep small{font-size:13px;margin-left:2px;font-weight:600}
+  .eewcard .chipbig{display:inline-block;min-width:56px;border-radius:9px;padding:0 8px;font-size:30px;line-height:1.3;color:#fff;text-shadow:0 0 3px #000a}
+  .eewcard .pos{margin-top:6px;height:18px;font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap}
+  .eewcard .aretitle{margin-top:4px;font-size:11px;color:#cfd8ea}
+  .eewcard .areas{height:18px;overflow:hidden;white-space:nowrap;font-size:12px;margin-top:4px}
+  .eewcard .warnmsg{font-size:14px;font-weight:800;line-height:1.5;margin-top:6px}
+  .eewcard .warnlist{font-size:12.5px;line-height:1.5;margin:3px 0 6px}
+  .eewcard .warnbox{max-height:190px;overflow:auto;margin-top:4px}
+  .eewcard .warnbox table td{font-size:12px;padding:2px 4px}
+  .eewcard .warnbox table td.sm{color:var(--sub);font-size:11px;white-space:nowrap}
+  .eewcard .warnttl{margin-top:6px;font-size:11.5px;color:#cfd8ea;font-weight:600}
+  .eewcard details.histbox{margin-top:6px}
+  .eewcard details.histbox>summary{cursor:pointer;font-size:11.5px;color:#cfd8ea;font-weight:600;user-select:none}
+  .eewcard table.hist{margin-top:0}
+  .eewcard table.hist td{border-bottom:none}
+  .eewcard table.hist td{font-size:11px;padding:1px 4px;color:var(--sub)}
+  .eewcard.lv1{background:#12304fee;border-color:#3b9cff}
+  .eewcard.lv2{background:#7a1010ee;border-color:#ff4d4d;animation:eewb 1s infinite}
+  .eewcard.lv3{background:#2a0a3eee;border-color:#c04bff;animation:eewb .6s infinite}
   @keyframes eewb{50%{box-shadow:0 0 18px 4px #ff3b3b99}}
+  #eewcards{display:flex;flex-direction:column;gap:8px}
+  .epi{position:relative}
+  .epi .epn{position:absolute;left:19px;top:-3px;font-size:12px;line-height:12px;font-weight:800;color:#fff;
+    text-shadow:0 0 3px #000,0 0 6px #000}
+  .qb{border:1px solid var(--line);border-left-width:4px;border-radius:8px;padding:2px 8px 8px;margin-bottom:8px;background:#0e131c55}
+  .qb.sel{background:#1d263655;border-color:#3b4a66}
+  .qh{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:13px}
+  .qh .qd{flex:1;font-size:10.5px;color:var(--sub)}
+  .qh .qx{padding:1px 7px;font-size:12px}
+  button.sec{width:100%;margin-top:2px;font-size:13px;padding:7px 10px}
+  button.sec:disabled{opacity:.45;cursor:not-allowed}
   @media (max-width:700px){
     #panel{width:calc(100% - 20px);max-height:62%;top:52px;display:none}
     #panel.open{display:block}
@@ -1292,24 +1360,14 @@ INDEX_HTML = r"""<!doctype html>
 <div id="panel" class="open">
   <h1>地震 強震モニタ風シミュレーター</h1>
 
-  <h2>① 震源（地図をクリックで設定）</h2>
-  <div class="row">
-    <div><label>緯度</label><input id="lat" type="number" step="0.01" value="35.68"></div>
-    <div><label>経度</label><input id="lon" type="number" step="0.01" value="139.77"></div>
-  </div>
-
-  <h2>② 規模・深さ</h2>
-  <label>マグニチュード（スライダーは9.9まで／右の欄は15まで入力可）</label>
-  <div class="row" style="align-items:center">
-    <div style="flex:2.2"><input id="mag" type="range" min="0" max="9.9" step="0.1" value="7.0"></div>
-    <div><input id="magnum" type="number" min="0" max="15" step="0.1" value="7.0"></div>
-  </div>
-  <label>震源の深さ（km）</label>
-  <input id="depth" type="number" min="0" max="699" step="5" value="20">
+  <h2>① 地震（複数指定できます）</h2>
+  <div id="qlist"></div>
+  <button id="qadd" class="sec">＋ 地震を追加</button>
+  <div class="hint">選択中の地震の震源は、地図をクリックして設定できます。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
 
-  <h2>プリセット</h2>
+  <h2>② プリセット（選択中の地震に適用）</h2>
   <div class="presets" id="presets"></div>
 
   <button id="run" class="primary">▶ シミュレーション実行</button>
@@ -1317,7 +1375,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <div id="result" style="display:none">
     <div id="srcinfo" class="hint"></div>
-    <h2>最終的な区域別最大震度（シミュレーション結果・上位）</h2>
+    <h2 id="areasH">最終的な区域別最大震度（シミュレーション結果・上位）</h2>
     <table id="areas"></table>
   </div>
 
@@ -1337,22 +1395,7 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <div id="rightcol">
-  <div id="eewcard" class="card lv0">
-    <h3>緊急地震速報</h3>
-    <div class="eh"><span id="eewLv" class="lvbadge">待機中</span><span id="eewNo" class="eno"></span></div>
-    <div class="tiles">
-      <div class="tile"><div class="k">予想最大震度</div><div class="v" id="eewMax"><span class="chipbig" style="background:#3a4357">-</span></div></div>
-      <div class="tile"><div class="k">マグニチュード</div><div class="v" id="eewMag">-</div></div>
-      <div class="tile"><div class="k">深さ</div><div class="v" id="eewDep">-</div></div>
-    </div>
-    <div class="pos" id="eewPos">シミュレーション実行後に表示</div>
-    <div id="eewAreas" class="areas"></div>
-    <div id="warnHead"></div>
-    <div class="warnttl">警報対象範囲（震度4以上を予想）<span id="warnMode" class="sub" style="margin-left:6px"></span></div>
-    <div id="warnBox" class="warnbox"><span class="sub">警報・特別警報の発表後に表示</span></div>
-    <details class="histbox"><summary>報の履歴</summary><table id="eewHist" class="hist"></table></details>
-    <div class="sub">黄色の○＋＝EEW推定震源／赤✕＝設定した震源／地図の薄い塗り＝予想震度</div>
-  </div>
+  <div id="eewcards"></div>
   <div id="rank" class="card">
     <h3>リアルタイム震度ランキング（区域別）</h3>
     <table id="rankTbl"><tr><td style="color:var(--sub)">シミュレーション実行後に表示</td></tr></table>
@@ -1426,27 +1469,82 @@ const imagery = L.layerGroup([esri('World_Imagery',ATTR_IMG,19),esri('Reference/
 dark.addTo(map);
 L.control.layers({'ダーク（Esri）':dark,'ライト（Esri）':light,'衛星写真（Esri）':imagery},null,{position:'topright'}).addTo(map);
 
-const epiIcon = L.divIcon({className:'',html:'<div class="epi">✕</div>',iconSize:[26,26],iconAnchor:[13,13]});
-let epiMarker=null;
+/* ---------- 震源（複数地震） ---------- */
+const MAX_Q=5;
+const QCOL=['#ff4d4d','#ffb020','#4dd2ff','#b07bff','#5fe08a'];     // 地震ごとの識別色
+let QS=[{lat:35.68,lon:139.77,mag:7.0,depth:20,delay:0}], selQ=0;
+const epiMarkers=[];
+const epiIcon=i=>L.divIcon({className:'',html:'<div class="epi" style="color:'+QCOL[i%QCOL.length]+'">✕<span class="epn">'+(i+1)+'</span></div>',iconSize:[26,26],iconAnchor:[13,13]});
+function syncMarkers(){
+  while(epiMarkers.length>QS.length) map.removeLayer(epiMarkers.pop());
+  QS.forEach((q,i)=>{
+    if(!epiMarkers[i]) epiMarkers[i]=L.marker([q.lat,q.lon],{icon:epiIcon(i),interactive:false,keyboard:false}).addTo(map);
+    else{ epiMarkers[i].setLatLng([q.lat,q.lon]); epiMarkers[i].setIcon(epiIcon(i)); }
+  });
+}
+const clampN=(v,lo,hi)=>Math.min(Math.max(v,lo),hi);
+function selectQ(i){
+  selQ=i;
+  Array.from($('qlist').children).forEach((b,k)=>{
+    b.classList.toggle('sel',k===i);
+    b.querySelector('.qd').textContent=(k===i?'地図クリックで震源を設定':'');
+  });
+}
+function renderQuakes(){
+  const box=$('qlist'); box.innerHTML='';
+  QS.forEach((q,i)=>{
+    const b=document.createElement('div'); b.className='qb'+(i===selQ?' sel':''); b.style.borderLeftColor=QCOL[i%QCOL.length];
+    b.innerHTML='<div class="qh"><b>地震'+(i+1)+'</b><span class="qd">'+(i===selQ?'地図クリックで震源を設定':'')+'</span>'
+      +(QS.length>1?'<button class="qx" title="この地震を削除">✕</button>':'')+'</div>'
+      +'<div class="row"><div><label>緯度</label><input data-f="lat" type="number" step="0.01"></div>'
+      +'<div><label>経度</label><input data-f="lon" type="number" step="0.01"></div></div>'
+      +'<label>マグニチュード（スライダーは9.9まで／右の欄は15まで入力可）</label>'
+      +'<div class="row" style="align-items:center"><div style="flex:2.2"><input data-f="magr" type="range" min="0" max="9.9" step="0.1"></div>'
+      +'<div><input data-f="mag" type="number" min="0" max="15" step="0.1"></div></div>'
+      +'<div class="row"><div><label>震源の深さ（km）</label><input data-f="depth" type="number" min="0" max="699" step="5"></div>'
+      +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="300" step="1"></div></div>';
+    const F=f=>b.querySelector('[data-f="'+f+'"]');
+    F('lat').value=q.lat.toFixed(2); F('lon').value=q.lon.toFixed(2);
+    F('mag').value=q.mag.toFixed(1); F('magr').value=Math.min(q.mag,9.9);
+    F('depth').value=q.depth; F('delay').value=q.delay;
+    const num=(f,fn)=>F(f).addEventListener('input',()=>{ const v=parseFloat(F(f).value); if(isFinite(v)) fn(v); });
+    num('lat',v=>{ q.lat=v; syncMarkers(); });
+    num('lon',v=>{ q.lon=v; syncMarkers(); });
+    num('mag',v=>{ q.mag=clampN(v,0,15); F('magr').value=Math.min(q.mag,9.9); });
+    num('depth',v=>{ q.depth=clampN(v,0,699); });
+    num('delay',v=>{ q.delay=Math.round(clampN(v,0,300)); });
+    F('magr').addEventListener('input',()=>{ q.mag=parseFloat(F('magr').value); F('mag').value=q.mag.toFixed(1); });
+    F('mag').addEventListener('change',()=>{ F('mag').value=q.mag.toFixed(1); });
+    b.addEventListener('focusin',()=>{ if(selQ!==i) selectQ(i); });
+    b.addEventListener('click',()=>{ if(selQ!==i) selectQ(i); });
+    const x=b.querySelector('.qx');
+    if(x) x.onclick=ev=>{
+      ev.stopPropagation(); QS.splice(i,1);
+      if(i<selQ) selQ--; else if(i===selQ) selQ=Math.min(selQ,QS.length-1);
+      renderQuakes(); syncMarkers();
+    };
+    box.appendChild(b);
+  });
+  $('qadd').disabled=QS.length>=MAX_Q;
+  $('qadd').textContent=QS.length>=MAX_Q?'地震は最大'+MAX_Q+'個までです':'＋ 地震を追加';
+}
 function setEpi(lat,lon,pan){
   lat=Math.round(lat*100)/100; lon=Math.round(lon*100)/100;
-  $('lat').value=lat.toFixed(2); $('lon').value=lon.toFixed(2);
-  if(!epiMarker) epiMarker=L.marker([lat,lon],{icon:epiIcon,interactive:false,keyboard:false}).addTo(map);
-  else epiMarker.setLatLng([lat,lon]);
+  const q=QS[selQ]; q.lat=lat; q.lon=lon;
+  const b=$('qlist').children[selQ];
+  if(b){ b.querySelector('[data-f="lat"]').value=lat.toFixed(2); b.querySelector('[data-f="lon"]').value=lon.toFixed(2); }
+  syncMarkers();
   if(pan) map.panTo([lat,lon]);
 }
 map.on('click',e=>setEpi(e.latlng.lat,e.latlng.lng,false));
-['lat','lon'].forEach(id=>$(id).addEventListener('change',()=>{
-  const la=parseFloat($('lat').value), lo=parseFloat($('lon').value);
-  if(isFinite(la)&&isFinite(lo)) setEpi(la,lo,false);
-}));
-setEpi(35.68,139.77,false);
+$('qadd').onclick=()=>{
+  if(QS.length>=MAX_Q) return;
+  const c=map.getCenter();
+  QS.push({lat:Math.round(c.lat*100)/100,lon:Math.round(c.lng*100)/100,mag:6.0,depth:10,delay:0});
+  selQ=QS.length-1; renderQuakes(); syncMarkers();
+};
+renderQuakes(); syncMarkers();
 
-/* ---------- 入力 ---------- */
-function setMag(m){ m=Math.min(Math.max(m,0),15); $('magnum').value=m.toFixed(1); $('mag').value=Math.min(m,9.9); }
-$('mag').addEventListener('input',()=>{ $('magnum').value=parseFloat($('mag').value).toFixed(1); });
-$('magnum').addEventListener('input',()=>{ const m=parseFloat($('magnum').value); if(isFinite(m)) $('mag').value=Math.min(Math.max(m,0),9.9); });
-$('magnum').addEventListener('change',()=>{ const m=parseFloat($('magnum').value); setMag(isFinite(m)?m:7.0); });
 const PRESETS=[
   {n:'阪神・淡路(1995)',lat:34.60,lon:135.04,m:7.3,d:16},
   {n:'東北沖(2011)',lat:38.10,lon:142.86,m:9.0,d:24},
@@ -1458,9 +1556,18 @@ const PRESETS=[
 ];
 PRESETS.forEach(p=>{
   const b=document.createElement('button'); b.textContent=p.n;
-  b.onclick=()=>{ setEpi(p.lat,p.lon,true); setMag(p.m); $('depth').value=p.d; };
+  b.onclick=()=>{
+    const q=QS[selQ]; q.lat=p.lat; q.lon=p.lon; q.mag=p.m; q.depth=p.d;     // 発生時刻（秒後）は据え置き
+    renderQuakes(); syncMarkers(); map.panTo([p.lat,p.lon]);
+  };
   $('presets').appendChild(b);
 });
+{ const b=document.createElement('button'); b.textContent='2地震の例（能登＋首都直下）';
+  b.onclick=()=>{
+    QS=[{lat:37.49,lon:137.27,mag:7.6,depth:15,delay:0},{lat:35.68,lon:139.77,mag:7.3,depth:30,delay:20}];
+    selQ=0; renderQuakes(); syncMarkers(); map.setView([36.3,138.3],6);
+  };
+  $('presets').appendChild(b); }
 $('toggle').onclick=()=>$('panel').classList.toggle('open');
 if(window.innerWidth<=700) $('panel').classList.remove('open');
 
@@ -1498,9 +1605,9 @@ function circlePts(lat0,lon0,rkm,n){
   }
   return pts;
 }
-function drawCircle(rkm,style,width){
+function drawCircle(lat,lon,rkm,style,width){
   if(!(rkm>0.5)) return;
-  const pts=circlePts(sim.epi.lat,sim.epi.lon,rkm,180);
+  const pts=circlePts(lat,lon,rkm,180);
   ctx.beginPath(); ctx.moveTo(pts[0].x,pts[0].y);
   for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x,pts[i].y);
   ctx.strokeStyle=style; ctx.lineWidth=width; ctx.stroke();
@@ -1516,7 +1623,8 @@ function frac(x){ return x-Math.floor(x); }
 
 /* ---------- シミュレーション状態 ---------- */
 let sim=null, Q=null, tcur=0, playing=false, lastTs=0, runCtl=null, waitFlag=false;
-const limT=()=>!sim?0:(sim.eewDone?sim.tEnd:Math.min(sim.tEnd,sim.eewUpto||0));
+// EEWの演算が追いついていない地震があれば、その地震の確定済み時刻までしか再生しない
+const limT=()=>{ if(!sim) return 0; let lim=sim.tEnd; for(const q of sim.quakes) if(!q.eewDone) lim=Math.min(lim,q.eewUpto||0); return lim; };
 
 function valuesAt(t){
   const nf=sim.nf; let f=t/sim.dt; if(f<0)f=0; if(f>nf-1)f=nf-1;
@@ -1589,13 +1697,23 @@ function drawPredPolygons(pv,z){
 }
 
 let predCv=null;
-function drawPredFill(rep,z){
+function predOf(rep){
   if(!rep._pv){                                        // 予想震度(×10, int8)を初回だけ展開
     const bin=atob(rep.pq); const a=new Int8Array(bin.length);
     for(let i=0;i<bin.length;i++) a[i]=(bin.charCodeAt(i)<<24)>>24;
     rep._pv=a;
   }
-  const pv=rep._pv; if(pv.length!==N) return;
+  return rep._pv;
+}
+function mergedPred(){                                 // 各地震の現在の予想震度を、観測点ごとに最大で合成
+  const list=[]; for(const cur of eewCurs){ if(cur&&cur.pq){ const pv=predOf(cur); if(pv.length===N) list.push(pv); } }
+  if(!list.length) return null;
+  if(list.length===1) return list[0];
+  const out=Int8Array.from(list[0]);
+  for(let k=1;k<list.length;k++){ const pv=list[k]; for(let i=0;i<N;i++) if(pv[i]>out[i]) out[i]=pv[i]; }
+  return out;
+}
+function drawPredFill(pv,z){
   if(GEO && GEO.length){ drawPredPolygons(pv,z); return; }   // 区域境界データがあればそちらで塗る
   const dpr=window.devicePixelRatio||1, w=cv.width, h=cv.height;
   if(!predCv) predCv=document.createElement('canvas');
@@ -1633,7 +1751,7 @@ function draw(ts){
     buckets[k].push(i);
   }
   // EEWの予想震度で地図を薄く塗りつぶす（観測点ごとの予想震度の階級色。高い階級を上に重ねる）
-  if(sim && eewCur && eewCur.pq && $('showPred').checked) drawPredFill(eewCur,z);
+  if(sim && $('showPred').checked){ const pv=mergedPred(); if(pv) drawPredFill(pv,z); }
   // 震度1以上の観測点は「円の中に震度階級の数字」で表示（ズームに応じて円を拡大）
   const rn=Math.min(16,5.5+(z-4)*1.2), showTxt=rn>=6.5;
   ctx.textAlign='center'; ctx.textBaseline='middle';
@@ -1658,28 +1776,35 @@ function draw(ts){
   updateRank(ts);
   if(sim){
     updateEew();
-    drawCircle(interp(sim.P,tcur),'rgba(90,200,255,.95)',1.6);
-    drawCircle(interp(sim.S,tcur),'rgba(255,95,95,.98)',2.2);
-    if(eewCur && sim.ett && eewCur.t0!=null){        // EEW推定震源から見たP波・S波（推定、薄く破線）
-      const tt=sim.ett[eewCur.depth], tau=tcur-eewCur.t0;
-      if(tt && tau>0){
-        drawCircleAt(eewCur.lat,eewCur.lon,interp(tt[0],tau),'rgba(90,200,255,.38)',1.3,[6,5]);
-        drawCircleAt(eewCur.lat,eewCur.lon,interp(tt[1],tau),'rgba(255,120,120,.45)',1.6,[6,5]);
+    sim.quakes.forEach(q=>{                             // 各地震の実際のP波・S波（発生後のみ）
+      const tl=tcur-q.delay; if(tl<0) return;
+      drawCircle(q.lat,q.lon,interp(q.P,tl),'rgba(90,200,255,.95)',1.6);
+      drawCircle(q.lat,q.lon,interp(q.S,tl),'rgba(255,95,95,.98)',2.2);
+    });
+    eewCurs.forEach(cur=>{
+      if(!cur) return;
+      if(sim.ett && cur.t0!=null){                      // EEW推定震源から見たP波・S波（推定、薄く破線）
+        const tt=sim.ett[cur.depth], tau=tcur-cur.t0;
+        if(tt && tau>0){
+          drawCircleAt(cur.lat,cur.lon,interp(tt[0],tau),'rgba(90,200,255,.38)',1.3,[6,5]);
+          drawCircleAt(cur.lat,cur.lon,interp(tt[1],tau),'rgba(255,120,120,.45)',1.6,[6,5]);
+        }
       }
-    }
-    if(eewCur){ const p=map.latLngToContainerPoint([eewCur.lat,eewCur.lon]);
+      const p=map.latLngToContainerPoint([cur.lat,cur.lon]);
       ctx.strokeStyle='#ffd23b'; ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(p.x,p.y,9,0,6.2832);
-      ctx.moveTo(p.x-14,p.y); ctx.lineTo(p.x+14,p.y); ctx.moveTo(p.x,p.y-14); ctx.lineTo(p.x,p.y+14); ctx.stroke(); }
+      ctx.moveTo(p.x-14,p.y); ctx.lineTo(p.x+14,p.y); ctx.moveTo(p.x,p.y-14); ctx.lineTo(p.x,p.y+14); ctx.stroke();
+    });
     $('hT').textContent=tcur.toFixed(1);
-    $('hP').textContent=interp(sim.P,tcur).toFixed(0);
-    $('hS').textContent=interp(sim.S,tcur).toFixed(0);
+    const hv=f=>sim.quakes.map(q=>{ const tl=tcur-q.delay; return tl<0?'-':interp(q[f],tl).toFixed(0); }).join('／');
+    $('hP').textContent=hv('P');
+    $('hS').textContent=hv('S');
     const hm=$('hM'); const m=Math.max(vmax,-3);
     if(m<0.5){ hm.textContent='—'; hm.style.color='#93a0b8'; }
     else { hm.textContent=m.toFixed(1)+'（'+CLASS_LABEL[shindoCls(m)]+'）'; hm.style.color=clsColor(shindoCls(m)); }
   }
 }
 
-let lastRank=0, eewCur=null;
+let lastRank=0, eewCurs=[], eewCards=[];
 function updateRank(ts){
   if(!sim||!AM||(ts||0)-lastRank<250) return; lastRank=ts||0;
   const arr=[]; for(let a=0;a<AM.length;a++){ if(AM[a]>=0.5) arr.push([a,AM[a]]); }
@@ -1693,31 +1818,56 @@ function updateRank(ts){
   $('rankTbl').innerHTML=h||'<tr><td style="color:#93a0b8">震度1以上の観測なし</td></tr>';
 }
 const EEW_LBL=['待機中','予報','警報','特別警報'];
-function eewSet(id,html){ const el=$(id); if(el._h!==html){ el.innerHTML=html; el._h=html; } }
-function updateEew(){
-  const card=$('eewcard'), e=sim.eew;
+function eewSet(el,html){ if(el._h!==html){ el.innerHTML=html; el._h=html; } }
+// 地震の数だけ緊急地震速報カードを作る（報の履歴は初期状態で閉じる）
+function buildEewCards(n){
+  const box=$('eewcards'); box.innerHTML=''; eewCards=[]; eewCurs=new Array(n).fill(null);
+  for(let i=0;i<n;i++){
+    const c=document.createElement('div'); c.className='card eewcard lv0';
+    c.innerHTML='<h3>緊急地震速報'+(n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span> 地震'+(i+1):'')+'</h3>'
+      +'<div class="eh"><span class="lvbadge r-lv">待機中</span><span class="eno r-no"></span></div>'
+      +'<div class="tiles">'
+      +'<div class="tile"><div class="k">予想最大震度</div><div class="v r-max"><span class="chipbig" style="background:#3a4357">-</span></div></div>'
+      +'<div class="tile"><div class="k">マグニチュード</div><div class="v r-mag">-</div></div>'
+      +'<div class="tile"><div class="k">深さ</div><div class="v eewDep r-dep">-</div></div></div>'
+      +'<div class="pos r-pos">シミュレーション実行後に表示</div>'
+      +'<div class="areas r-areas"></div>'
+      +'<div class="r-warnHead"></div>'
+      +'<div class="warnttl">警報対象範囲（震度4以上を予想）<span class="sub r-warnMode" style="margin-left:6px"></span></div>'
+      +'<div class="warnbox r-warnBox"><span class="sub">警報・特別警報の発表後に表示</span></div>'
+      +'<details class="histbox"><summary>報の履歴</summary><table class="hist r-hist"></table></details>'
+      +'<div class="sub">黄色の○＋＝EEW推定震源／✕＝設定した震源／地図の薄い塗り＝予想震度</div>';
+    box.appendChild(c);
+    eewCards.push({el:c, r:k=>c.querySelector('.r-'+k)});
+  }
+}
+buildEewCards(1);
+function updateEew(){ sim.quakes.forEach((qk,i)=>updateEewCard(qk,i)); }
+function updateEewCard(qk,i){
+  const C=eewCards[i]; if(!C) return;
+  const card=C.el, R=C.r, e=qk.eew;
   let cur=null, lvmax=0;
-  if(e){ for(let i=0;i<e.reports.length;i++){ const r=e.reports[i]; if(r.t>tcur) break; cur=r; if(r.lv>lvmax) lvmax=r.lv; } }
-  eewCur=cur;
+  if(e){ for(let k=0;k<e.reports.length;k++){ const r=e.reports[k]; if(r.t>tcur) break; cur=r; if(r.lv>lvmax) lvmax=r.lv; } }
+  eewCurs[i]=cur;
   if(!cur){
-    card.className='card lv0';
-    eewSet('eewLv',e?'発表前':'発表なし'); eewSet('eewNo','');
-    eewSet('eewMax','<span class="chipbig" style="background:#3a4357">-</span>');
-    eewSet('eewMag','-'); eewSet('eewDep','-');
-    eewSet('eewPos',e?'観測点でP波を検知中…':'発表基準に達しませんでした');
-    eewSet('eewAreas',''); eewSet('eewHist','');
-    eewSet('warnBox','<span class="sub">警報・特別警報の発表後に表示</span>'); eewSet('warnMode','');
-    eewSet('warnHead','');
+    card.className='card eewcard lv0';
+    eewSet(R('lv'),e?'発表前':'発表なし'); eewSet(R('no'),'');
+    eewSet(R('max'),'<span class="chipbig" style="background:#3a4357">-</span>');
+    eewSet(R('mag'),'-'); eewSet(R('dep'),'-');
+    eewSet(R('pos'),e?(tcur<qk.delay?'発生前（'+qk.delay+'秒後に発生）':'観測点でP波を検知中…'):'発表基準に達しませんでした');
+    eewSet(R('areas'),''); eewSet(R('hist'),'');
+    eewSet(R('warnBox'),'<span class="sub">警報・特別警報の発表後に表示</span>'); eewSet(R('warnMode'),'');
+    eewSet(R('warnHead'),'');
     return;
   }
-  card.className='card lv'+lvmax;
-  eewSet('eewLv',EEW_LBL[lvmax]);
-  eewSet('eewNo','第'+cur.no+'報'+(cur.final?'（最終）':''));
+  card.className='card eewcard lv'+lvmax;
+  eewSet(R('lv'),EEW_LBL[lvmax]);
+  eewSet(R('no'),'第'+cur.no+'報'+(cur.final?'（最終）':''));
   const tc=(cur.maxCls===2||cur.maxCls===3)?'#111':'#fff';
-  eewSet('eewMax','<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
-  eewSet('eewMag','M'+cur.mag.toFixed(1));
-  eewSet('eewDep',cur.depth+'<small>km</small>');
-  eewSet('eewPos','推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?' ／PLUM併用':''));
+  eewSet(R('max'),'<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
+  eewSet(R('mag'),'M'+cur.mag.toFixed(1));
+  eewSet(R('dep'),cur.depth+'<small>km</small>');
+  eewSet(R('pos'),'推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?' ／PLUM併用':''));
   // 警報対象範囲の表: 範囲が狭ければ都道府県別、広ければ地域区分別にまとめる
   let ah='', wh='', mode='', head='';
   if(lvmax>=2 && cur.areas.length){
@@ -1746,9 +1896,9 @@ function updateEew(){
         +'<div class="warnlist">警報対象地域：'+rows.map(g=>g.key).join('、')+'</div>';
   }else if(lvmax>=2){ ah='<span class="sub">該当地域なし</span>'; wh='<span class="sub">該当地域なし</span>'; }
   else{ ah='<span class="sub">強い揺れは予想されていません。今後の情報に注意。</span>'; wh='<span class="sub">警報・特別警報の発表後に表示</span>'; }
-  eewSet('eewAreas',ah); eewSet('warnBox',wh); eewSet('warnMode',mode); eewSet('warnHead',head);
+  eewSet(R('areas'),ah); eewSet(R('warnBox'),wh); eewSet(R('warnMode'),mode); eewSet(R('warnHead'),head);
   const hist=e.reports.filter(r=>r.t<=tcur).slice(-4).reverse();
-  eewSet('eewHist','<tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
+  eewSet(R('hist'),'<tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
     +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+r.mag.toFixed(1)+'</td><td>'+r.depth+'km</td><td>'+r.maxLabel+'</td></tr>').join(''));
 }
 
@@ -1776,10 +1926,9 @@ $('seek').addEventListener('input',()=>{ if(!sim) return; tcur=Math.min(parseInt
 
 /* ---------- 実行 ---------- */
 $('run').onclick=async()=>{
-  const body={lat:parseFloat($('lat').value),lon:parseFloat($('lon').value),
-              mag:parseFloat($('magnum').value),depth:parseFloat($('depth').value),
+  const body={quakes:QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay})),
               gz:(typeof DecompressionStream!=='undefined')};
-  if(![body.lat,body.lon,body.mag,body.depth].every(isFinite)){ $('status').textContent='入力値を確認してください'; return; }
+  if(!QS.every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
   if(runCtl) runCtl.abort(); const ctl=runCtl=new AbortController();
   $('run').disabled=true; $('status').textContent='計算中…'; playing=false; waitFlag=false;
   const handle=async(m)=>{
@@ -1790,19 +1939,24 @@ $('run').onclick=async()=>{
       for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
       if(v.gz) u=new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
       Q=new Int8Array(u.buffer,u.byteOffset,u.length);
-      v.eew={reports:[]}; v.eewUpto=0; v.eewDone=false; sim=v; tcur=0;
+      v.quakes.forEach(q=>{ q.eew={reports:[]}; q.eewUpto=0; q.eewDone=false; });
+      sim=v; tcur=0; buildEewCards(v.quakes.length);
       $('seek').disabled=false; $('seek').max=Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
       showResult(v);
       $('status').textContent='再生中（EEW演算中）';
       playing=true; $('play').textContent='⏸'; $('run').disabled=false;
       if(window.innerWidth<=700) $('panel').classList.remove('open');
     }else if(!sim){ return; }
-    else if(k==='upto'){ sim.eewUpto=v; }
-    else if(k==='report'){ sim.eew.reports.push(v); }
-    else if(k==='final'){ const r=sim.eew.reports.find(x=>x.no===v); if(r) r.final=true; }
-    else if(k==='none'){ sim.eew=null; sim.eewDone=true; $('status').textContent='完了（'+sim.nf+'フレーム）'; }
-    else if(k==='done'){ sim.eewDone=true; $('status').textContent='完了（'+sim.nf+'フレーム／リプレイ可）'; }
-    else if(k==='error'){ sim.eewDone=true; $('status').textContent='EEW演算エラー: '+v; }
+    else{
+      const qk=sim.quakes[m.q]; if(!qk) return;
+      const fin=()=>{ if(!sim.err && sim.quakes.every(x=>x.eewDone)) $('status').textContent='完了（'+sim.nf+'フレーム／リプレイ可）'; };
+      if(k==='upto'){ qk.eewUpto=v; }
+      else if(k==='report'){ qk.eew.reports.push(v); }
+      else if(k==='final'){ const r=qk.eew.reports.find(x=>x.no===v); if(r) r.final=true; }
+      else if(k==='none'){ qk.eew=null; qk.eewDone=true; fin(); }
+      else if(k==='done'){ qk.eewDone=true; fin(); }
+      else if(k==='error'){ qk.eewDone=true; sim.err=true; $('status').textContent='EEW演算エラー（地震'+(m.q+1)+'）: '+v; }
+    }
   };
   try{
     const r=await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:ctl.signal});
@@ -1820,7 +1974,11 @@ $('run').onclick=async()=>{
 
 function showResult(j){
   $('result').style.display='block';
-  $('srcinfo').textContent='震源タイプ: '+j.src.type+(j.src.name?'（'+j.src.name+'）':'')+(j.src.L>0?' ／ 想定断層長 約'+j.src.L+'km（断層の広がりを考慮して震度を計算）':'');
+  const many=j.quakes.length>1;
+  $('srcinfo').style.whiteSpace='pre-line';
+  $('srcinfo').textContent=j.quakes.map((q,i)=>(many?'地震'+(i+1)+'：':'')+'震源タイプ: '+q.src.type+(q.src.name?'（'+q.src.name+'）':'')
+    +(q.src.L>0?' ／ 想定断層長 約'+q.src.L+'km（断層の広がりを考慮して震度を計算）':'')).join('\n');
+  $('areasH').textContent=many?'最終的な区域別最大震度（全地震の最大値・上位）':'最終的な区域別最大震度（シミュレーション結果・上位）';
   const t=$('areas'); t.innerHTML='';
   if(!j.areas.length){ t.innerHTML='<tr><td>震度1以上の区域はありません</td></tr>'; return; }
   j.areas.forEach(a=>{
