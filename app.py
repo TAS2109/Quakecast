@@ -63,6 +63,169 @@ def _load_data():
 ST_LON, ST_LAT, ST_ARV, ST_DEP, ST_AREA, AREA_NAMES, JMA = _load_data()
 N_ST = len(ST_LON)
 
+
+# ---------------------------------------------------------------------
+# 区域境界ポリゴン(data/areas.geojson)による観測点の区域判定（任意）
+#   観測点の座標がどの区域ポリゴンに入るかで ST_AREA を決め直す。
+#   ポリゴン外（海上・簡略化で欠けた沿岸など）は、15km以内の最寄り区域、
+#   それも無ければ stations.csv の値を使う。区域名が areas.csv とあまり
+#   一致しない（<80%）場合は、誤判定を避けるため何も変更しない。
+# ---------------------------------------------------------------------
+def _apply_geojson_areas():
+    import unicodedata
+    path = DATA_DIR / "areas.geojson"
+    if not path.exists():
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            gj = json.load(f)
+    except Exception as e:
+        print("[areas.geojson] 読み込み失敗:", e)
+        return
+
+    def norm(s):
+        return unicodedata.normalize("NFKC", str(s or "")).replace(" ", "").replace("　", "")
+
+    by_name = {norm(v): k for k, v in AREA_NAMES.items()}
+    keys = ("name", "Name", "NAME", "area_name", "AREA_NAME", "regionName", "Area", "area")
+    feats = []                       # (area_id, [ring ndarray(k,2)], bbox)
+    for ft in gj.get("features", []):
+        pr = ft.get("properties") or {}
+        aid = None
+        for k in keys:
+            if k in pr and norm(pr[k]) in by_name:
+                aid = by_name[norm(pr[k])]
+                break
+        g = ft.get("geometry") or {}
+        if aid is None or not g:
+            continue
+        polys = g["coordinates"] if g.get("type") == "MultiPolygon" else (
+            [g["coordinates"]] if g.get("type") == "Polygon" else [])
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] for poly in polys for r in poly if len(r) >= 3]
+        if rings:
+            allp = np.concatenate(rings)
+            feats.append((aid, rings, (allp[:, 0].min(), allp[:, 0].max(), allp[:, 1].min(), allp[:, 1].max())))
+    n_total = len(gj.get("features", []))
+    del gj
+    if len(feats) < 0.8 * len(AREA_NAMES):
+        print("[areas.geojson] 区域名の一致が少ないため（%d/%d件, areas.csv=%d区域）観測点の区域は変更しません"
+              % (len(feats), n_total, len(AREA_NAMES)))
+        return
+
+    def inside(px, py, ring):
+        x, y = ring[:, 0], ring[:, 1]
+        x2, y2 = np.roll(x, -1), np.roll(y, -1)
+        dy = np.where(y2 == y, 1e-12, y2 - y)
+        res = np.zeros(len(px), dtype=bool)
+        for a in range(0, len(px), 64):
+            qx, qy = px[a:a + 64, None], py[a:a + 64, None]
+            cond = (y[None, :] > qy) != (y2[None, :] > qy)
+            xint = x[None, :] + (qy - y[None, :]) * ((x2 - x) / dy)[None, :]
+            res[a:a + 64] = (np.sum(cond & (qx < xint), axis=1) % 2) == 1
+        return res
+
+    new_area = np.full(N_ST, -1, dtype=np.int64)
+    for aid, rings, (x0, x1, y0, y1) in feats:
+        cand = np.where((ST_LON >= x0) & (ST_LON <= x1) & (ST_LAT >= y0) & (ST_LAT <= y1)
+                        & (new_area < 0))[0]
+        if not len(cand):
+            continue
+        ins = np.zeros(len(cand), dtype=bool)
+        for r in rings:                               # 穴を含め偶奇則で判定
+            ins ^= inside(ST_LON[cand], ST_LAT[cand], r)
+        new_area[cand[ins]] = aid
+    n_in = int((new_area >= 0).sum())
+
+    # ポリゴン外の観測点: 15km以内の最寄り区域
+    left = np.where(new_area < 0)[0]
+    n_near = 0
+    if len(left):
+        vx = np.concatenate([r[:, 0] for _, rs, _ in feats for r in rs])
+        vy = np.concatenate([r[:, 1] for _, rs, _ in feats for r in rs])
+        vid = np.concatenate([np.full(len(r), aid) for aid, rs, _ in feats for r in rs])
+        for i in left:
+            kx = 111.32 * math.cos(math.radians(ST_LAT[i]))
+            d = np.hypot((vx - ST_LON[i]) * kx, (vy - ST_LAT[i]) * 110.57)
+            j = int(np.argmin(d))
+            if d[j] <= 15.0:
+                new_area[i] = vid[j]
+                n_near += 1
+    ok = new_area >= 0
+    changed = int((new_area[ok] != ST_AREA[ok]).sum())
+    ST_AREA[ok] = new_area[ok]
+    print("[areas.geojson] 区域一致 %d/%d件 / ポリゴン内 %d点・最寄り %d点・csv据え置き %d点 / 区域を変更 %d点"
+          % (len(feats), n_total, n_in, n_near, int((~ok).sum()), changed))
+
+
+_apply_geojson_areas()
+
+
+# ---------------------------------------------------------------------
+# 震央地名（気象庁の震源地名）: data/epicenters.geojson のポリゴンから緯度経度→地名
+#   陸域（石川県能登地方など）・海域（能登半島沖など）・海外の地域を含む。
+#   無ければ None を返し、呼び出し側が簡易的な地名にフォールバックする。
+# ---------------------------------------------------------------------
+def _load_epicenters():
+    path = DATA_DIR / "epicenters.geojson"
+    if not path.exists():
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            gj = json.load(f)
+    except Exception as e:
+        print("[epicenters.geojson] 読み込み失敗:", e)
+        return []
+    out = []
+    for ft in gj.get("features", []):
+        nm = (ft.get("properties") or {}).get("name")
+        g = ft.get("geometry") or {}
+        polys = g.get("coordinates", []) if g.get("type") == "MultiPolygon" else (
+            [g.get("coordinates", [])] if g.get("type") == "Polygon" else [])
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] for poly in polys for r in poly if len(r) >= 3]
+        if not nm or not rings:
+            continue
+        allp = np.concatenate(rings)
+        bb = (allp[:, 0].min(), allp[:, 0].max(), allp[:, 1].min(), allp[:, 1].max())
+        out.append((nm, rings, bb, (bb[1] - bb[0]) * (bb[3] - bb[2]), allp))
+    print("[epicenters.geojson] %d区域を読み込み" % len(out))
+    return out
+
+
+EPI_FEATS = _load_epicenters()
+
+
+def _in_ring(lon, lat, ring):
+    x, y = ring[:, 0], ring[:, 1]
+    x2, y2 = np.roll(x, -1), np.roll(y, -1)
+    cond = (y > lat) != (y2 > lat)
+    dy = np.where(y2 == y, 1e-12, y2 - y)
+    xint = x + (lat - y) * (x2 - x) / dy
+    return bool(np.sum(cond & (lon < xint)) % 2 == 1)
+
+
+def epicenter_region(lat, lon):
+    """緯度経度を含む震央地名。複数に含まれれば最小の区域。どこにも入らなければ100km以内の最寄り。"""
+    if not EPI_FEATS:
+        return None
+    best = None
+    for nm, rings, (x0, x1, y0, y1), area, _ in EPI_FEATS:
+        if not (x0 <= lon <= x1 and y0 <= lat <= y1):
+            continue
+        ins = False
+        for r in rings:                              # 穴を含め偶奇則
+            ins ^= _in_ring(lon, lat, r)
+        if ins and (best is None or area < best[0]):
+            best = (area, nm)
+    if best:
+        return best[1]
+    kx = 111.32 * math.cos(math.radians(lat))
+    near = None
+    for nm, _, _, _, allp in EPI_FEATS:
+        d = float(np.min(np.hypot((allp[:, 0] - lon) * kx, (allp[:, 1] - lat) * 110.57)))
+        if near is None or d < near[0]:
+            near = (d, nm)
+    return near[1] if near and near[0] <= 100.0 else None
+
 # ---------------------------------------------------------------------
 # 区域 → 都道府県 → 地域区分 の対応（警報対象範囲の表示用）
 #   各都道府県の代表点（県庁所在地ほか）への最寄りで観測点の都道府県を決め、
@@ -456,7 +619,7 @@ def _mag_of_mw(mw):
 def _mw_from_m01(m01_i, x, depth_p, arv, sdep):
     """観測点の計測震度から、距離減衰式を逆算してMwを求める（二分法）"""
     lo = np.full(m01_i.shape, -5.0)      # 元の式のMw換算ではM4でも約-1.6になるため下限を広く取る
-    hi = np.full(m01_i.shape, 10.5)
+    hi = np.full(m01_i.shape, 13.0)
     for _ in range(40):
         mid = (lo + hi) / 2.0
         lp = (0.58 * mid + 0.0038 * depth_p
@@ -505,7 +668,7 @@ def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
             mw = min(mw, float(mws[cen].min()))        # 下限以下の観測点が示す上限を超えない
     else:
         mw = float(mws.min()) - 0.4                    # 全点が下限以下: 上限より小さい規模
-    mag = min(max(_mag_of_mw(mw), 2.0), 9.5)
+    mag = min(max(_mag_of_mw(mw), 2.0), 15.0)
     # 観測波形が短いうちは大地震の規模を過小評価する（経過時間とともに上限が上がる）
     msat = 6.2 + 0.95 * math.log2(1.0 + max(tau, 0.0) / 3.0)
     return min(mag, msat), mag > msat      # (推定M, 上限に頭打ち中=まだ規模が成長中か)
@@ -657,7 +820,20 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     area_added = len(areas) > len(last["areas"])   # 警報対象地域の追加は即続報
                     changed = (lv != last["lv"]) or area_added or (moved and T - last["t"] >= (1 if lv >= 2 else 2))
                 if (changed and len(reports) < 80) or after_peak:
+                    # 震源地名: 推定震源に最も近い観測点の区域名。25km超離れていれば「○○県沖」
+                    de_ = _planar_km(lat_e, lon_e, ST_LAT, ST_LON)
+                    j_ = int(np.argmin(de_))
+                    epi_geo = epicenter_region(lat_e, lon_e)      # 気象庁の震央地名（データがあれば）
+                    if epi_geo:
+                        epi_name = epi_geo
+                    elif de_[j_] <= 25.0:
+                        epi_name = AREA_NAMES.get(int(ST_AREA[j_]), "")
+                    elif de_[j_] <= 300.0:
+                        epi_name = AREA_GEO.get(int(ST_AREA[j_]), ("", ""))[0] + "沖"
+                    else:
+                        epi_name = "日本の遠方"
                     last = {"no": len(reports) + 1, "t": round(float(T), 1), "lat": round(lat_e, 2),
+                            "epiName": epi_name,
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
                             "maxCls": cls_e, "plum": bool(plum_used), "lv": lv, "areas": areas, "final": after_peak,
@@ -815,7 +991,7 @@ def api_simulate():
         return _json_response({"error": "入力が不正です"}, 400)
     if not (10.0 <= lat <= 55.0 and 110.0 <= lon <= 165.0):
         return _json_response({"error": "震源は日本周辺（緯度10〜55, 経度110〜165）で指定してください"}, 400)
-    mag = min(max(mag, 0.0), 9.9)
+    mag = min(max(mag, 0.0), 15.0)
     depth = min(max(depth, 0.0), 699.0)
     gz = bool(j.get("gz"))
     base, (tp, rt, t_end) = sim_core(lat, lon, mag, depth, gz=gz)
@@ -945,6 +1121,10 @@ INDEX_HTML = r"""<!doctype html>
   #eewcard .pos{margin-top:6px;height:18px;font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap}
   #eewcard .aretitle{margin-top:4px;font-size:11px;color:#cfd8ea}
   #eewcard .areas{height:18px;overflow:hidden;white-space:nowrap;font-size:12px;margin-top:4px}
+  #warncard.alert{background:#7a1010ee;border-color:#ff4d4d;border-width:2px;animation:eewb 1s infinite}
+  #warncard.alert3{animation-duration:.6s}
+  #warncard .warnmsg{font-size:14px;font-weight:800;line-height:1.5}
+  #warncard .warnlist{font-size:12.5px;line-height:1.5;margin:3px 0 6px}
   #warncard .warnbox{max-height:190px;overflow:auto}
   #warncard table td{font-size:12px;padding:2px 4px}
   #warncard table td.sm{color:var(--sub);font-size:11px;white-space:nowrap}
@@ -981,9 +1161,9 @@ INDEX_HTML = r"""<!doctype html>
 
   <h2>② 規模・深さ</h2>
   <label>マグニチュード <b id="magv">7.0</b></label>
-  <input id="mag" type="range" min="0" max="9.9" step="0.1" value="7.0">
+  <input id="mag" type="range" min="0" max="15" step="0.1" value="7.0">
   <label>震源の深さ（km）</label>
-  <input id="depth" type="number" min="0" max="699" step="1" value="20">
+  <input id="depth" type="number" min="0" max="699" step="5" value="20">
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
 
@@ -1029,6 +1209,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <div id="warncard" class="card">
     <h3>警報対象範囲（震度4以上を予想）<span id="warnMode" class="sub" style="margin-left:6px"></span></h3>
+    <div id="warnHead"></div>
     <div id="warnBox" class="warnbox"><span class="sub">警報・特別警報の発表後に表示</span></div>
   </div>
   <div id="rank" class="card">
@@ -1382,6 +1563,7 @@ function updateEew(){
     eewSet('eewPos',e?'観測点でP波を検知中…':'発表基準に達しませんでした');
     eewSet('eewAreas',''); eewSet('eewHist','');
     eewSet('warnBox','<span class="sub">警報・特別警報の発表後に表示</span>'); eewSet('warnMode','');
+    eewSet('warnHead',''); $('warncard').className='card';
     return;
   }
   card.className='card lv'+lvmax;
@@ -1393,7 +1575,8 @@ function updateEew(){
   eewSet('eewDep',cur.depth+'<small>km</small>');
   eewSet('eewPos','推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?' ／PLUM併用':''));
   // 警報対象範囲の表: 範囲が狭ければ都道府県別、広ければ地域区分別にまとめる
-  let ah='', wh='', mode='';
+  let ah='', wh='', mode='', head='';
+  $('warncard').className='card'+(lvmax>=2?' alert'+(lvmax>=3?' alert3':''):'');   // 警報・特別警報で赤く点滅
   if(lvmax>=2 && cur.areas.length){
     ah='<span class="sub">警報対象 '+cur.areas.length+'区域（下表）</span>';
     const prefs=new Set(cur.areas.map(a=>a.pref));
@@ -1416,9 +1599,11 @@ function updateEew(){
       wh+='<tr><td>'+g.key+'</td><td class="num"><span class="chip" style="background:'+clsColor(g.cls)+';color:'+tc+'">'+g.label+'</span></td><td class="num">'+g.n+'</td><td class="num">'+s+'</td></tr>';
     });
     wh+='</table>';
+    head='<div class="warnmsg">'+(cur.epiName||'震源付近')+'で地震。強い揺れに警戒。</div>'
+        +'<div class="warnlist">警報対象地域：'+rows.map(g=>g.key).join('、')+'</div>';
   }else if(lvmax>=2){ ah='<span class="sub">該当地域なし</span>'; wh='<span class="sub">該当地域なし</span>'; }
   else{ ah='<span class="sub">強い揺れは予想されていません。今後の情報に注意。</span>'; wh='<span class="sub">警報・特別警報の発表後に表示</span>'; }
-  eewSet('eewAreas',ah); eewSet('warnBox',wh); eewSet('warnMode',mode);
+  eewSet('eewAreas',ah); eewSet('warnBox',wh); eewSet('warnMode',mode); eewSet('warnHead',head);
   const hist=e.reports.filter(r=>r.t<=tcur).slice(-4).reverse();
   eewSet('eewHist','<tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
     +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+r.mag.toFixed(1)+'</td><td>'+r.depth+'km</td><td>'+r.maxLabel+'</td></tr>').join(''));
