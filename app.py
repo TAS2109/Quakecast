@@ -264,6 +264,9 @@ def realtime_frames(m01, kyori, dep_p, tf, p_curve, s_curve, tatsu):
 #        （波形が増えるほど大きな地震の規模を推定できる＝初期は過小評価になりやすい）
 #     4) 推定した震源・Mから各区域の震度を予測し、予報/警報/特別警報を判定
 #     5) 推定値が変化するたびに続報（第N報）を発表
+#     6) PLUM法を併用: 観測された震度を周囲30km以内へそのまま予測震度とする
+#        （規模推定が頭打ちでも実際に強く揺れた地域を取りこぼさない）
+#     7) 警報の対象地域は一度発表したら続報でも取り消さない（追加時は即続報）
 # =====================================================================
 TG = np.arange(0.0, 600.0 + 1e-9, 0.05)
 EEW_DEPTHS = [10.0, 30.0, 60.0, 120.0, 250.0, 450.0]
@@ -419,6 +422,7 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
     T_stop = min(t_end - 1.0, max(t_first + 60.0, t_peak + 6.0))
     max_a = int(ST_AREA.max())
     reports, last, lv_max = [], None, 0
+    warned = {}      # 警報対象地域（発表済みは続報でも保持）
 
     while T <= T_stop:
         t_data = T - EEW_DELAY
@@ -442,6 +446,19 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
                 mag_e, capped = est
 
             m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e)
+            # --- PLUM法（実際の気象庁EEWでも併用）---
+            fr = min(int(math.floor(t_data)), rt.shape[0] - 1)
+            ob = np.nan_to_num(rt[fr].astype(np.float64), nan=-9.0, neginf=-9.0, posinf=-9.0)
+            trig = np.where(ob >= 4.5)[0]          # 震度5弱以上を観測した点のみ起点
+            plum_used = False
+            if len(trig):
+                dd = _planar_km(ST_LAT[trig][:, None], ST_LON[trig][:, None],
+                                ST_LAT[None, :], ST_LON[None, :])
+                pl = np.max(np.where(dd <= 30.0, ob[trig][:, None], -9.0), axis=0)
+                upm = pl > m01_p + 0.05
+                if upm.any():
+                    m01_p = np.where(upm, pl, m01_p)
+                    plum_used = True
             vmax_e = float(m01_p.max())
             cls_e, lb_max = shindo_class(vmax_e)
             if cls_e >= 7:            # 推定最大震度6弱以上 → 特別警報
@@ -469,8 +486,11 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
                     areas.append({"name": AREA_NAMES.get(int(a), "区域%d" % int(a)),
                                   "label": lb, "cls": c,
                                   "ts": round(float(ats[a]), 1) if np.isfinite(ats[a]) else None})
-                    if len(areas) >= 30:
+                    if len(areas) >= 60:
                         break
+                for a_ in areas:                    # 発表済みの対象地域は取り消さない
+                    warned[a_["name"]] = a_
+                areas = sorted(warned.values(), key=lambda x: -x["cls"])[:60]
 
             if lv >= 1:
                 after_peak = T >= t_peak + 1          # 最大震度の観測後 → これが最終報
@@ -485,13 +505,14 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
                     dpos = float(_planar_km(lat_e, lon_e, last["lat"], last["lon"]))
                     moved = (abs(mag_e - last["mag"]) >= dm_th or dpos >= pos_th
                              or abs(dep_e - last["depth"]) >= 20.0
-                             or abs(len(areas) - len(last["areas"])) >= 3)
-                    changed = (lv != last["lv"]) or (moved and T - last["t"] >= 2)
-                if (changed and len(reports) < 49) or after_peak:
+                             or (cls_e != last["maxCls"] and abs(vmax_e - last["max"]) >= 0.3))
+                    area_added = len(areas) > len(last["areas"])   # 警報対象地域の追加は即続報
+                    changed = (lv != last["lv"]) or area_added or (moved and T - last["t"] >= 2)
+                if (changed and len(reports) < 80) or after_peak:
                     last = {"no": len(reports) + 1, "t": int(T), "lat": round(lat_e, 2),
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "max": round(vmax_e, 1), "maxLabel": lb_max,
-                            "maxCls": cls_e, "lv": lv, "areas": areas, "final": after_peak}
+                            "maxCls": cls_e, "plum": bool(plum_used), "lv": lv, "areas": areas, "final": after_peak}
                     reports.append(last)
                     lv_max = lv
                     if after_peak:
@@ -1060,7 +1081,7 @@ function updateEew(){
   eewSet('eewMax','<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
   eewSet('eewMag','M'+cur.mag.toFixed(1));
   eewSet('eewDep',cur.depth+'<small>km</small>');
-  eewSet('eewPos','推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点');
+  eewSet('eewPos','推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?' ／PLUM併用':''));
   let ah='';
   if(lvmax>=2){
     if(cur.areas.length){
