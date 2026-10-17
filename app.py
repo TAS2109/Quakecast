@@ -637,37 +637,82 @@ def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
     t_ceil = np.ceil(tp_n[avail]).astype(int)
     d_all = np.maximum(hubeny_km(lat_e, lon_e, ST_LAT[avail], ST_LON[avail]), 8.0)
     ts_e = t0_e + np.interp(d_all, sc, TG, right=600.0)
-    # 各観測点で「P波が届いてからS波が届く前」の最新フレームの振幅を使う
-    f = np.minimum(np.minimum(int(math.floor(t_data)), np.floor(ts_e - 1.5).astype(int)),
-                   rt.shape[0] - 1)
+    # 各観測点で「P波が届いてからS波が届く前」の最新フレームの振幅を使う。
+    # 推定震源が真の震源からずれていると推定S到達時刻(ts_e)が実際より遅くなり、S波到達後の
+    # フレームをP波の式で逆算して規模が極端に小さくなる（M9→M2）。そこで観測波形そのものの
+    # 立ち上がり（S波の急な振幅ジャンプ）を検出し、それ以降のフレームはP波解析に使わない。
+    fmax = min(int(math.floor(t_data)), rt.shape[0] - 1)
+    with np.errstate(invalid="ignore"):
+        sub = rt[:fmax + 1, avail].astype(np.float64)
+        jump = (sub[1:] - sub[:-1]) > 0.8
+    jump &= np.arange(1, fmax + 1)[:, None] >= (t_ceil + 2)[None, :]   # P波立ち上がり直後は除外
+    has_on = jump.any(axis=0)
+    onset = np.where(has_on, jump.argmax(axis=0) + 1, 10 ** 6)          # S波が観測された最初のフレーム
+    f = np.minimum(np.minimum(fmax, np.floor(ts_e - 1.5).astype(int)), onset - 1)
     ok = f >= t_ceil + 1
-    if not ok.any():
-        return None
-    sel = np.where(ok)[0]
-    sel = sel[np.argsort(d_all[sel])[:10]]            # 震源に近い観測点ほど信号が強い（上位10点）
-    idx, f, d = avail[sel], f[sel], d_all[sel]
-    obs = rt[f, idx].astype(np.float64) + rng.normal(0.0, 0.25, len(idx))   # 振幅の観測ノイズ
-    bai = ((1.0 + ST_ARV[idx]) / 2.2) / 2.0
-    fthr = -3.3 + (1.0 + bai * 3.0) / 4.0             # 検出下限（これ以下は規模の上限しか分からない）
-    cen = obs <= fthr + 0.3
-    obs = np.maximum(obs, fthr + 0.3)
+
     dep_p = dep_e - 10.0
     dterm = min(max(dep_p - 10.0, 0.0), 30.0)
-    bai_dep = (ST_DEP[idx] + 1200.0) / 600.0
-    kp = (-0.006 + dterm / 2000.0) - bai_dep / 300.0
-    pr = np.interp(f - t0_e, TG, pc)                   # 推定震源から見たP波の到達距離
-    zp = d - pr
-    capd = (-zp * kp * 2.0) >= 2.0                     # 振幅が上限（cap）に達した区間
-    m01_i = np.where(capd, obs + 1.5 + d / 150.0 + dterm / 52.0,
-                     obs - zp * kp * 2.0 + 3.5 + d / 150.0 + dterm / 52.0)
-    x = np.sqrt(d * d + dep_p * dep_p)
-    mws = _mw_from_m01(m01_i, x, dep_p, ST_ARV[idx], ST_DEP[idx])
-    if (~cen).any():
-        mw = float(np.median(mws[~cen]))
-        if cen.any():
-            mw = min(mw, float(mws[cen].min()))        # 下限以下の観測点が示す上限を超えない
-    else:
-        mw = float(mws.min()) - 0.4                    # 全点が下限以下: 上限より小さい規模
+    mw_p = None
+    if ok.any():
+        sel = np.where(ok)[0]
+        sel = sel[np.argsort(d_all[sel])[:10]]            # 震源に近い観測点ほど信号が強い（上位10点）
+        idx, ff, d = avail[sel], f[sel], d_all[sel]
+        obs = rt[ff, idx].astype(np.float64) + rng.normal(0.0, 0.25, len(idx))   # 振幅の観測ノイズ
+        bai = ((1.0 + ST_ARV[idx]) / 2.2) / 2.0
+        fthr = -3.3 + (1.0 + bai * 3.0) / 4.0             # 検出下限（これ以下は規模の上限しか分からない）
+        cen = obs <= fthr + 0.3
+        obs = np.maximum(obs, fthr + 0.3)
+        bai_dep = (ST_DEP[idx] + 1200.0) / 600.0
+        kp = (-0.006 + dterm / 2000.0) - bai_dep / 300.0
+        pr = np.interp(ff - t0_e, TG, pc)                  # 推定震源から見たP波の到達距離
+        zp = d - pr
+        capd = (-zp * kp * 2.0) >= 2.0                     # 振幅が上限（cap）に達した区間
+        m01_i = np.where(capd, obs + 1.5 + d / 150.0 + dterm / 52.0,
+                         obs - zp * kp * 2.0 + 3.5 + d / 150.0 + dterm / 52.0)
+        x = np.sqrt(d * d + dep_p * dep_p)
+        mws = _mw_from_m01(m01_i, x, dep_p, ST_ARV[idx], ST_DEP[idx])
+        if (~cen).any():
+            mw_p = float(np.median(mws[~cen]))
+            if cen.any():
+                mw_p = min(mw_p, float(mws[cen].min()))    # 下限以下の観測点が示す上限を超えない
+        else:
+            mw_p = float(mws.min()) - 0.4                  # 全点が下限以下: 上限より小さい規模
+
+    # --- S波（主要動）の振幅も使う: S波が観測された点の立ち上がりフレームから逆算 ---
+    # リアルタイム震度のS波側の式: v = s0 + zs*ks,  s0 = min(m01-(1.5+k2/150)-dterm/52, 4.6)
+    # 立ち上がり直後は zs≈0 なので v≈s0。s0が上限4.6に張り付いていれば規模の下限しか分からない。
+    mw_s = mw_lb = mw_ub = None
+    son = np.where(has_on)[0]
+    if len(son):
+        son = son[np.argsort(d_all[son])[:10]]
+        idx, d = avail[son], d_all[son]
+        obs = rt[onset[son], idx].astype(np.float64) + rng.normal(0.0, 0.25, len(idx))
+        bai = ((1.0 + ST_ARV[idx]) / 2.2) / 2.0
+        fthr = -3.3 + (1.0 + bai * 3.0) / 4.0
+        low = obs <= fthr + 0.3                            # 検出下限以下（上限のみ）
+        hi = obs >= 4.5                                    # s0が上限に張り付き（下限のみ）
+        k2 = np.clip(d, 0.5, 300.0)
+        m01_s = np.maximum(obs, fthr + 0.3) + 1.5 + k2 / 150.0 + dterm / 52.0
+        x = np.sqrt(d * d + dep_p * dep_p)
+        mws_s = _mw_from_m01(m01_s, x, dep_p, ST_ARV[idx], ST_DEP[idx])
+        mid = ~low & ~hi
+        if mid.any():
+            mw_s = float(np.median(mws_s[mid]))
+        if hi.any():
+            mw_lb = float(mws_s[hi].max())
+        if low.any():
+            mw_ub = float(mws_s[low].min())
+
+    mw = mw_p
+    if mw_s is not None:
+        mw = mw_s
+    if mw_lb is not None:
+        mw = mw_lb if mw is None else max(mw, mw_lb)
+    if mw_ub is not None:
+        mw = (mw_ub - 0.4) if mw is None else min(mw, mw_ub)
+    if mw is None:
+        return None
     mag = min(max(_mag_of_mw(mw), 2.0), 15.0)
     # 観測波形が短いうちは大地震の規模を過小評価する（経過時間とともに上限が上がる）
     msat = 6.2 + 0.95 * math.log2(1.0 + max(tau, 0.0) / 3.0)
