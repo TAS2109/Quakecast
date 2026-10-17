@@ -404,14 +404,26 @@ def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
     return min(mag, msat), mag > msat      # (推定M, 上限に頭打ち中=まだ規模が成長中か)
 
 
-def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
-    """緊急地震速報の発表列（第1報, 第2報, ...）を生成する"""
+def _eew_tt_payload(nf):
+    """EEW推定震源から描く推定P/S波用の走時曲線（深さ別・1秒刻みの震央距離km）"""
+    out = {}
+    for d in EEW_DEPTHS:
+        pc, sc = _tt(d)
+        out[str(int(d))] = [[round(float(x), 1) for x in pc[::20][:nf]],
+                            [round(float(x), 1) for x in sc[::20][:nf]]]
+    return out
+
+
+def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
+    """緊急地震速報を演算できた順に返すジェネレータ。
+    ("upto", T): T秒までの速報は確定 / ("report", 報) / ("final", 報番号) / ("done"|"none", None)"""
     rng = np.random.default_rng(int(abs(lat0) * 1000 + abs(lon0) * 100 + mag * 10 + depth) % (2 ** 31))
     tp_n = tp + rng.normal(0.0, 0.1, N_ST)            # P波ピックの誤差
     order = np.argsort(tp_n)
     n_fin = int(np.isfinite(tp_n).sum())
     if n_fin < 2:
-        return None
+        yield ("none", None)
+        return
     order = order[:n_fin]
     t_first = float(tp_n[order[0]])
     T = int(math.ceil(float(tp_n[order[1]]) + EEW_DELAY))
@@ -423,6 +435,7 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
     max_a = int(ST_AREA.max())
     reports, last, lv_max = [], None, 0
     warned = {}      # 警報対象地域（発表済みは続報でも保持）
+    yield ("upto", T0 - 0.001)
 
     while T <= T_stop:
         t_data = T - EEW_DELAY
@@ -513,21 +526,37 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
                 if (changed and len(reports) < 80) or after_peak:
                     last = {"no": len(reports) + 1, "t": int(T), "lat": round(lat_e, 2),
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
-                            "nSt": int(n), "max": round(vmax_e, 1), "maxLabel": lb_max,
+                            "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
                             "maxCls": cls_e, "plum": bool(plum_used), "lv": lv, "areas": areas, "final": after_peak}
                     reports.append(last)
+                    yield ("report", last)
                     lv_max = lv
                     if after_peak:
                         break
         T += 1 if T < T0 + 90 else 2
+        yield ("upto", T - 0.001)
 
     if not reports:
-        return None
-    reports[-1]["final"] = True
-    return {"reports": reports}
+        yield ("none", None)
+        return
+    if not reports[-1].get("final"):
+        reports[-1]["final"] = True
+        yield ("final", reports[-1]["no"])
+    yield ("done", None)
 
 
-def simulate(lat0, lon0, mag, depth, dt=1.0):
+def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
+    """一括版（従来互換）"""
+    reports = []
+    for kind, v in eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
+        if kind == "report":
+            reports.append(v)
+        elif kind == "final":
+            reports[-1]["final"] = True
+    return {"reports": reports} if reports else None
+
+
+def sim_core(lat0, lon0, mag, depth, dt=1.0, gz=False):
     m01, dist, dep_p, src = final_intensity(mag, depth, lat0, lon0)
 
     # 細かい時間軸でP/S波の到達距離曲線を作る（単調増加に整える）
@@ -576,17 +605,15 @@ def simulate(lat0, lon0, mag, depth, dt=1.0):
     vmax = float(m01.max())
     cls, label = shindo_class(vmax)
 
-    # 緊急地震速報: 観測点の検知データから震源・規模・深さを逐次推定した速報列
-    eew = build_eew(mag, depth, lat0, lon0, tp, rt, t_end)
-
     def _clean(a, nd=1):
         return [None if not math.isfinite(x) else round(float(x), nd) for x in a]
 
-    return {
+    out = {
         "dt": dt,
         "nf": nf,
         "ns": N_ST,
-        "q": base64.b64encode(q.tobytes()).decode("ascii"),
+        "q": base64.b64encode(gzip.compress(q.tobytes(), compresslevel=6) if gz else q.tobytes()).decode("ascii"),
+        "gz": bool(gz),
         "P": _clean(p_curve, 2),
         "S": _clean(s_curve, 2),
         "tp": _clean(tp, 1),
@@ -599,8 +626,16 @@ def simulate(lat0, lon0, mag, depth, dt=1.0):
         "epi": {"lat": lat0, "lon": lon0, "mag": mag, "depth": depth},
         "tEnd": t_end,
         "src": {"type": src["type"], "name": src["name"], "L": round(src["L"])},
-        "eew": eew,
+        "ett": _eew_tt_payload(nf),
     }
+    return out, (tp, rt, t_end)
+
+
+def simulate(lat0, lon0, mag, depth, dt=1.0):
+    """一括版（従来互換）: 基本データ＋EEW全報"""
+    out, (tp, rt, t_end) = sim_core(lat0, lon0, mag, depth, dt)
+    out["eew"] = build_eew(mag, depth, lat0, lon0, tp, rt, t_end)
+    return out
 
 
 # =====================================================================
@@ -646,7 +681,21 @@ def api_simulate():
         return _json_response({"error": "震源は日本周辺（緯度10〜55, 経度110〜165）で指定してください"}, 400)
     mag = min(max(mag, 0.0), 9.9)
     depth = min(max(depth, 0.0), 699.0)
-    return _json_response(simulate(lat, lon, mag, depth))
+    gz = bool(j.get("gz"))
+    base, (tp, rt, t_end) = sim_core(lat, lon, mag, depth, gz=gz)
+
+    def gen():
+        def dump(o):
+            return (json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        yield dump({"k": "base", "v": base})          # まず震度フレームを返して再生開始
+        try:
+            for kind, v in eew_stream(mag, depth, lat, lon, tp, rt, t_end):
+                yield dump({"k": kind, "v": v})       # EEWは演算できた順に送る
+        except Exception as e:
+            yield dump({"k": "error", "v": str(e)})
+
+    return Response(gen(), mimetype="application/x-ndjson",
+                    headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 @app.get("/healthz")
@@ -973,10 +1022,18 @@ function drawCircle(rkm,style,width){
   for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x,pts[i].y);
   ctx.strokeStyle=style; ctx.lineWidth=width; ctx.stroke();
 }
+function drawCircleAt(lat,lon,rkm,style,width,dash){
+  if(!(rkm>0.5)) return;
+  const pts=circlePts(lat,lon,rkm,180);
+  ctx.beginPath(); ctx.moveTo(pts[0].x,pts[0].y);
+  for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x,pts[i].y);
+  ctx.setLineDash(dash||[]); ctx.strokeStyle=style; ctx.lineWidth=width; ctx.stroke(); ctx.setLineDash([]);
+}
 function frac(x){ return x-Math.floor(x); }
 
 /* ---------- シミュレーション状態 ---------- */
-let sim=null, Q=null, tcur=0, playing=false, lastTs=0;
+let sim=null, Q=null, tcur=0, playing=false, lastTs=0, runCtl=null, waitFlag=false;
+const limT=()=>!sim?0:(sim.eewDone?sim.tEnd:Math.min(sim.tEnd,sim.eewUpto||0));
 
 function valuesAt(t){
   const nf=sim.nf; let f=t/sim.dt; if(f<0)f=0; if(f>nf-1)f=nf-1;
@@ -1035,6 +1092,13 @@ function draw(ts){
     updateEew();
     drawCircle(interp(sim.P,tcur),'rgba(90,200,255,.95)',1.6);
     drawCircle(interp(sim.S,tcur),'rgba(255,95,95,.98)',2.2);
+    if(eewCur && sim.ett && eewCur.t0!=null){        // EEW推定震源から見たP波・S波（推定、薄く破線）
+      const tt=sim.ett[eewCur.depth], tau=tcur-eewCur.t0;
+      if(tt && tau>0){
+        drawCircleAt(eewCur.lat,eewCur.lon,interp(tt[0],tau),'rgba(90,200,255,.38)',1.3,[6,5]);
+        drawCircleAt(eewCur.lat,eewCur.lon,interp(tt[1],tau),'rgba(255,120,120,.45)',1.6,[6,5]);
+      }
+    }
     if(eewCur){ const p=map.latLngToContainerPoint([eewCur.lat,eewCur.lon]);
       ctx.strokeStyle='#ffd23b'; ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(p.x,p.y,9,0,6.2832);
       ctx.moveTo(p.x-14,p.y); ctx.lineTo(p.x+14,p.y); ctx.moveTo(p.x,p.y-14); ctx.lineTo(p.x,p.y+14); ctx.stroke(); }
@@ -1105,6 +1169,9 @@ function tick(ts){
   if(sim && playing){
     const d=Math.min((ts-lastTs)/1000,0.1);
     tcur+=d*parseFloat($('speed').value);
+    const lim=limT();                                  // EEWの演算が追いつくまで待つ
+    if(tcur>lim){ tcur=lim; if(!waitFlag){ waitFlag=true; $('status').textContent='EEW演算待ち…'; } }
+    else if(waitFlag){ waitFlag=false; $('status').textContent='再生中（EEW演算中）'; }
     if(tcur>=sim.tEnd){ tcur=sim.tEnd; playing=false; $('play').textContent='▶'; }
     $('seek').value=Math.round(tcur*10); $('tlabel').textContent=tcur.toFixed(1)+' s';
   }
@@ -1118,28 +1185,50 @@ $('play').onclick=()=>{
   playing=!playing; $('play').textContent=playing?'⏸':'▶';
 };
 $('restart').onclick=()=>{ if(!sim) return; tcur=0; $('seek').value=0; $('tlabel').textContent='0.0 s'; };
-$('seek').addEventListener('input',()=>{ if(!sim) return; tcur=parseInt($('seek').value)/10; $('tlabel').textContent=tcur.toFixed(1)+' s'; });
+$('seek').addEventListener('input',()=>{ if(!sim) return; tcur=Math.min(parseInt($('seek').value)/10,limT()); $('seek').value=Math.round(tcur*10); $('tlabel').textContent=tcur.toFixed(1)+' s'; });
 
 /* ---------- 実行 ---------- */
 $('run').onclick=async()=>{
   const body={lat:parseFloat($('lat').value),lon:parseFloat($('lon').value),
-              mag:parseFloat($('mag').value),depth:parseFloat($('depth').value)};
+              mag:parseFloat($('mag').value),depth:parseFloat($('depth').value),
+              gz:(typeof DecompressionStream!=='undefined')};
   if(![body.lat,body.lon,body.mag,body.depth].every(isFinite)){ $('status').textContent='入力値を確認してください'; return; }
-  $('run').disabled=true; $('status').textContent='計算中…'; playing=false;
+  if(runCtl) runCtl.abort(); const ctl=runCtl=new AbortController();
+  $('run').disabled=true; $('status').textContent='計算中…'; playing=false; waitFlag=false;
+  const handle=async(m)=>{
+    if(ctl!==runCtl) return;
+    const k=m.k, v=m.v;
+    if(k==='base'){                                    // 震度フレーム到着 → すぐ再生開始
+      const bin=atob(v.q); let u=new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
+      if(v.gz) u=new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+      Q=new Int8Array(u.buffer,u.byteOffset,u.length);
+      v.eew={reports:[]}; v.eewUpto=0; v.eewDone=false; sim=v; tcur=0;
+      $('seek').disabled=false; $('seek').max=Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
+      showResult(v);
+      $('status').textContent='再生中（EEW演算中）';
+      playing=true; $('play').textContent='⏸'; $('run').disabled=false;
+      if(window.innerWidth<=700) $('panel').classList.remove('open');
+    }else if(!sim){ return; }
+    else if(k==='upto'){ sim.eewUpto=v; }
+    else if(k==='report'){ sim.eew.reports.push(v); }
+    else if(k==='final'){ const r=sim.eew.reports.find(x=>x.no===v); if(r) r.final=true; }
+    else if(k==='none'){ sim.eew=null; sim.eewDone=true; $('status').textContent='完了（'+sim.nf+'フレーム）'; }
+    else if(k==='done'){ sim.eewDone=true; $('status').textContent='完了（'+sim.nf+'フレーム／リプレイ可）'; }
+    else if(k==='error'){ sim.eewDone=true; $('status').textContent='EEW演算エラー: '+v; }
+  };
   try{
-    const r=await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const j=await r.json();
-    if(!r.ok){ $('status').textContent=j.error||'エラーが発生しました'; return; }
-    const bin=atob(j.q), u=new Uint8Array(bin.length);
-    for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
-    Q=new Int8Array(u.buffer); sim=j; tcur=0;
-    $('seek').disabled=false; $('seek').max=Math.round(j.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
-    showResult(j);
-    $('status').textContent='完了（'+j.nf+'フレーム）';
-    playing=true; $('play').textContent='⏸';
-    if(window.innerWidth<=700) $('panel').classList.remove('open');
-  }catch(e){ $('status').textContent='通信エラー: '+e; }
-  finally{ $('run').disabled=false; }
+    const r=await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:ctl.signal});
+    if(!r.ok){ let msg='エラーが発生しました'; try{ msg=(await r.json()).error||msg; }catch(_){} $('status').textContent=msg; return; }
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    for(;;){
+      const {value,done}=await rd.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true}); let k;
+      while((k=buf.indexOf('\n'))>=0){ const line=buf.slice(0,k); buf=buf.slice(k+1); if(line.trim()) await handle(JSON.parse(line)); }
+    }
+    if(buf.trim()) await handle(JSON.parse(buf));
+  }catch(e){ if(e.name!=='AbortError') $('status').textContent='通信エラー: '+e; }
+  finally{ if(ctl===runCtl) $('run').disabled=false; }
 };
 
 function showResult(j){
