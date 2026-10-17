@@ -286,9 +286,9 @@ def _tt(depth):
 
 def _planar_km(lat1, lon1, lat2, lon2):
     """高速な簡易距離[km]（等距円筒近似。EEWの探索用）"""
-    dy = (lat1 - lat2) * 111.2
-    dx = (lon1 - lon2) * 111.2 * np.cos(np.radians((lat1 + lat2) / 2.0))
-    return np.sqrt(dx * dx + dy * dy)
+    p1, p2 = np.radians(lat1), np.radians(lat2)       # 遠地震源でも誤差が出ないよう大圏距離
+    a = np.sin((p1 - p2) / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(np.radians(lon1 - lon2) / 2.0) ** 2
+    return 12742.0 * np.arcsin(np.sqrt(np.minimum(a, 1.0)))
 
 
 def _grid_cost(glat, glon, depth, tobs, lat_s, lon_s, lat_u, lon_u, t_data, lat1, lon1, prior):
@@ -314,15 +314,15 @@ def _locate(tobs, lat_s, lon_s, lat_u, lon_u, t_data, free_depth, prior):
     depths = EEW_DEPTHS if free_depth else [10.0]
     best = None
     clat, clon = lat1, lon1
-    for stage in (0, 1):
+    for stage in (0, 1, 2):                              # 1°刻み(±24°) → 0.2°刻み → 0.05°刻み
         if stage == 0:
-            offs = np.arange(-6.0, 6.0001, 0.5)
+            offs = np.arange(-24.0, 24.0001, 1.0)      # 遠地の巨大地震も探索できる範囲
         else:
-            offs = np.arange(-0.5, 0.5001, 0.1)
+            offs = np.arange(-1.0, 1.0001, 0.2) if stage == 1 else np.arange(-0.2, 0.2001, 0.05)
             clat, clon = best[1], best[2]
         la, lo = np.meshgrid(clat + offs, clon + offs, indexing="ij")
         glat, glon = la.ravel(), lo.ravel()
-        for d in depths:
+        for d in (depths if stage else [x for x in depths if x in (10.0, 60.0, 250.0)] or depths):
             c, t0 = _grid_cost(glat, glon, d, tobs, lat_s, lon_s, lat_u, lon_u,
                                t_data, lat1, lon1, prior)
             k = int(np.argmin(c))
@@ -429,7 +429,9 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
         avail = order[tp_n[order] <= t_data]
         n = len(avail)
         if n >= 2:
-            use = avail[:20]
+            # 最初の20点＋広く散らばった検知点（開口が広いほど遠地の距離が決まる）
+            use = avail[:20] if n <= 20 else np.concatenate(
+                [avail[:20], avail[20:][::max(1, (n - 20) // 40)][:40]])
             mask = np.ones(N_ST, dtype=bool)
             mask[avail] = False
             cand = np.where(mask)[0]
@@ -437,7 +439,7 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
             unt = cand[np.argsort(dc)[:50]]
             lat_e, lon_e, dep_e, t0_e, cost_e = _locate(
                 tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
-                t_data, n >= 4, 0.003 if n < 4 else 0.0005)
+                t_data, n >= 4, 0.002 if n < 4 else 0.0001)
             est = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
                                 T - t_first, rng)
             if est is None:
@@ -517,7 +519,7 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
                     lv_max = lv
                     if after_peak:
                         break
-        T += 1 if T < T0 + 40 else 3
+        T += 1 if T < T0 + 90 else 2
 
     if not reports:
         return None
