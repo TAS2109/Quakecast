@@ -1348,39 +1348,33 @@ INDEX_HTML = r"""<!doctype html>
   .card h3{margin:0 0 5px;font-size:11.5px;color:var(--sub);font-weight:600}
   .card .sub{color:var(--sub);font-size:11px;margin-top:3px}
   #rank td.no{color:var(--sub);width:14px}
-  .eewcard{border-width:2px}
-  .eewcard .t{font-size:15px;font-weight:800}
-  .eewcard .rg{display:inline-block;margin:2px 10px 2px 0;white-space:nowrap}
-  .eewcard .rg i{font-style:normal;font-weight:700;margin-left:3px}
-  .eewcard .eh{display:flex;align-items:center;gap:10px;margin-bottom:6px;height:32px}
-  .eewcard .lvbadge{font-size:19px;font-weight:800;padding:2px 10px;border-radius:7px;background:#0006;min-width:112px;text-align:center}
-  .eewcard .eno{font-size:15px;font-weight:700}
-  .eewcard .tiles{display:grid;grid-template-columns:1.15fr 1.1fr .85fr;gap:6px}
-  .eewcard .tile{background:#0005;border-radius:8px;padding:4px 4px 2px;text-align:center;height:78px;overflow:hidden}
-  .eewcard .tile .k{font-size:10.5px;color:#cfd8ea}
-  .eewcard .tile .v{font-size:36px;font-weight:800;line-height:1.3;font-variant-numeric:tabular-nums;white-space:nowrap}
-  .eewcard .eewDep{font-size:28px;line-height:1.5}
-  .eewcard .eewDep small{font-size:13px;margin-left:2px;font-weight:600}
-  .eewcard .chipbig{display:inline-block;min-width:56px;border-radius:9px;padding:0 8px;font-size:30px;line-height:1.3;color:#fff;text-shadow:0 0 3px #000a}
-  .eewcard .pos{margin-top:6px;height:18px;font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap}
-  .eewcard .aretitle{margin-top:4px;font-size:11px;color:#cfd8ea}
-  .eewcard .areas{height:18px;overflow:hidden;white-space:nowrap;font-size:12px;margin-top:4px}
-  .eewcard .warnmsg{font-size:14px;font-weight:800;line-height:1.5;margin-top:6px}
-  .eewcard .warnlist{font-size:12.5px;line-height:1.5;margin:3px 0 6px}
-  .eewcard .warnbox{max-height:190px;overflow:auto;margin-top:4px}
-  .eewcard .warnbox table td{font-size:12px;padding:2px 4px}
-  .eewcard .warnbox table td.sm{color:var(--sub);font-size:11px;white-space:nowrap}
-  .eewcard .warnttl{margin-top:6px;font-size:11.5px;color:#cfd8ea;font-weight:600}
-  .eewcard details.histbox{margin-top:6px}
-  .eewcard details.histbox>summary{cursor:pointer;font-size:11.5px;color:#cfd8ea;font-weight:600;user-select:none}
+  .eewcard{border-width:2px;padding:5px 8px}
+  .eewcard .eh{display:flex;align-items:center;gap:6px;height:24px;margin-bottom:4px}
+  .eewcard .ett{flex:1;min-width:0;font-size:11.5px;color:#cfd8ea;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .eewcard .lvbadge{font-size:14px;font-weight:800;padding:1px 8px;border-radius:6px;background:#0006;min-width:74px;text-align:center;white-space:nowrap}
+  .eewcard .eno{font-size:12px;font-weight:700;white-space:nowrap}
+  .eewcard .tiles{display:grid;grid-template-columns:1.15fr 1fr .9fr;gap:5px}
+  .eewcard .tile{background:#0005;border-radius:6px;padding:2px 3px 1px;text-align:center;height:48px;overflow:hidden}
+  .eewcard .tile .k{font-size:9.5px;color:#cfd8ea;line-height:1.25}
+  .eewcard .tile .v{font-size:22px;font-weight:800;line-height:1.25;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .eewcard .eewDep{font-size:19px;line-height:1.5}
+  .eewcard .eewDep small{font-size:11px;margin-left:2px;font-weight:600}
+  .eewcard .chipbig{display:inline-block;min-width:42px;border-radius:7px;padding:0 6px;font-size:20px;line-height:1.3;color:#fff;text-shadow:0 0 3px #000a}
+  .eewcard .pos,.eewcard .warn{height:16px;font-size:11.5px;line-height:16px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .eewcard .pos{margin-top:4px}
+  .eewcard details.histbox{margin-top:2px}
+  .eewcard details.histbox>summary{cursor:pointer;font-size:10.5px;color:#cfd8ea;font-weight:600;user-select:none}
   .eewcard table.hist{margin-top:0}
-  .eewcard table.hist td{border-bottom:none}
-  .eewcard table.hist td{font-size:11px;padding:1px 4px;color:var(--sub)}
+  .eewcard table.hist td{border-bottom:none;font-size:10.5px;padding:0 4px;color:var(--sub)}
   .eewcard.lv1{background:#12304fee;border-color:#3b9cff}
   .eewcard.lv2{background:#7a1010ee;border-color:#ff4d4d;animation:eewb 1s infinite}
   .eewcard.lv3{background:#2a0a3eee;border-color:#c04bff;animation:eewb .6s infinite}
   @keyframes eewb{50%{box-shadow:0 0 18px 4px #ff3b3b99}}
   #eewcards{display:flex;flex-direction:column;gap:8px}
+  #obs{display:none;align-items:center;gap:8px;padding:5px 8px}
+  #obs .ok{font-size:11px;color:var(--sub);white-space:nowrap}
+  #obs .ov{font-size:12.5px;font-weight:700;white-space:nowrap}
+  #obs .oa{flex:1;min-width:0;font-size:11.5px;color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .epi{position:relative}
   .epi .epn{position:absolute;left:19px;top:-3px;font-size:12px;line-height:12px;font-weight:800;color:#fff;
     text-shadow:0 0 3px #000,0 0 6px #000}
@@ -1414,6 +1408,8 @@ INDEX_HTML = r"""<!doctype html>
   <div class="hint">選択中の地震の震源は、地図をクリックして設定できます。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" checked style="width:auto"> その時点で観測された最大震度を表示</label>
+  <div class="hint">黄色の○＋＝EEW推定震源／✕＝設定した震源（番号は地震番号）／地図の薄い塗り＝予想震度</div>
 
   <h2>② プリセット（選択中の地震に適用）</h2>
   <div class="presets" id="presets"></div>
@@ -1443,6 +1439,7 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <div id="rightcol">
+  <div id="obs" class="card"><span class="ok">観測最大震度</span><span class="ov" id="obsV"></span><span class="oa" id="obsA"></span></div>
   <div id="eewcards"></div>
   <div id="rank" class="card">
     <h3>リアルタイム震度ランキング（区域別）</h3>
@@ -1791,10 +1788,10 @@ function draw(ts){
 
   const z=map.getZoom(), r0=Math.max(2.0,(z-3.6)*0.95);
   const buckets=new Array(LUT_N); for(let k=0;k<LUT_N;k++) buckets[k]=[];
-  let vmax=-99; AM.fill(-99);
+  let vmax=-99, vmaxI=-1; AM.fill(-99);
   for(let i=0;i<N;i++){
     const v=VALS[i];
-    if(!(SEA&&SEA[i])){ if(v>vmax) vmax=v; const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v; }   // 海底観測点は最大・ランキングに含めない
+    if(!(SEA&&SEA[i])){ if(v>vmax){ vmax=v; vmaxI=i; } const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v; }   // 海底観測点は最大・ランキングに含めない
     let k=Math.round((v-LUT_MIN)/LUT_STEP); if(k<0)k=0; if(k>=LUT_N)k=LUT_N-1;
     buckets[k].push(i);
   }
@@ -1847,6 +1844,7 @@ function draw(ts){
     $('hP').textContent=hv('P');
     $('hS').textContent=hv('S');
     const hm=$('hM'); const m=Math.max(vmax,-3);
+    updateObs(m,vmaxI);
     if(m<0.5){ hm.textContent='—'; hm.style.color='#93a0b8'; }
     else { hm.textContent=m.toFixed(1)+'（'+CLASS_LABEL[shindoCls(m)]+'）'; hm.style.color=clsColor(shindoCls(m)); }
   }
@@ -1867,26 +1865,33 @@ function updateRank(ts){
 }
 const EEW_LBL=['待機中','予報','警報','特別警報'];
 function eewSet(el,html){ if(el._h!==html){ el.innerHTML=html; el._h=html; } }
+function eewTxt(el,t){ if(el._h!==t){ el.textContent=t; el.title=t; el._h=t; } }
+// その時点で観測された最大震度（陸上観測点）。チェックボックスで表示/非表示
+function updateObs(m,i){
+  const box=$('obs'), on=!!sim && $('showObs').checked;
+  box.style.display=on?'flex':'none'; if(!on) return;
+  if(m<0.5||i<0){ eewSet($('obsV'),'<span style="color:#93a0b8">—</span>'); eewTxt($('obsA'),''); return; }
+  const c=shindoCls(m), tc=(c===2||c===3)?'#111':'#fff';
+  eewSet($('obsV'),'<span class="chip" style="background:'+clsColor(c)+';color:'+tc+'">'+CLASS_LABEL[c]+'</span> '+m.toFixed(1));
+  eewTxt($('obsA'),ANAMES[AREA[i]]||('区域'+AREA[i]));
+}
 // 地震の数だけ緊急地震速報カードを作る（報の履歴は初期状態で閉じる）
 function buildEewCards(n){
   const box=$('eewcards'); box.innerHTML=''; eewCards=[]; eewCurs=new Array(n).fill(null);
   for(let i=0;i<n;i++){
     const c=document.createElement('div'); c.className='card eewcard lv0';
-    c.innerHTML='<h3>緊急地震速報'+(n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span> 地震'+(i+1):'')+'</h3>'
-      +'<div class="eh"><span class="lvbadge r-lv">待機中</span><span class="eno r-no"></span></div>'
+    c.innerHTML='<div class="eh"><span class="ett">緊急地震速報'+(n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span>地震'+(i+1):'')+'</span>'
+      +'<span class="lvbadge r-lv">待機中</span><span class="eno r-no"></span></div>'
       +'<div class="tiles">'
       +'<div class="tile"><div class="k">予想最大震度</div><div class="v r-max"><span class="chipbig" style="background:#3a4357">-</span></div></div>'
       +'<div class="tile"><div class="k">マグニチュード</div><div class="v r-mag">-</div></div>'
       +'<div class="tile"><div class="k">深さ</div><div class="v eewDep r-dep">-</div></div></div>'
       +'<div class="pos r-pos">シミュレーション実行後に表示</div>'
-      +'<div class="areas r-areas"></div>'
-      +'<div class="r-warnHead"></div>'
-      +'<div class="warnttl">警報対象範囲（震度4以上を予想）<span class="sub r-warnMode" style="margin-left:6px"></span></div>'
-      +'<div class="warnbox r-warnBox"><span class="sub">警報・特別警報の発表後に表示</span></div>'
-      +'<details class="histbox"><summary>報の履歴</summary><table class="hist r-hist"></table></details>'
-      +'<div class="sub">黄色の○＋＝EEW推定震源／✕＝設定した震源／地図の薄い塗り＝予想震度</div>';
+      +'<div class="warn r-warn"></div>'
+      +'<details class="histbox"><summary>報の履歴</summary><table class="hist r-hist"></table></details>';
     box.appendChild(c);
-    eewCards.push({el:c, r:k=>c.querySelector('.r-'+k)});
+    const els={}; ['lv','no','max','mag','dep','pos','warn','hist'].forEach(k=>els[k]=c.querySelector('.r-'+k));
+    eewCards.push({el:c, r:k=>els[k]});
   }
 }
 buildEewCards(1);
@@ -1902,10 +1907,8 @@ function updateEewCard(qk,i){
     eewSet(R('lv'),e?'発表前':'発表なし'); eewSet(R('no'),'');
     eewSet(R('max'),'<span class="chipbig" style="background:#3a4357">-</span>');
     eewSet(R('mag'),'-'); eewSet(R('dep'),'-');
-    eewSet(R('pos'),e?(tcur<qk.delay?'発生前（'+qk.delay+'秒後に発生）':'観測点でP波を検知中…'):'発表基準に達しませんでした');
-    eewSet(R('areas'),''); eewSet(R('hist'),'');
-    eewSet(R('warnBox'),'<span class="sub">警報・特別警報の発表後に表示</span>'); eewSet(R('warnMode'),'');
-    eewSet(R('warnHead'),'');
+    eewTxt(R('pos'),e?(tcur<qk.delay?'発生前（'+qk.delay+'秒後に発生）':'観測点でP波を検知中…'):'発表基準に達しませんでした');
+    eewTxt(R('warn'),''); eewSet(R('hist'),'');
     return;
   }
   card.className='card eewcard lv'+lvmax;
@@ -1915,36 +1918,17 @@ function updateEewCard(qk,i){
   eewSet(R('max'),'<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
   eewSet(R('mag'),'M'+cur.mag.toFixed(1));
   eewSet(R('dep'),cur.depth+'<small>km</small>');
-  eewSet(R('pos'),'推定震源 N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?' ／PLUM併用':''));
-  // 警報対象範囲の表: 範囲が狭ければ都道府県別、広ければ地域区分別にまとめる
-  let ah='', wh='', mode='', head='';
-  if(lvmax>=2 && cur.areas.length){
-    ah='<span class="sub">警報対象 '+cur.areas.length+'区域（下表）</span>';
-    const prefs=new Set(cur.areas.map(a=>a.pref));
-    const byRegion=prefs.size>6;
-    mode=byRegion?'（地域区分別）':'（都道府県別）';
-    const grp={};
-    cur.areas.forEach(a=>{
-      const key=byRegion?a.region:a.pref;
-      const g=grp[key]||(grp[key]={key:key,cls:0,label:'',n:0,ts:null});
-      g.n++;
-      if(a.cls>g.cls){ g.cls=a.cls; g.label=a.label; }
-      if(a.ts!=null && (g.ts==null||a.ts<g.ts)) g.ts=a.ts;
-    });
-    const rows=Object.values(grp).sort((p,q)=>q.cls-p.cls||(p.ts==null?1e9:p.ts)-(q.ts==null?1e9:q.ts));
-    wh='<table><tr><td class="sm">'+(byRegion?'地域':'都道府県')+'</td><td class="sm" style="text-align:right">予想最大</td><td class="sm" style="text-align:right">区域</td><td class="sm" style="text-align:right">主要動</td></tr>';
-    rows.forEach(g=>{
-      const rem=(g.ts==null)?null:g.ts-tcur;
-      const s=(rem==null)?'-':(rem>0?'あと'+Math.ceil(rem)+'秒':'到達');
-      const tc=(g.cls===2||g.cls===3)?'#111':'#fff';
-      wh+='<tr><td>'+g.key+'</td><td class="num"><span class="chip" style="background:'+clsColor(g.cls)+';color:'+tc+'">'+g.label+'</span></td><td class="num">'+g.n+'</td><td class="num">'+s+'</td></tr>';
-    });
-    wh+='</table>';
-    head='<div class="warnmsg">'+(cur.epiName||'震源付近')+'で地震。強い揺れに警戒。</div>'
-        +'<div class="warnlist">警報対象地域：'+rows.map(g=>g.key).join('、')+'</div>';
-  }else if(lvmax>=2){ ah='<span class="sub">該当地域なし</span>'; wh='<span class="sub">該当地域なし</span>'; }
-  else{ ah='<span class="sub">強い揺れは予想されていません。今後の情報に注意。</span>'; wh='<span class="sub">警報・特別警報の発表後に表示</span>'; }
-  eewSet(R('areas'),ah); eewSet(R('warnBox'),wh); eewSet(R('warnMode'),mode); eewSet(R('warnHead'),head);
+  eewTxt(R('pos'),(cur.epiName||'震源付近')+'　N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?'／PLUM':''));
+  // 警報対象は地名だけを1行で表示（区域別の予想震度は表示しない）。範囲が広ければ地域区分でまとめる
+  let w='';
+  if(lvmax>=2){
+    if(cur.areas.length){
+      const byRegion=new Set(cur.areas.map(a=>a.pref)).size>6, best={};
+      cur.areas.forEach(a=>{ const key=byRegion?a.region:a.pref; if(!(key in best)||a.cls>best[key]) best[key]=a.cls; });
+      w='警報対象：'+Object.keys(best).sort((p,q)=>best[q]-best[p]).join('、');
+    }else w='警報対象：該当地域なし';
+  }
+  eewTxt(R('warn'),w);
   const hist=e.reports.filter(r=>r.t<=tcur).slice(-4).reverse();
   eewSet(R('hist'),'<tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
     +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+r.mag.toFixed(1)+'</td><td>'+r.depth+'km</td><td>'+r.maxLabel+'</td></tr>').join(''));
