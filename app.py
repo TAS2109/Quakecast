@@ -1160,8 +1160,11 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <h2>② 規模・深さ</h2>
-  <label>マグニチュード <b id="magv">7.0</b></label>
-  <input id="mag" type="range" min="0" max="15" step="0.1" value="7.0">
+  <label>マグニチュード（スライダーは9.9まで／右の欄は15まで入力可）</label>
+  <div class="row" style="align-items:center">
+    <div style="flex:2.2"><input id="mag" type="range" min="0" max="9.9" step="0.1" value="7.0"></div>
+    <div><input id="magnum" type="number" min="0" max="15" step="0.1" value="7.0"></div>
+  </div>
   <label>震源の深さ（km）</label>
   <input id="depth" type="number" min="0" max="699" step="5" value="20">
 
@@ -1302,7 +1305,10 @@ map.on('click',e=>setEpi(e.latlng.lat,e.latlng.lng,false));
 setEpi(35.68,139.77,false);
 
 /* ---------- 入力 ---------- */
-$('mag').addEventListener('input',()=>{ $('magv').textContent=parseFloat($('mag').value).toFixed(1); });
+function setMag(m){ m=Math.min(Math.max(m,0),15); $('magnum').value=m.toFixed(1); $('mag').value=Math.min(m,9.9); }
+$('mag').addEventListener('input',()=>{ $('magnum').value=parseFloat($('mag').value).toFixed(1); });
+$('magnum').addEventListener('input',()=>{ const m=parseFloat($('magnum').value); if(isFinite(m)) $('mag').value=Math.min(Math.max(m,0),9.9); });
+$('magnum').addEventListener('change',()=>{ const m=parseFloat($('magnum').value); setMag(isFinite(m)?m:7.0); });
 const PRESETS=[
   {n:'阪神・淡路(1995)',lat:34.60,lon:135.04,m:7.3,d:16},
   {n:'東北沖(2011)',lat:38.10,lon:142.86,m:9.0,d:24},
@@ -1314,7 +1320,7 @@ const PRESETS=[
 ];
 PRESETS.forEach(p=>{
   const b=document.createElement('button'); b.textContent=p.n;
-  b.onclick=()=>{ setEpi(p.lat,p.lon,true); $('mag').value=p.m; $('magv').textContent=p.m.toFixed(1); $('depth').value=p.d; };
+  b.onclick=()=>{ setEpi(p.lat,p.lon,true); setMag(p.m); $('depth').value=p.d; };
   $('presets').appendChild(b);
 });
 $('toggle').onclick=()=>$('panel').classList.toggle('open');
@@ -1634,7 +1640,7 @@ $('seek').addEventListener('input',()=>{ if(!sim) return; tcur=Math.min(parseInt
 /* ---------- 実行 ---------- */
 $('run').onclick=async()=>{
   const body={lat:parseFloat($('lat').value),lon:parseFloat($('lon').value),
-              mag:parseFloat($('mag').value),depth:parseFloat($('depth').value),
+              mag:parseFloat($('magnum').value),depth:parseFloat($('depth').value),
               gz:(typeof DecompressionStream!=='undefined')};
   if(![body.lat,body.lon,body.mag,body.depth].every(isFinite)){ $('status').textContent='入力値を確認してください'; return; }
   if(runCtl) runCtl.abort(); const ctl=runCtl=new AbortController();
