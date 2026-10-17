@@ -1,0 +1,9 @@
+# Render Blueprint（GitHubリポジトリ連携用。手動でWeb Serviceを作る場合は不要）
+services:
+  - type: web
+    name: quake-sim
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
