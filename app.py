@@ -439,10 +439,18 @@ _VF_LINES = [
     [(138.73, 35.36), (137.48, 35.89), (136.77, 36.15), (133.55, 35.37), (132.62, 35.14), (131.1, 32.88),
      (130.86, 31.93), (130.66, 31.58), (130.2, 30.46), (129.72, 29.64), (128.23, 27.86)],   # 中部〜西日本〜九州〜琉球
 ]
-VF_FORE_COEF = 0.0012    # 前弧側: 距離1kmあたりlog10(PGV)の増分（基本式の非弾性減衰 -0.002 を約6割に弱める）
-VF_BACK_COEF = 0.0010    # 背弧側: 距離1kmあたりlog10(PGV)の減分
+VF_FORE_COEF = 0.0004    # 前弧側かつスラブ沿い: 距離1kmあたりlog10(PGV)の増分（非弾性減衰 -0.002 を2割弱める）
+VF_OFF_COEF = 0.0004     # スラブから外れた経路: 距離1kmあたりlog10(PGV)の減分（減衰が大きい）
 VF_WIDTH_KM = 40.0       # 火山フロント付近で前弧/背弧が切り替わる幅
+SLAB_L_KM = 450.0        # 沈み込む海溝からこの距離程度までが「スラブ沿いに揺れが伝わる」範囲
 DEEP_ANOM_D0, DEEP_ANOM_D1 = 60.0, 180.0   # 異常震域が効き始める深さ〜最大になる深さ[km]
+DEEP_SLOPE_D0, DEEP_SLOPE = 100.0, 0.7     # 深さ項(0.0038*深さ)は深さ-10が100kmを超えると傾きを0.7倍に抑える
+                                           # （元の式のまま深発地震に使うと遠方まで震度が過大になる）
+
+
+def _deff(depth_p):
+    """距離減衰式の深さ項に使う有効な深さ（深発地震で過大にならないよう頭打ち気味にする）"""
+    return np.minimum(depth_p, DEEP_SLOPE_D0) + DEEP_SLOPE * np.maximum(depth_p - DEEP_SLOPE_D0, 0.0)
 
 
 def _vf_signed_km():
@@ -472,13 +480,41 @@ _VF_FORE = np.clip(_VF_G, 0.0, 1.0)
 _VF_BACK = np.clip(-_VF_G, 0.0, 1.0)
 
 
-def deep_anomaly_dlog(depth, x_hypo):
-    """深発地震の異常震域による log10(PGV) の補正量（観測点ごと）。浅い地震は0"""
+def _poly_dist_km(pts, lon, lat):
+    """点(lon,lat)（配列可）から折れ線ptsまでの距離[km]"""
+    kx = 111.32 * np.cos(np.radians(lat))
+    ky = 110.57
+    best = np.full(np.shape(lon), 1e9)
+    for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+        ax, ay = (x1 - lon) * kx, (y1 - lat) * ky
+        bx, by = (x2 - lon) * kx, (y2 - lat) * ky
+        vx, vy = bx - ax, by - ay
+        l2 = np.maximum(vx * vx + vy * vy, 1e-9)
+        t = np.clip(-(ax * vx + ay * vy) / l2, 0.0, 1.0)
+        best = np.minimum(best, np.hypot(ax + t * vx, ay + t * vy))
+    return best
+
+
+def _slab_weight(lat0, lon0):
+    """観測点ごとの「スラブ沿いに揺れが伝わる度合い」0〜1。震源に最も近い海溝（沈み込む板）を軸に、
+    その海溝から離れるほど小さい（例: 小笠原の深発地震は関東・東北の太平洋側に伝わりやすく、近畿以西は伝わりにくい）"""
+    best = None
+    for pts in TRENCHES.values():
+        d = float(_poly_dist_km(pts, np.array([lon0]), np.array([lat0]))[0])
+        if best is None or d < best[0]:
+            best = (d, pts)
+    return np.exp(-(_poly_dist_km(best[1], ST_LON, ST_LAT) / SLAB_L_KM) ** 2)
+
+
+def deep_anomaly_dlog(depth, x_hypo, lat0, lon0):
+    """深発地震の異常震域による log10(PGV) の補正量（観測点ごと）。浅い地震は0。
+    スラブ沿い（かつ火山フロントの太平洋側）は減衰が小さく、それ以外の経路は減衰が大きい"""
     s = float(np.clip((depth - DEEP_ANOM_D0) / (DEEP_ANOM_D1 - DEEP_ANOM_D0), 0.0, 1.0))
     if s <= 0.0:
         return 0.0
+    w = _slab_weight(lat0, lon0)
     x = np.minimum(x_hypo, 1500.0)
-    return s * x * (VF_FORE_COEF * _VF_FORE - VF_BACK_COEF * _VF_BACK)
+    return s * x * (VF_FORE_COEF * w * _VF_FORE - VF_OFF_COEF * (1.0 - w))
 
 
 def classify_source(mag, depth, lat0, lon0):
@@ -500,6 +536,8 @@ def classify_source(mag, depth, lat0, lon0):
                 best = (d, name, vx / n, vy / n)
     d, name, ux, uy = best
     is_trench = (d <= 250.0 and mag >= 5.5 and depth <= min(20.0 + 0.3 * d, 60.0))
+    if is_trench and _sea_factor(lat0, lon0, "内陸・その他")[0] < 0.99:
+        is_trench = False          # 陸域・内陸の地震は、海溝に近くても海溝型にしない
     length = min(10.0 ** (0.5 * mag - 1.85), 600.0) if (is_trench and mag >= 7.0) else 0.0
     return {"type": "海溝型" if is_trench else "内陸・その他", "name": name if is_trench else "",
             "L": length, "ux": ux, "uy": uy, "kx": kx, "ky": ky}
@@ -612,13 +650,13 @@ def final_intensity(mag, depth, lat0, lon0, min_x=0.0, anomaly=True):
     mw = (2.0 / 3.0) * math.log10(m0) - 6.07              # Mw再計算
 
     log_pgv600 = (
-        0.58 * mw + 0.0038 * depth_p + 0.0
+        0.58 * mw + 0.0038 * _deff(depth_p) + 0.0
         - np.log10(x_hypo + 0.0028 * 10.0 ** (0.5 * mw))
         - 0.002 * x_hypo
         - 1.29
     )
     if anomaly and depth > DEEP_ANOM_D0:                  # 深発地震の異常震域
-        log_pgv600 = log_pgv600 + deep_anomaly_dlog(depth, x_hypo)
+        log_pgv600 = log_pgv600 + deep_anomaly_dlog(depth, x_hypo, lat0, lon0)
     pgv600 = 10.0 ** log_pgv600
     pgv = pgv600 * ST_ARV * (4000.0 - ST_DEP)             # 地盤増幅を考慮
     m01 = 2.68 + 1.72 * np.log10(pgv)                     # PGV → 計測震度
@@ -832,7 +870,7 @@ def _mw_from_m01(m01_i, x, depth_p, arv, sdep):
     hi = np.full(m01_i.shape, 13.0)
     for _ in range(40):
         mid = (lo + hi) / 2.0
-        lp = (0.58 * mid + 0.0038 * depth_p
+        lp = (0.58 * mid + 0.0038 * _deff(depth_p)
               - np.log10(x + 0.0028 * 10.0 ** (0.5 * mid)) - 0.002 * x - 1.29)
         m = 2.68 + 1.72 * (lp + np.log10(arv * (4000.0 - sdep)))
         up = m > m01_i
@@ -857,7 +895,7 @@ def _mw_finite(m01_i, d, dep_p, arv, sdep, trench):
     return mw
 
 
-def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
+def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng, noise=None):
     """P波到達後〜S波到達前の振幅からマグニチュードを推定。使える観測点が無ければNone"""
     pc, sc = _tt(dep_e)
     t_ceil = np.ceil(tp_n[avail]).astype(int)
@@ -885,7 +923,7 @@ def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
         sel = np.where(ok)[0]
         sel = sel[np.argsort(d_all[sel])[:10]]            # 震源に近い観測点ほど信号が強い（上位10点）
         idx, ff, d = avail[sel], f[sel], d_all[sel]
-        obs = rt[ff, idx].astype(np.float64) + rng.normal(0.0, 0.25, len(idx))   # 振幅の観測ノイズ
+        obs = rt[ff, idx].astype(np.float64) + (noise[idx] if noise is not None else rng.normal(0.0, 0.25, len(idx)))   # 振幅の観測ノイズ（観測点ごとに固定）
         bai = ((1.0 + ST_ARV[idx]) / 2.2) / 2.0
         fthr = -3.3 + (1.0 + bai * 3.0) / 4.0             # 検出下限（これ以下は規模の上限しか分からない）
         cen = obs <= fthr + 0.3
@@ -924,7 +962,7 @@ def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng):
     if len(son):
         son = son[np.argsort(d_all[son])[:10]]
         idx, d = avail[son], d_all[son]
-        obs = rt[onset[son], idx].astype(np.float64) + rng.normal(0.0, 0.25, len(idx))
+        obs = rt[onset[son], idx].astype(np.float64) + (noise[idx] if noise is not None else rng.normal(0.0, 0.25, len(idx)))
         bai = ((1.0 + ST_ARV[idx]) / 2.2) / 2.0
         fthr = -3.3 + (1.0 + bai * 3.0) / 4.0
         low = obs <= fthr + 0.3                            # 検出下限以下（上限のみ）
@@ -973,6 +1011,8 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
     ("upto", T): T秒までの速報は確定 / ("report", 報) / ("final", 報番号) / ("done"|"none", None)"""
     rng = np.random.default_rng(int(abs(lat0) * 1000 + abs(lon0) * 100 + mag * 10 + depth) % (2 ** 31))
     tp_n = tp + rng.normal(0.0, 0.1, N_ST)            # P波ピックの誤差
+    amp_noise = rng.normal(0.0, 0.25, N_ST)           # 振幅の観測ノイズ（観測点ごとに固定。続報ごとに引き直すとMが毎回ばらつく）
+    mag_s = None                                      # 推定Mの平滑値（報ごとの±0.3〜0.5のばらつきを抑える）
     order = np.argsort(tp_n)
     n_fin = int(np.isfinite(tp_n).sum())
     if n_fin < 2:
@@ -1020,7 +1060,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
                     t_data, n >= 4, 0.002 if n < 4 else 0.0001)
             est = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
-                                T - t_first, rng)
+                                T - t_first, rng, amp_noise)
             # 規模がまだ推定できない間（P波検知直後で振幅が得られない）は、仮の固定値を
             # 発表せず、直前の報の値を引き継ぐ。最初の報は規模が推定できてから発表する。
             mag_known = (est is not None) or (last is not None)
@@ -1028,6 +1068,12 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 mag_e, capped = (last["mag"] if last else 3.0), False
             else:
                 mag_e, capped = est
+                # 規模が成長中（頭打ち）や大きな変化はそのまま採用し、小さな変動は平滑化する
+                if mag_s is None or capped or abs(mag_e - mag_s) >= 1.0:
+                    mag_s = mag_e
+                else:
+                    mag_s += 0.4 * (mag_e - mag_s)
+                mag_e = mag_s
 
             # 推定震源が観測点直下でも式が発散しないよう、震源距離に下限(10km)を設ける
             m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e, min_x=10.0, anomaly=False)
@@ -1113,7 +1159,10 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                              or abs(dep_e - last["depth"]) >= 20.0
                              or (cls_e != last["maxCls"] and abs(vmax_e - last["max"]) >= 0.3))
                     area_added = len(areas) > len(last["areas"])   # 警報対象地域の追加は即続報
-                    changed = (lv != last["lv"]) or area_added or (moved and T - last["t"] >= (1 if lv >= 2 else 2))
+                    # 推定に変化がなくても、実際のEEWのように一定間隔で続報（精度の更新）を出す
+                    per = 2.0 if T < T0 + 40 else (4.0 if T < T0 + 120 else 8.0)
+                    changed = ((lv != last["lv"]) or area_added or (moved and T - last["t"] >= (1 if lv >= 2 else 2))
+                               or (T - last["t"] >= per))
                 if (changed and len(reports) < 80) or after_peak:
                     # 震源地名: 推定震源に最も近い観測点の区域名。25km超離れていれば「○○県沖」
                     de_ = np.where(ST_LAND, _planar_km(lat_e, lon_e, ST_LAT, ST_LON), 1e9)   # 地名は陸上観測点基準
@@ -1192,6 +1241,13 @@ def quake_core(lat0, lon0, mag, depth, dt=1.0):
     tf = np.arange(nf_cap) * dt
     p_curve = np.interp(tf, tg, p_curve_f)
     s_curve = np.interp(tf, tg, s_curve_f)
+    # 走時表の範囲(600秒)を超えた後は、最後の傾きで波面を延長する（頭打ちのままだと、波が通過した後の
+    # 観測点の震度が最終値に達せず、減衰が始まらないため）
+    late = tf > tg[-1]
+    if late.any():
+        for cur_f, arr in ((p_curve_f, p_curve), (s_curve_f, s_curve)):
+            sl = (cur_f[-1] - cur_f[-201]) / (tg[-1] - tg[-201])
+            arr[late] = cur_f[-1] + sl * (tf[late] - tg[-1])
     rt = realtime_frames(m01, dist, dep_p, tf, p_curve, s_curve, tatsu)
     reach = np.isfinite(tatsu)                            # S波が届かない観測点は判定から除く
     act = np.where((rt[:, reach] >= 0.5).any(axis=1))[0] if reach.any() else []
@@ -2177,6 +2233,14 @@ INDEX_HTML = r"""<!doctype html>
     font-size:13px;display:flex;gap:16px;align-items:center;white-space:nowrap}
   #hud b{font-size:16px;font-variant-numeric:tabular-nums}
   #hud .lbl{color:var(--sub);font-size:11px;margin-right:4px}
+  #simClk{position:absolute;z-index:1100;right:10px;bottom:84px;background:rgba(14,20,34,.82);border:1px solid #2c3a57;
+    border-radius:8px;padding:5px 9px;color:#e6ecf8;text-align:right;font-variant-numeric:tabular-nums;backdrop-filter:blur(3px)}
+  #simClk #clkT{font-size:19px;font-weight:700;letter-spacing:.5px;cursor:pointer}
+  #simClk #clkD{font-size:10.5px;color:#9fb0cf}
+  #simClk .clkCtl{display:none;margin-top:4px;gap:4px;align-items:center;justify-content:flex-end}
+  #simClk.edit .clkCtl{display:flex}
+  #simClk input{background:#0e1422;color:#e6ecf8;border:1px solid #2c3a57;border-radius:4px;font-size:11px;padding:2px 3px}
+  #simClk button{background:#2c3a57;color:#e6ecf8;border:0;border-radius:4px;font-size:11px;padding:3px 6px;cursor:pointer}
   #bar{position:absolute;z-index:1000;left:50%;bottom:26px;transform:translateX(-50%);
     width:min(760px,calc(100% - 20px));background:var(--panel);border:1px solid var(--line);
     border-radius:12px;padding:10px 12px}
@@ -2451,7 +2515,9 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
-<div id="bar">
+<div id="simClk" title="クリックで時刻を変更"><div id="clkT">--:--:--</div><div id="clkD"></div>
+    <div class="clkCtl"><input type="datetime-local" step="1" id="clkIn"><button id="clkNow" type="button">現在時刻</button></div></div>
+  <div id="bar">
   <div id="ctl">
     <button id="restart" title="最初に戻る">|◄</button>
     <button id="play" title="再生/一時停止">►</button>
@@ -3111,6 +3177,24 @@ const TSU_MSG={
   1:'若干の海面変動が予想されますが、被害の心配はありません。'};
 let simClock0=Date.now();
 const pad2=n=>('0'+n).slice(-2);
+// 時計: clkOrigin=ユーザーが指定した起点時刻(ms)。null なら現在時刻。シミュレーション中は simClock0+経過時間を表示
+let clkOrigin=null, clkSet0=Date.now();
+const WD=['日','月','火','水','木','金','土'];
+function clkLocalStr(ms){ const d=new Date(ms); return d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate())+'T'+pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds()); }
+function clkNowMs(){ if(sim) return simClock0+tcur*1000; return clkOrigin===null?Date.now():clkOrigin+(Date.now()-clkSet0); }
+function clkRefresh(){ const el=document.getElementById('clkT'); if(!el) return; const d=new Date(clkNowMs());
+  el.textContent=pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());
+  document.getElementById('clkD').textContent=d.getFullYear()+'/'+pad2(d.getMonth()+1)+'/'+pad2(d.getDate())+'('+WD[d.getDay()]+')'+(clkOrigin!==null?' ・設定':''); }
+function clkSetTo(ms){ if(ms===null){ clkOrigin=null; if(sim) simClock0=Date.now()-tcur*1000; }
+  else { if(sim){ simClock0=ms-tcur*1000; clkOrigin=simClock0; } else { clkOrigin=ms; clkSet0=Date.now(); } }
+  clkRefresh(); }
+setInterval(clkRefresh,250);
+document.addEventListener('DOMContentLoaded',()=>{
+  const box=document.getElementById('simClk'), inp=document.getElementById('clkIn');
+  document.getElementById('clkT').onclick=()=>{ box.classList.toggle('edit'); inp.value=clkLocalStr(clkNowMs()); };
+  inp.onchange=()=>{ const ms=Date.parse(inp.value); if(!isNaN(ms)) clkSetTo(ms); };
+  document.getElementById('clkNow').onclick=()=>{ clkSetTo(null); inp.value=clkLocalStr(Date.now()); };
+  clkRefresh(); });
 function clk(t){ const d=new Date(simClock0+t*1000); return pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds()); }
 function fmtT(t){ if(t<600) return t.toFixed(1)+' s'; const s=Math.floor(t), h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60;
   return (h?h+':'+pad2(m):m)+':'+pad2(x); }
@@ -3815,13 +3899,16 @@ function audioCollect(t0,t1){
   const ev=[]; if(!sim) return ev;
   // 緊急地震速報（初報／警報への格上げ／予想最大震度の更新）
   sim.quakes.forEach(qk=>{
-    const e=qk.eew; if(!e) return; let lvm=0, cls=-1;
+    const e=qk.eew; if(!e) return; let lvm=0, cls=-1, spC=-9, spM=-9, spT=-1e9;   // sp*: 最後に読み上げた予想最大震度・M・時刻
     e.reports.forEach((r,k)=>{
-      if(r.t>t0&&r.t<=t1){
-        const epi=r.epiName||'震源付近';
-        if(r.lv>=2&&lvm<2) ev.push({s:'eewWarn',p:90,k:true,x:'緊急地震速報。'+epi+'で地震。強い揺れに警戒してください。'});
-        else if(k===0) ev.push({s:'eewFcst',p:70,k:true,x:'緊急地震速報。'+epi+'で地震。'});
-        else if(r.maxCls>cls&&r.maxCls>=1) ev.push({s:'eewUpd',p:50,x:'推定最大震度'+aSh(r.maxCls)+'。'});
+      const inW=r.t>t0&&r.t<=t1;
+      const epi=r.epiName||'震源付近';
+      if(r.lv>=2&&lvm<2){ if(inW) ev.push({s:'eewWarn',p:90,k:true,x:'緊急地震速報。'+epi+'で地震。強い揺れに警戒してください。'}); spC=r.maxCls; spM=r.mag; spT=r.t; }
+      else if(k===0){ if(inW) ev.push({s:'eewFcst',p:70,k:true,x:'緊急地震速報。'+epi+'で地震。'}); spC=r.maxCls; spM=r.mag; spT=r.t; }
+      else if(r.maxCls!==spC||Math.abs(r.mag-spM)>=0.3||r.t-spT>=10){
+        // 予想最大震度が変わった／予想Mが0.3以上変わった／10秒以上読み上げていない → 現在の推定を読み上げる
+        if(inW) ev.push({s:'eewUpd',p:50,x:(r.maxCls>=1?'推定最大震度'+aSh(r.maxCls)+'、':'')+'マグニチュード'+r.mag.toFixed(1)+'。'});
+        spC=r.maxCls; spM=r.mag; spT=r.t;
       }
       if(r.lv>lvm) lvm=r.lv; if(r.maxCls>cls) cls=r.maxCls;
     });
@@ -3975,7 +4062,7 @@ $('run').onclick=async()=>{
       v.tSeis=v.tEnd; v.hasTsu=(v.tsuEnd||0)>v.tEnd+1;
       { const ext=Math.max(v.tsuEnd||0,(v.info&&v.info.end)||0); v.tsuExt=ext>v.tEnd+1; if(v.tsuExt) v.tEnd=ext; }
       infoCnt=0; infoSig=''; infoPrev=null; infoUnread=0; imFitted=false; imState=null; drawInfoMap(); renderBadge();
-      simClock0=Date.now();
+      simClock0=(clkOrigin!==null&&!sim)?clkOrigin:(clkOrigin!==null?clkNowMs()-tcur*1000:Date.now());
       sim=v; tcur=0; audioReset(); buildEewCards(v.quakes.length);
       $('seek').disabled=false; $('seek').max=v.tsuExt?2000:Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
       showResult(v);
