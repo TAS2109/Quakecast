@@ -2203,7 +2203,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="hint">選択中の地震の震源は、地図をクリックして設定できます。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
-  <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" checked style="width:auto"> その時点で観測された最大震度を表示（各観測点の最大値を保持）</label>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" style="width:auto"> その時点で観測された最大震度を表示（各観測点の最大値を保持）</label>
   <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,.12)">
     <label style="display:flex;align-items:center;gap:6px"><input id="sndOn" type="checkbox" checked style="width:auto"> 効果音（緊急地震速報・震度速報／地震情報・津波・最大震度の更新）</label>
     <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="spkOn" type="checkbox" checked style="width:auto"> 読み上げ（ブラウザ標準の日本語音声）</label>
@@ -2296,8 +2296,8 @@ INDEX_HTML = r"""<!doctype html>
     <input id="seek" type="range" min="0" max="0" step="1" value="0" disabled>
     <span id="tlabel">0.0 s</span>
     <select id="speed" title="再生速度">
-      <option value="0.5">×0.5</option><option value="1">×1</option>
-      <option value="2" selected>×2</option><option value="5">×5</option><option value="10">×10</option>
+      <option value="0.5">×0.5</option><option value="1" selected>×1</option>
+      <option value="2">×2</option><option value="5">×5</option><option value="10">×10</option>
     </select>
     <select id="tsuSpeed" title="地震動の計算範囲を過ぎた後（津波フェーズ）の再生速度">
       <option value="60">津波×60</option><option value="300" selected>津波×300</option><option value="1800">津波×1800</option>
@@ -3349,6 +3349,7 @@ function audioUnlock(){
       const cp=aCtx.createDynamicsCompressor(); aMaster.connect(cp); cp.connect(aCtx.destination);   // 重なっても音割れしにくくする
       aCtx.onstatechange=()=>{ if(aCtx.state==='running') aHint(false); }; }
     aMaster.gain.value=1.4*aVol();
+    aPrimeSpeech();
     if(aCtx.state!=='running'){
       const pr=aCtx.resume(); if(pr&&pr.then) pr.then(()=>{ if(aCtx.state==='running') aHint(false); }).catch(()=>{});
       const b=aCtx.createBuffer(1,1,22050), s=aCtx.createBufferSource(); s.buffer=b; s.connect(aCtx.destination); s.start(0);   // iOS用: 無音を鳴らして出力を開始
@@ -3359,7 +3360,7 @@ function audioUnlock(){
 $('audioHint').addEventListener('click',audioUnlock);
 $('sndVol').addEventListener('input',()=>{ if(aMaster) aMaster.gain.value=1.4*aVol(); aSave(); });
 $('sndOn').addEventListener('change',aSave);
-$('spkOn').addEventListener('change',()=>{ aSave(); if(!aSp()&&window.speechSynthesis) window.speechSynthesis.cancel(); });
+$('spkOn').addEventListener('change',()=>{ aSave(); if(!aSp()){ if(window.speechSynthesis) window.speechSynthesis.cancel(); } else audioUnlock(); });
 // 起動時に音声のON/OFFを選ばせる（選択はブラウザに保存し、次回からは聞かない）
 (function(){
   let asked=false; try{ asked=localStorage.getItem('kmAudioAsked')==='1'; }catch(e){}
@@ -3380,21 +3381,37 @@ function aTone(f0,t0,d,type,vol,f1){
 }
 function aBell(f,t0,d,vol){ aTone(f,t0,d,'sine',vol); aTone(f*2.76,t0,d*0.5,'sine',vol*0.35); aTone(f*5.4,t0,d*0.25,'sine',vol*0.15); }
 // 各効果音は鳴らす長さ[秒]を返す
+// 少しずらした2本ののこぎり波を重ねて「うなり」を出し、緊迫感のある硬い音にする
+function aHarsh(f,t0,d,vol,f1){ aTone(f,t0,d,'sawtooth',vol,f1); aTone(f*1.013,t0,d,'sawtooth',vol,f1?f1*1.013:0); }
 const SFX={
-  eewFcst(){ [[1175,0],[1568,0.16],[1175,0.8],[1568,0.96]].forEach(p=>aTone(p[0],p[1],0.32,'triangle',0.35)); return 1.4; },
-  eewWarn(){ for(let k=0;k<3;k++){ const b=k*0.95;
-      aTone(1319,b,0.14,'square',0.15); aTone(988,b+0.16,0.14,'square',0.15); aTone(1319,b+0.32,0.14,'square',0.15); aTone(988,b+0.48,0.14,'square',0.15); } return 2.8; },
-  eewUpd(){ aTone(1568,0,0.09,'triangle',0.3); aTone(1976,0.12,0.12,'triangle',0.3); return 0.3; },
-  infoNew(){ aBell(659,0,0.7,0.3); aBell(784,0.2,0.7,0.3); aBell(988,0.4,1.0,0.3); return 1.5; },
-  infoUpd(){ aBell(784,0,0.6,0.28); aBell(988,0.22,0.9,0.28); return 1.1; },
-  newInt(c){ const n=c<=1?1:c<=3?2:c<=4?3:4, base=523*Math.pow(2,Math.min(c,9)/9);
-    for(let k=0;k<n;k++) aTone(base*(1+k*0.12),k*0.13,0.11,c>=5?'square':'triangle',c>=5?0.18:0.3); return n*0.13+0.12; },
-  tsuInfo(){ aBell(660,0,1.0,0.3); aBell(523,0.5,1.2,0.3); return 1.7; },
-  tsuAdv(){ for(let k=0;k<2;k++){ aTone(880,k,0.45,'triangle',0.3); aTone(660,k+0.5,0.45,'triangle',0.3); } return 2.0; },
-  tsuWarn(){ for(let k=0;k<3;k++){ aTone(620,k*0.9,0.45,'sawtooth',0.16,940); aTone(940,k*0.9+0.45,0.45,'sawtooth',0.16,620); } return 2.7; },
-  tsuMajor(){ for(let k=0;k<6;k++){ aTone(700,k*0.5,0.25,'sawtooth',0.18,1250); aTone(1250,k*0.5+0.25,0.25,'sawtooth',0.18,700); } return 3.0; },
-  tsuObs(){ aBell(1047,0,1.2,0.3); aBell(1319,0.35,1.2,0.25); return 1.6; },
-  cancel(){ [[988,0],[784,0.2],[622,0.4]].forEach(p=>aTone(p[0],p[1],0.3,'triangle',0.3)); return 0.8; }
+  // 緊急地震速報（予報）: 高い2音を素早く3回
+  eewFcst(){ for(let k=0;k<3;k++){ aHarsh(1397,k*0.34,0.1,0.13); aHarsh(1047,k*0.34+0.13,0.1,0.13); } return 1.1; },
+  // 緊急地震速報（警報）: 不協和な2音の高速連打＋低音の脈動を4セット
+  eewWarn(){ for(let k=0;k<4;k++){ const b=k*0.9;
+      for(let j=0;j<5;j++) aHarsh(j%2?1245:1760,b+j*0.1,0.085,0.15);
+      aTone(98,b,0.7,'sawtooth',0.2,87); } return 3.6; },
+  // 予想震度の更新: 短い3連
+  eewUpd(){ for(let k=0;k<3;k++) aHarsh(2093,k*0.09,0.06,0.12); return 0.35; },
+  // 震度速報・地震情報: 低めの短調の下降音＋重い打音
+  infoNew(){ aHarsh(784,0,0.22,0.13); aHarsh(622,0.24,0.22,0.13); aHarsh(523,0.48,0.5,0.13); aTone(65,0,0.6,'sine',0.35,45); return 1.1; },
+  infoUpd(){ aHarsh(622,0,0.16,0.12); aHarsh(784,0.18,0.3,0.12); aTone(65,0,0.4,'sine',0.3,45); return 0.6; },
+  // 最大震度の更新: 震度が大きいほど、速く・多く・高く（5弱以上は低音付き）
+  newInt(c){ const n=Math.min(2+c,8), gap=c>=5?0.075:0.1, base=440*Math.pow(2,Math.min(c,9)/8);
+    for(let k=0;k<n;k++) aHarsh(base*(k%2?1.26:1),k*gap,gap*0.8,c>=5?0.15:0.11);
+    if(c>=5) aTone(90,0,n*gap,'sawtooth',0.2,70); return n*gap+0.1; },
+  // 津波情報（予報）: 低いゴング
+  tsuInfo(){ aBell(330,0,1.4,0.35); aBell(247,0.6,1.6,0.35); return 2.0; },
+  // 津波注意報: 緊張感のある2音サイレン
+  tsuAdv(){ for(let k=0;k<3;k++){ aHarsh(740,k*0.8,0.38,0.14); aHarsh(554,k*0.8+0.4,0.38,0.14); } return 2.4; },
+  // 津波警報: 速い上下サイレン
+  tsuWarn(){ for(let k=0;k<5;k++){ aHarsh(500,k*0.7,0.35,0.15,1000); aHarsh(1000,k*0.7+0.35,0.35,0.15,500); }
+    aTone(82,0,3.5,'sawtooth',0.2); return 3.5; },
+  // 大津波警報: さらに速い高音サイレン＋重低音
+  tsuMajor(){ for(let k=0;k<10;k++){ aHarsh(600,k*0.4,0.2,0.15,1500); aHarsh(1500,k*0.4+0.2,0.2,0.15,600); }
+    aTone(65,0,4,'square',0.2,55); return 4.0; },
+  // 津波観測: 重い鐘を2回
+  tsuObs(){ aBell(392,0,1.4,0.4); aBell(311,0.5,1.6,0.4); aTone(65,0,0.8,'sine',0.3,50); return 2.0; },
+  cancel(){ aHarsh(523,0,0.25,0.11); aHarsh(415,0.28,0.25,0.11); aHarsh(330,0.56,0.45,0.11); return 1.0; }
 };
 function audioPlay(name,prio,arg){
   if(!aOn()||!SFX[name]) return;
@@ -3406,16 +3423,34 @@ function audioPlay(name,prio,arg){
   aBusyPrio=prio; aBusyUntil=now+SFX[name](arg);
 }
 // 読み上げ。keep=true は話している最中でも順番待ちにする。長い文は「。」で区切って順に話す（途中で切れるのを防ぐ）
+const aUtt=[]; let aSpeakAt=0, aPrimed=false;    // aUtt: 話している途中でブラウザに破棄されないよう参照を保持する
+function aPrimeSpeech(){            // iPhone等: 最初の操作の中で一度だけ無音の読み上げを行い、以後の自動読み上げを許可させる
+  if(aPrimed||!aSp()||!window.speechSynthesis) return; aPrimed=true;
+  try{ const u=new SpeechSynthesisUtterance(' '); u.volume=0; u.lang='ja-JP'; window.speechSynthesis.speak(u); }catch(e){}
+}
+// 読み上げ。keep=true は話している最中でも順番待ちにする。長い文は「。」で区切って順に話す（途中で切れるのを防ぐ）
 function audioSpeak(text,prio,keep){
   if(!aSp()||!window.speechSynthesis||!text) return;
-  const ss=window.speechSynthesis, busy=ss.speaking||ss.pending;
-  if(prio>=90) ss.cancel(); else if(busy&&!keep) return;
-  if(!aVoice) aVoice=(ss.getVoices()||[]).find(v=>/^ja/i.test(v.lang))||null;
-  const parts=[]; let cur='';
-  text.split('。').forEach(s=>{ if(!s) return; s+='。'; if(cur&&(cur+s).length>90){ parts.push(cur); cur=''; } cur+=s; });
-  if(cur) parts.push(cur);
-  parts.forEach(t=>{ const u=new SpeechSynthesisUtterance(t); u.lang='ja-JP'; u.rate=1.05; u.volume=Math.min(1,aVol()*1.2);
-    if(aVoice) u.voice=aVoice; ss.speak(u); });
+  try{
+    const ss=window.speechSynthesis;
+    let busy=ss.speaking||ss.pending;
+    if(busy&&Date.now()-aSpeakAt>180000){ ss.cancel(); aUtt.length=0; busy=false; }   // 固まったときの復帰
+    if(!aVoice) aVoice=(ss.getVoices()||[]).find(v=>/^ja/i.test(v.lang))||null;
+    const parts=[]; let cur='';
+    text.split('。').forEach(s=>{ if(!s) return; s+='。'; if(cur&&(cur+s).length>90){ parts.push(cur); cur=''; } cur+=s; });
+    if(cur) parts.push(cur);
+    const go=()=>{
+      try{ ss.resume(); }catch(e){}
+      parts.forEach(t=>{ const u=new SpeechSynthesisUtterance(t); u.lang='ja-JP'; u.rate=1.05; u.volume=Math.min(1,aVol()*1.2);
+        if(aVoice) u.voice=aVoice;
+        u.onend=u.onerror=()=>{ const i=aUtt.indexOf(u); if(i>=0) aUtt.splice(i,1); };
+        aUtt.push(u); ss.speak(u); });
+      aSpeakAt=Date.now();
+    };
+    if(prio>=90){ ss.cancel(); aUtt.length=0; setTimeout(go,80); }     // cancel 直後の speak は無視されることがあるため少し待つ
+    else if(busy&&!keep) return;
+    else go();
+  }catch(e){}
 }
 function aMaxClsAt(t){
   if(!sim||!CUMV||CUMV.length!==sim.nf) return -1;
