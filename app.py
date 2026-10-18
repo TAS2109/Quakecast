@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震 強震モニタ風シミュレーター
+Quakecast
 
 【このプロジェクトの目標】
   JQuake のような「強震モニタ・地震津波情報等総合配信サイト」の再現を目指している。
@@ -2234,7 +2234,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>地震 強震モニタ風シミュレーター</title>
+<title>Quakecast</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   :root{--bg:#10141c;--panel:#161c27ee;--line:#2b3547;--txt:#e6ebf5;--sub:#93a0b8;--acc:#3b9cff;}
@@ -2462,7 +2462,7 @@ INDEX_HTML = r"""<!doctype html>
 <button id="runFab" class="idle" title="現在の地震設定でシミュレーションを実行（Enterキーでも可）">► シミュレーション実行</button>
 
 <div id="panel" class="open">
-  <h1>地震 強震モニタ風シミュレーター</h1>
+  <h1>Quakecast</h1>
 
   <h2>① 地震（複数指定できます）</h2>
   <div id="qlist"></div>
