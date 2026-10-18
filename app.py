@@ -421,6 +421,66 @@ TRENCHES = {
 }
 
 
+# ---------------------------------------------------------------------
+# 深発地震の異常震域
+#   沈み込む冷たい海洋プレート（スラブ）内は地震波の減衰が小さく(Qが高い)、火山フロントより
+#   太平洋側（前弧側）では震源から遠くても強く揺れる。一方、火山フロントより日本海側（背弧側）は
+#   高温のマントルウェッジを通るため減衰が大きく、震源の真上でも揺れが小さい。
+#   → 火山フロント（概略）からの符号付き距離を観測点ごとに求め、深発地震の時だけ
+#     PGVの距離減衰（非弾性減衰項）を前弧側で弱め・背弧側で強める。
+#   ※緊急地震速報の予測はこの効果を見込まない（実際にも予測が難しいため。PLUM法で補う）
+# ---------------------------------------------------------------------
+# 火山フロントの概略（経度, 緯度）。進行方向の左側＝太平洋側（前弧側）になる向きに並べる
+_VF_LINES = [
+    [(144.5, 43.6), (142.7, 43.4), (141.4, 42.7), (140.8, 42.5), (140.7, 42.07), (140.9, 40.65),
+     (141.0, 39.85), (140.8, 38.96), (140.45, 38.14), (140.07, 37.6), (139.97, 37.12), (139.38, 36.8),
+     (139.18, 36.55), (138.53, 36.4), (138.37, 35.97), (138.73, 35.36), (139.4, 34.73), (139.53, 34.08),
+     (139.77, 33.1), (139.76, 32.46), (140.3, 29.8)],                       # 千島〜東北〜伊豆・小笠原
+    [(138.73, 35.36), (137.48, 35.89), (136.77, 36.15), (133.55, 35.37), (132.62, 35.14), (131.1, 32.88),
+     (130.86, 31.93), (130.66, 31.58), (130.2, 30.46), (129.72, 29.64), (128.23, 27.86)],   # 中部〜西日本〜九州〜琉球
+]
+VF_FORE_COEF = 0.0012    # 前弧側: 距離1kmあたりlog10(PGV)の増分（基本式の非弾性減衰 -0.002 を約6割に弱める）
+VF_BACK_COEF = 0.0010    # 背弧側: 距離1kmあたりlog10(PGV)の減分
+VF_WIDTH_KM = 40.0       # 火山フロント付近で前弧/背弧が切り替わる幅
+DEEP_ANOM_D0, DEEP_ANOM_D1 = 60.0, 180.0   # 異常震域が効き始める深さ〜最大になる深さ[km]
+
+
+def _vf_signed_km():
+    """観測点ごとの火山フロントまでの符号付き距離[km]（正＝太平洋側＝前弧側、負＝日本海側＝背弧側）"""
+    kx = 111.32 * np.cos(np.radians(ST_LAT))
+    ky = 110.57
+    best = np.full(N_ST, 1e9)
+    sgn = np.ones(N_ST)
+    for pts in _VF_LINES:
+        for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+            ax, ay = (x1 - ST_LON) * kx, (y1 - ST_LAT) * ky
+            bx, by = (x2 - ST_LON) * kx, (y2 - ST_LAT) * ky
+            vx, vy = bx - ax, by - ay
+            l2 = np.maximum(vx * vx + vy * vy, 1e-9)
+            t = np.clip(-(ax * vx + ay * vy) / l2, 0.0, 1.0)
+            d = np.hypot(ax + t * vx, ay + t * vy)
+            cr = vx * (-ay) - vy * (-ax)                  # 観測点が線分の左(+)か右(-)か
+            m = d < best
+            best = np.where(m, d, best)
+            sgn = np.where(m, np.where(cr >= 0.0, 1.0, -1.0), sgn)
+    return best * sgn
+
+
+ST_VF = _vf_signed_km()
+_VF_G = np.tanh(ST_VF / VF_WIDTH_KM)
+_VF_FORE = np.clip(_VF_G, 0.0, 1.0)
+_VF_BACK = np.clip(-_VF_G, 0.0, 1.0)
+
+
+def deep_anomaly_dlog(depth, x_hypo):
+    """深発地震の異常震域による log10(PGV) の補正量（観測点ごと）。浅い地震は0"""
+    s = float(np.clip((depth - DEEP_ANOM_D0) / (DEEP_ANOM_D1 - DEEP_ANOM_D0), 0.0, 1.0))
+    if s <= 0.0:
+        return 0.0
+    x = np.minimum(x_hypo, 1500.0)
+    return s * x * (VF_FORE_COEF * _VF_FORE - VF_BACK_COEF * _VF_BACK)
+
+
 def classify_source(mag, depth, lat0, lon0):
     # 震源が海溝軸の近く、かつプレート境界の深さ以浅なら「海溝型」と自動判別する。
     # 海溝型かつM7以上は、震源断層の広がり（断層長L=10^(0.5M-1.85) km）を海溝走向に沿って考慮する。
@@ -520,12 +580,14 @@ def shindo_class(x):
     return k, labels[k]
 
 
-def final_intensity(mag, depth, lat0, lon0, min_x=0.0):
+def final_intensity(mag, depth, lat0, lon0, min_x=0.0, anomaly=True):
     """
     各観測点の最終的な計測震度（Scratch版 震度計算 の非予想側の式）を返す。
     戻り値: (m01, 震央距離km, depth_p, src)
     min_x: 震源距離の下限[km]。EEWの予測では、推定震源が観測点の直下にあるとき
            距離≈0で式が発散し震度7になるのを防ぐために使う（シミュレーション本体は0）。
+    anomaly: 深発地震の異常震域（火山フロントの前弧側で強く・背弧側で弱く揺れる）を考慮するか。
+           シミュレーション本体はTrue。EEWの予測はFalse（実際の予測式は異常震域を見込めない）。
     """
     # Scratch版の「震度計算処理」と同じ入力補正
     #   M引数 = M - (7.1-2.2),  深さ引数 = 深さ - 10
@@ -555,6 +617,8 @@ def final_intensity(mag, depth, lat0, lon0, min_x=0.0):
         - 0.002 * x_hypo
         - 1.29
     )
+    if anomaly and depth > DEEP_ANOM_D0:                  # 深発地震の異常震域
+        log_pgv600 = log_pgv600 + deep_anomaly_dlog(depth, x_hypo)
     pgv600 = 10.0 ** log_pgv600
     pgv = pgv600 * ST_ARV * (4000.0 - ST_DEP)             # 地盤増幅を考慮
     m01 = 2.68 + 1.72 * np.log10(pgv)                     # PGV → 計測震度
@@ -631,10 +695,13 @@ def realtime_frames(m01, kyori, dep_p, tf, p_curve, s_curve, tatsu):
 #     7) 警報の対象地域は一度発表したら続報でも取り消さない（追加時は即続報）
 # =====================================================================
 TG = np.arange(0.0, 600.0 + 1e-9, 0.05)
+CLEAR_CAP_S = 2400.0     # 強震モニタの表示を延ばす上限[秒]（全観測点が震度1未満に戻るまで）
 # 深さ候補。深発地震（最大699km）まで、深いほど粗くなり過ぎないよう細かく刻む
 EEW_DEPTHS = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 120.0, 150.0, 200.0, 250.0,
               300.0, 350.0, 400.0, 450.0, 500.0, 550.0, 600.0, 650.0, 690.0]
 EEW_DEPTHS_COARSE = (10.0, 60.0, 150.0, 300.0, 450.0, 600.0)   # 粗い探索（広域グリッド）で試す深さ
+EEW_DEEP_KM = 150.0      # 推定震源の深さがこれ以上なら深発地震とみなし、推定震源に基づく警報・特別警報は発表しない
+                         # （震度4以下の予報のみ。警報はPLUM法による予測のみ可）
 EEW_DELAY = 2.0          # 観測点のデータ伝送(1秒)＋処理(1秒)の遅れ[秒]
 _TT_CACHE = {}
 
@@ -963,7 +1030,13 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 mag_e, capped = est
 
             # 推定震源が観測点直下でも式が発散しないよう、震源距離に下限(10km)を設ける
-            m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e, min_x=10.0)
+            m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e, min_x=10.0, anomaly=False)
+            # 深発地震と推定された場合: 推定震源・規模からの予測は警報の根拠にできない（震度4止まり）。
+            # 警報・特別警報の根拠はPLUM法（観測された揺れの周辺30kmへの予測）のみとする。
+            deep_est = bool(dep_e >= EEW_DEEP_KM)
+            if deep_est:
+                m01_p = np.minimum(m01_p, 4.4)
+            plum_mask = np.zeros(N_ST, dtype=bool)
             # --- PLUM法（実際の気象庁EEWでも併用）---
             fr = min(int(math.floor(t_data)), rt.shape[0] - 1)
             ob = np.nan_to_num(rt[fr].astype(np.float64), nan=-9.0, neginf=-9.0, posinf=-9.0)
@@ -976,7 +1049,10 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 upm = pl > m01_p + 0.05
                 if upm.any():
                     m01_p = np.where(upm, pl, m01_p)
+                    plum_mask = upm
                     plum_used = True
+            # 警報・特別警報の判定と警報対象地域に使う予測震度（深発地震ではPLUM法の予測のみ）
+            m01_w = np.where(plum_mask, m01_p, -9.0) if deep_est else m01_p
             # 予想震度の塗りつぶし用: 観測点ごとのばらつき(地盤増幅の差)で地図がまだらにならないよう、
             # 気象庁のEEWと同じく「区域ごとの最大予想震度」を区域内の全観測点の値とする
             amx_all = np.full(max_a + 1, -99.0)
@@ -984,9 +1060,10 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             pq_vals = np.where(ST_SEA, -9.0, amx_all[ST_AREA])    # 海域は予想震度の塗りつぶしの対象外
             vmax_e = float(m01_p[ST_LAND].max())
             cls_e, lb_max = shindo_class(vmax_e)
-            if cls_e >= 7:            # 推定最大震度6弱以上 → 特別警報
+            cls_w = shindo_class(float(m01_w[ST_LAND].max()))[0]
+            if cls_w >= 7:            # 推定最大震度6弱以上 → 特別警報
                 lv = 3
-            elif cls_e >= 5:          # 推定最大震度5弱以上 → 警報
+            elif cls_w >= 5:          # 推定最大震度5弱以上 → 警報
                 lv = 2
             elif cls_e >= 3 or mag_e >= 3.5:   # 震度3以上またはM3.5以上 → 予報
                 lv = 1
@@ -1001,7 +1078,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             areas = []
             if lv >= 2:
                 amx = np.full(max_a + 1, -99.0)
-                np.maximum.at(amx, ST_AREA[ST_LAND], m01_p[ST_LAND])
+                np.maximum.at(amx, ST_AREA[ST_LAND], m01_w[ST_LAND])
                 de = hubeny_km(lat_e, lon_e, ST_LAT, ST_LON)
                 ts_all = t0_e + np.interp(de, _tt(dep_e)[1], TG, right=600.0)
                 ats = np.full(max_a + 1, np.inf)
@@ -1054,7 +1131,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                             "epiName": epi_name,
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
-                            "maxCls": cls_e, "plum": bool(plum_used), "lv": lv, "areas": areas, "final": after_peak,
+                            "maxCls": cls_e, "plum": bool(plum_used), "deepEst": deep_est, "lv": lv, "areas": areas, "final": after_peak,
                             # 観測点ごとの予想震度（×10, int8, base64）: 地図の塗りつぶし用
                             "pq": base64.b64encode(np.clip(np.round(np.nan_to_num(pq_vals, nan=-9.0) * 10.0), -127, 127)
                                                    .astype(np.int8).tobytes()).decode("ascii")}
@@ -1106,17 +1183,22 @@ def quake_core(lat0, lon0, mag, depth, dt=1.0):
     tp = np.interp(dist, p_curve_f, tg, right=np.inf)
     tatsu = np.interp(dist, s_curve_f, tg, right=np.inf)
 
-    # シミュレーション時間：最遠観測点にS波が届いてから90秒（上限540秒）
+    # シミュレーション時間：最遠観測点にS波が届いてから90秒（上限540秒）を最低限とし、
+    # さらに「全観測点が震度1未満（計測震度0.5未満）に戻る」までは強震モニタを表示し続ける
     finite = tatsu[np.isfinite(tatsu)]
     t_far = float(finite.max()) if len(finite) else t_valid
-    t_end = float(np.clip(t_far + 90.0, 60.0, min(540.0, t_valid)))
-    nf = int(t_end / dt) + 1
-    tf = np.arange(nf) * dt
-
+    t_end0 = float(np.clip(t_far + 90.0, 60.0, min(540.0, t_valid)))
+    nf_cap = int(CLEAR_CAP_S / dt) + 1
+    tf = np.arange(nf_cap) * dt
     p_curve = np.interp(tf, tg, p_curve_f)
     s_curve = np.interp(tf, tg, s_curve_f)
-
     rt = realtime_frames(m01, dist, dep_p, tf, p_curve, s_curve, tatsu)
+    reach = np.isfinite(tatsu)                            # S波が届かない観測点は判定から除く
+    act = np.where((rt[:, reach] >= 0.5).any(axis=1))[0] if reach.any() else []
+    t_clear = float(tf[act[-1]] + dt) if len(act) else 0.0
+    t_end = float(max(t_end0, min(t_clear + 5.0, CLEAR_CAP_S - dt)))
+    nf = int(t_end / dt) + 1
+    tf, p_curve, s_curve, rt = tf[:nf], p_curve[:nf], s_curve[:nf], rt[:nf]
     return {"m01": m01, "src": src, "p_curve": p_curve, "s_curve": s_curve,
             "tp": tp, "rt": rt, "t_end": t_end, "nf": nf}
 
@@ -1333,13 +1415,23 @@ def build_info(quakes, groups, grp_rt, tsus, dt):
     return {"groups": out, "end": round(end + 20.0, 1), "end0": round(end0 + 20.0, 1)}
 
 
+def _t_p_first(c, q):
+    """陸上観測点に最初にP波が届く時刻[秒]。計算範囲外（遠すぎる）なら距離から概算"""
+    tpl = c["tp"][ST_LAND]
+    tpl = tpl[np.isfinite(tpl)]
+    if len(tpl):
+        return float(tpl.min())
+    return float(hubeny_km(q["lat"], q["lon"], ST_LAT[ST_LAND], ST_LON[ST_LAND]).min()) / 8.0 + 15.0
+
+
 def sim_multi(quakes, dt=1.0, gz=False):
     """複数の地震を同時に扱う。quakes: [{lat, lon, mag, depth, delay(秒, 整数)}, ...]
     各地震を独立に計算し、delay秒ずらして重ね合わせる。
     観測点ごとのリアルタイム震度・最終震度は、全地震の最大値を採用する。
     戻り値: (基本データdict, [各地震の (tp, rt, t_end)])"""
     cores = [quake_core(q["lat"], q["lon"], q["mag"], q["depth"], dt) for q in quakes]
-    tsus = [_shift_tsu(tsunami_for_quake(q["lat"], q["lon"], q["mag"], q["depth"]), q["delay"]) for q in quakes]
+    tsus = [_shift_tsu(tsunami_for_quake(q["lat"], q["lon"], q["mag"], q["depth"], t_p1=_t_p_first(c, q)), q["delay"])
+            for q, c in zip(quakes, cores)]
     t_end = max(q["delay"] + c["t_end"] for q, c in zip(quakes, cores))
     nf = int(t_end / dt) + 1
 
@@ -1396,7 +1488,8 @@ def sim_multi(quakes, dt=1.0, gz=False):
 #   ・予想高さ: 阿部(1979)型の経験式 H = 10^(Mt-5.65)/Δ をベースに、海の向き・湾の増幅・深さで補正
 #   ・到達時間: 沿岸ほど浅くなる海底を仮定した長波の伝播時間（約20分で130km、600km先で約1時間）
 #   ・震源が海か（沿岸か）は、周囲の陸上観測点の分布（距離・方位の欠け）から簡易判定
-#   ・発表の流れ（実際の運用に準拠）:
+#   ・発表の流れ（実際の運用に準拠。第1報は近地で約3分、遠地・中遠地は地震波の到達後〜到達の約3時間前まで
+#     後ろにずれる。観測の取り込みは津波の到達後）:
 #       約3分後  第1報（地震波から推定したM。M8以上の巨大地震は「巨大」表現で最大クラスを仮定）
 #       約11〜15分後 第2報（Mw確定。巨大→数値に確定、予想高さの引き上げ）
 #       約35分後 第3報（沖合・沿岸の観測を反映）
@@ -1710,8 +1803,28 @@ def _tsu_model(mt, lat0, lon0, depth, sea_f):
     return h, t, d_eff
 
 
-def tsunami_for_quake(lat0, lon0, mag, depth):
-    """1つの地震の津波警報等・津波観測の時系列（その地震の発生を0秒とするローカル時間）"""
+TSU_NEAR_P_S = 90.0      # 日本の観測網（陸上）にP波が届くまでがこれ以内なら近地地震（第1報は約3分）
+
+
+def _tsu_first_time(t_p1, t_arr, rng):
+    """津波情報の第1報の発表時刻[秒]（地震発生から）。固定の3分ではなく、震源の遠さと津波の到達で変える。
+      近地: 約3分。
+      中遠地: 地震波が日本の観測網に届いてから約10分の解析後（揺れの到達より前には出さない）。
+      遠地（地震波の到達が10分超）: 約30分以降（遠地地震に関する情報）。
+      津波の到達までさらに時間がある場合は、到達の約3時間前まで待って発表する。"""
+    j = int(rng.integers(-15, 16))
+    if t_p1 <= TSU_NEAR_P_S:
+        return 180.0 + j
+    t = max(180.0 + j, t_p1 + 600.0 + 2 * j)
+    if t_p1 > 600.0:
+        t = max(t, 1800.0 + 20 * j)
+    t = max(t, t_arr - 10800.0 + 30 * j)
+    return float(min(t, max(t_arr - 300.0, 180.0 + j)))
+
+
+def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0):
+    """1つの地震の津波警報等・津波観測の時系列（その地震の発生を0秒とするローカル時間）
+    t_p1: 陸上観測点に最初にP波が届く時刻[秒]（近地か遠地かの判定と第1報の発表時刻に使う）"""
     src = classify_source(mag, depth, lat0, lon0)
     sea_f, _ = _sea_factor(lat0, lon0, src["type"])
     rng = np.random.default_rng(int(abs(lat0 * 1000 + lon0 * 100 + mag * 10 + depth)) % (2 ** 31))
@@ -1720,12 +1833,14 @@ def tsunami_for_quake(lat0, lon0, mag, depth):
     h_true, tm, _ = _tsu_model(mag, lat0, lon0, depth, sea_f)
     if float(h_true.max()) < 0.05:
         if mag >= 6.0:                                            # 震源に関する情報の付加文（津波の心配なし）
-            res["reports"].append({"t": 150.0, "no": 1, "kind": "none", "mag": round(mag, 1), "giant": False,
+            t_none = 150.0 if t_p1 <= TSU_NEAR_P_S else t_p1 + 480.0   # 遠地は揺れ（地震波）の到達後
+            res["reports"].append({"t": t_none, "no": 1, "kind": "none", "mag": round(mag, 1), "giant": False,
                                    "text": "この地震による津波の心配はありません。", "areas": []})
-            res["end"] = 600.0
+            res["end"] = max(600.0, t_none + 450.0)
         return res
 
-    giant = mag >= 8.0                                            # M8以上は「巨大」表現（Mを決め切れない）
+    near = t_p1 <= TSU_NEAR_P_S
+    giant = mag >= 8.0 and near                                   # 近地のM8以上は「巨大」表現（Mを決め切れない）。遠地は数値で発表
     m1 = (min(mag + 0.5, 9.2) if giant
           else min(mag, 7.9) - 0.15 * max(0.0, mag - 7.0) + float(rng.normal(0, 0.15)))
     m2 = mag + float(rng.normal(0, 0.05))
@@ -1736,14 +1851,21 @@ def tsunami_for_quake(lat0, lon0, mag, depth):
     safe = 1.35 if mag >= 8.0 else 1.0                            # M8以上は警報等の予想高さを実際より高めに見積もる（安全側）
     Ht = H2 * eps                                                 # 実際に来襲する津波の高さ
     t_true = tm * (1.0 + rng.normal(0, 0.06, n))
-    stages = [(180.0 + int(rng.integers(-15, 16)), H1, m1, giant, 0.0),
-              ((660.0 if mag >= 7.0 else 900.0) + int(rng.integers(0, 120)),
+    sig = tm[h_true >= 0.2]
+    if not len(sig):
+        sig = tm[h_true >= 0.05]
+    t_arr = float(sig.min())                                      # 最初の津波到達（予想）
+    t1 = _tsu_first_time(t_p1, t_arr, rng)                        # 第1報の発表時刻（近地約3分・遠地は後ろへ）
+    stages = [(t1, H1, m1, giant, 0.0),
+              (t1 + (480.0 if mag >= 7.0 else 720.0) + int(rng.integers(0, 120)),
                H2 * safe * np.exp(rng.normal(0, 0.1, n)), m2, False, 0.0)]
     lH2, lHt = np.log(np.maximum(H2 * safe, 1e-6)), np.log(np.maximum(Ht, 1e-6))
     for tk, w in ((1500.0, 0.45), (2400.0, 0.65), (3600.0, 0.8), (5400.0, 0.9)):
         # 沖合・沿岸の観測を取り込むほど実際の津波に近づく: 予想の拡大（引き上げ・追加）も縮小（切替）も起こる
         Hk = np.exp((1.0 - w) * lH2 + w * lHt + rng.normal(0, 0.08, n))
-        stages.append((tk + int(rng.integers(-120, 121)), Hk, m2, False, w))
+        # 観測の取り込みは、第1報からの経過か、津波が実際に到達してからの経過の遅い方
+        tk2 = max(t1 + (tk - 180.0), t_arr + (tk - 1200.0)) + int(rng.integers(-120, 121))
+        stages.append((max(tk2, stages[-1][0] + 120.0), Hk, m2, False, w))
 
     def build(H, gflag):
         d = {}
@@ -2963,7 +3085,7 @@ function updateEewCard(qk,i){
   eewSet(R('max'),'<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
   eewSet(R('mag'),'M'+cur.mag.toFixed(1));
   eewSet(R('dep'),cur.depth+'<small>km</small>');
-  eewTxt(R('pos'),(cur.epiName||'震源付近')+'　N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?'／PLUM':''));
+  eewTxt(R('pos'),(cur.epiName||'震源付近')+'　N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?'／PLUM':'')+(cur.deepEst?'／深発地震（警報はPLUM法のみ）':''));
   // 警報対象は地名だけを1行で表示（区域別の予想震度は表示しない）。範囲が広ければ地域区分でまとめる
   let w='';
   if(lvmax>=2){
