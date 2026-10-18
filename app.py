@@ -73,6 +73,46 @@ N_ST = len(ST_LON)
 
 
 # ---------------------------------------------------------------------
+# 小笠原村（父島・母島・硫黄島・南鳥島）の観測点を補う
+#   stations.csv では小笠原村付近の観測点が実際より少ないため、概略の座標で追加する。
+#   すでに1.5km以内に観測点がある地点は重複させない。地盤増幅(ARV)・地盤深さは最寄りの陸上観測点5点の
+#   中央値を仮置きとする。所属区域は「小笠原」で始まる区域（無ければ最寄りの観測点の区域）。
+# ---------------------------------------------------------------------
+_OGASAWARA_EXTRA = [
+    # (名称, 緯度, 経度)  ※概略座標
+    ("父島 二見", 27.0945, 142.1925), ("父島 扇浦", 27.0800, 142.1995), ("父島 小港", 27.0650, 142.2150),
+    ("父島 中央山", 27.0820, 142.2230), ("父島 初寝浦", 27.1090, 142.2300), ("父島 長崎", 27.1180, 142.2120),
+    ("母島 沖村", 26.6340, 142.1580), ("母島 乳房山", 26.6500, 142.1650), ("母島 北村", 26.6710, 142.1480),
+    ("硫黄島", 24.7800, 141.3200), ("南鳥島", 24.2900, 153.9800),
+]
+
+
+def _append_ogasawara():
+    global ST_LON, ST_LAT, ST_ARV, ST_DEP, ST_AREA, N_ST
+    oga = [k for k, v in AREA_NAMES.items() if str(v).startswith("小笠原")]
+    lon, lat, arv, dep, area = [], [], [], [], []
+    for nm, la, lo in _OGASAWARA_EXTRA:
+        kx = 111.32 * math.cos(math.radians(la))
+        dd = np.hypot((ST_LON - lo) * kx, (ST_LAT - la) * 110.57)
+        if float(dd.min()) < 1.5:
+            continue
+        near = np.argsort(dd)[:5]
+        lon.append(lo); lat.append(la)
+        arv.append(float(np.median(ST_ARV[near]))); dep.append(float(np.median(ST_DEP[near])))
+        area.append(int(oga[0]) if oga else int(ST_AREA[near[0]]))
+    if not lon:
+        return
+    ST_LON = np.concatenate([ST_LON, lon]); ST_LAT = np.concatenate([ST_LAT, lat])
+    ST_ARV = np.concatenate([ST_ARV, arv]); ST_DEP = np.concatenate([ST_DEP, dep])
+    ST_AREA = np.concatenate([ST_AREA, np.array(area, dtype=np.int64)])
+    N_ST = len(ST_LON)
+    print("[小笠原] 観測点 %d点を追加（計%d点）" % (len(lon), N_ST))
+
+
+_append_ogasawara()
+
+
+# ---------------------------------------------------------------------
 # 区域境界ポリゴン(data/areas.geojson)による観測点の区域判定（任意）
 #   観測点の座標がどの区域ポリゴンに入るかで ST_AREA を決め直す。
 #   ポリゴン外（海上・簡略化で欠けた沿岸など）は、15km以内の最寄り区域、
@@ -1886,7 +1926,7 @@ def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0):
     rng = np.random.default_rng(int(abs(lat0 * 1000 + lon0 * 100 + mag * 10 + depth)) % (2 ** 31))
     res = {"reports": [], "obs": [], "end": 0.0}
     n = _TSU_N
-    h_true, tm, _ = _tsu_model(mag, lat0, lon0, depth, sea_f)
+    h_true, tm, deff = _tsu_model(mag, lat0, lon0, depth, sea_f)
     if float(h_true.max()) < 0.05:
         if mag >= 6.0:                                            # 震源に関する情報の付加文（津波の心配なし）
             t_none = 150.0 if t_p1 <= TSU_NEAR_P_S else t_p1 + 480.0   # 遠地は揺れ（地震波）の到達後
@@ -2013,17 +2053,27 @@ def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0):
             "areas": [{"i": i, "lv": v[0], "hl": v[1], "ts": round(float(tm[i]), 1), "imm": False}
                       for i, v in sorted(cur.items())]})
 
-    # 津波観測に関する情報（第1波・最大波）。発表された予報区ごとに、到達後12分間隔で波が高まる
-    # 波は押し・引きが交互に来る。第1波は小さめで、最大波は第2〜4波。m の要素: [時刻, 累積最大波高, 波の番号, 押し(+1)/引き(-1), その波の波高]
+    # 津波観測に関する情報（第1波・最大波）。発表された予報区ごとに、到達後に波が繰り返し押し寄せる。
+    # 波は押し・引きが交互に来る。第1波は小さめで、最大波は第2波以降（震源から遠い海岸ほど後ろの波）。
+    # 波の間隔は地震の規模で決まる（M7級で十数分、M9級で30分前後）。巨大地震では数時間にわたり観測が続く。
+    # m の要素: [時刻, 累積最大波高, 波の番号, 押し(+1)/引き(-1), その波の波高]
+    per0 = min(3300.0, 900.0 * 10.0 ** (0.4 * (mag - 7.5)))      # 押しから次の押しまでの周期[秒]（M7.5以下は15分、M9で約55分）
     for i in sorted(ever):
         if Ht[i] < 0.1:
             continue
         tt, prev, m = float(t_true[i]), 0.0, []
         d0 = 1 if rng.random() < 0.7 else -1                      # 第1波が押し波か引き波か
-        per = float(rng.uniform(600.0, 1500.0))                   # 押しから次の押しまでの周期[秒]
-        kp = int(rng.integers(2, 5))                              # 最大波の番号
-        for k in range(1, 6):
-            e = max(0.15, 1.0 - 0.3 * abs(k - kp)) * (0.55 if k == 1 else 1.0)
+        per = per0 * float(np.exp(rng.normal(0, 0.2))) * (1.3 if _TSU_AMP[i] <= 0.45 else 1.0)   # 湾・内海は周期が長い
+        far = float(np.clip((float(deff[i]) - 200.0) / 1200.0, 0.0, 1.0))   # 0: 震源に近い 〜 1: 遠い（1400km以上）
+        kmax = 3 + int(round(3 * far)) + (1 if mag >= 8.5 else 0)
+        kp = int(rng.integers(2, kmax + 2))                       # 最大波の番号（近い海岸は2〜3波目、遠い海岸は最大7〜8波目）
+        nw = kp + 5 + (3 if mag >= 8.0 else 0)                    # 観測する波の数（最大波のあと波高が十分に小さくなるまで）
+        for k in range(1, nw + 1):
+            if k <= kp:
+                e = max(0.15, 1.0 - 0.3 * (kp - k))
+            else:
+                e = max(0.15, 1.0 - 0.17 * (k - kp))
+            e *= (0.55 if k == 1 else 1.0)
             hw = round(float(Ht[i]) * e * (1.0 + float(rng.normal(0, 0.04))), 2)
             prev = max(hw, prev)
             m.append([round(tt + 60.0 + (k - 1) * per / 2.0, 1), prev, k, d0 if k % 2 == 1 else -d0, hw])
@@ -2275,6 +2325,8 @@ INDEX_HTML = r"""<!doctype html>
   .eewcard .warn{margin-top:5px;padding:4px 8px;border-radius:6px;background:#000b;border-left:5px solid #ffd23b;color:#fff3b0;font-size:14.5px;font-weight:800;line-height:1.4;white-space:normal}
   .eewcard .warn:empty{display:none}
   .eewcard .pos{margin-top:4px}
+  .eewcard .pos:empty{display:none}
+  .eewcard .plumTag{display:inline-block;margin:0 6px;padding:0 7px;border-radius:6px;background:#ffd23b;color:#111;font-size:.95em;font-weight:900;letter-spacing:.06em;text-shadow:none;box-shadow:0 0 6px #ffd23b99;vertical-align:baseline}
   .eewcard details.histbox{margin-top:2px}
   .eewcard details.histbox>summary{cursor:pointer;font-size:10.5px;color:#cfd8ea;font-weight:600;user-select:none}
   .eewcard table.hist{margin-top:0}
@@ -2736,7 +2788,7 @@ const PRESETS=[
   {n:'能登半島(2024)',lat:37.49,lon:137.27,m:7.6,d:15},
   {n:'南海トラフ(想定)',lat:33.00,lon:136.50,m:9.0,d:20},
   {n:'首都直下(想定)',lat:35.68,lon:139.77,m:7.3,d:30},
-  {n:'深発地震の例',lat:37.0,lon:134.0,m:7.0,d:400}
+  {n:'小笠原諸島西方沖地震(2015・深発)',lat:27.9,lon:140.7,m:8.1,d:682}
 ];
 PRESETS.forEach(p=>{
   const b=document.createElement('button'); b.textContent=p.n;
@@ -2746,10 +2798,10 @@ PRESETS.forEach(p=>{
   };
   $('presets').appendChild(b);
 });
-{ const b=document.createElement('button'); b.textContent='2地震の例（能登＋首都直下）';
+{ const b=document.createElement('button'); b.textContent='複数地震の例(南海トラフ+首都直下)';
   b.onclick=()=>{
-    QS=[{lat:37.49,lon:137.27,mag:7.6,depth:15,delay:0},{lat:35.68,lon:139.77,mag:7.3,depth:30,delay:20}];
-    selQ=0; renderQuakes(); syncMarkers(); map.setView([36.3,138.3],6);
+    QS=[{lat:33.00,lon:136.50,mag:9.0,depth:20,delay:0},{lat:35.68,lon:139.77,mag:7.3,depth:30,delay:20}];
+    selQ=0; renderQuakes(); syncMarkers(); map.setView([34.6,138.0],6);
   };
   $('presets').appendChild(b); }
 $('toggle').onclick=()=>$('panel').classList.toggle('open');
@@ -3128,7 +3180,7 @@ function eewTitle(i,cur,lvmax){
   const n=sim?sim.quakes.length:1;
   const mk=n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span>地震'+(i+1):'';
   if(!cur) return '緊急地震速報'+mk;
-  return '緊急地震速報('+EEW_LBL[lvmax]+')　'+escH(cur.epiName||'震源付近')+'で地震　#'+cur.no+(cur.final?'(最終)':'')+mk;
+  return '緊急地震速報('+EEW_LBL[lvmax]+')'+(cur.plum?'<span class="plumTag">PLUM報</span>':'　')+escH(cur.epiName||'震源付近')+'で地震　#'+cur.no+(cur.final?'(最終)':'')+mk;
 }
 function updateEewCard(qk,i){
   const C=eewCards[i]; if(!C) return;
@@ -3151,7 +3203,7 @@ function updateEewCard(qk,i){
   eewSet(R('max'),'<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
   eewSet(R('mag'),'M'+cur.mag.toFixed(1));
   eewSet(R('dep'),cur.depth+'<small>km</small>');
-  eewTxt(R('pos'),(cur.epiName||'震源付近')+'　N'+cur.lat.toFixed(1)+'° E'+cur.lon.toFixed(1)+'° ／ 検知'+cur.nSt+'点'+(cur.plum?'／PLUM':'')+(cur.deepEst?'／深発地震（警報はPLUM法のみ）':''));
+  eewTxt(R('pos'),'');                                   // 震源名・座標の行は出さない（発表前後の状態表示のみ使用）
   // 警報対象は地名だけを1行で表示（区域別の予想震度は表示しない）。範囲が広ければ地域区分でまとめる
   let w='';
   if(lvmax>=2){
@@ -3895,6 +3947,20 @@ function aTsuTxt(st,top){
 }
 const aTsuLv=m=>(m>=5?1:0)+(m>=3?1:0)+(m>=1?1:0)+(m>0?1:0);
 // (t0,t1] の間に起きた「鳴らす出来事」を集める（p が大きいほど重要）
+// 警報の対象地域を、読み上げ用の地方名（東北・関東・北陸・甲信…）にまとめる。予想震度の大きい地方から順に並べる
+const EEW_SPK_REG={'北海道':'北海道','青森県':'東北','岩手県':'東北','宮城県':'東北','秋田県':'東北','山形県':'東北','福島県':'東北',
+  '茨城県':'関東','栃木県':'関東','群馬県':'関東','埼玉県':'関東','千葉県':'関東','東京都':'関東','神奈川県':'関東',
+  '新潟県':'北陸','富山県':'北陸','石川県':'北陸','福井県':'北陸','山梨県':'甲信','長野県':'甲信',
+  '岐阜県':'東海','静岡県':'東海','愛知県':'東海','三重県':'東海','滋賀県':'近畿','京都府':'近畿','大阪府':'近畿','兵庫県':'近畿','奈良県':'近畿','和歌山県':'近畿',
+  '鳥取県':'中国','島根県':'中国','岡山県':'中国','広島県':'中国','山口県':'中国','徳島県':'四国','香川県':'四国','愛媛県':'四国','高知県':'四国',
+  '福岡県':'九州北部','佐賀県':'九州北部','長崎県':'九州北部','熊本県':'九州北部','大分県':'九州北部','宮崎県':'九州南部','鹿児島県':'九州南部','沖縄県':'沖縄'};
+const EEW_SPK_ORD=['北海道','東北','関東','北陸','甲信','東海','近畿','中国','四国','九州北部','九州南部','沖縄'];
+function eewRegionsTxt(areas){
+  const best={};
+  (areas||[]).forEach(a=>{ const g=EEW_SPK_REG[a.pref]; if(!g) return; if(!(g in best)||a.cls>best[g]) best[g]=a.cls; });
+  const ks=Object.keys(best).sort((p,q)=>best[q]-best[p]||EEW_SPK_ORD.indexOf(p)-EEW_SPK_ORD.indexOf(q));
+  return ks.join('、');
+}
 function audioCollect(t0,t1){
   const ev=[]; if(!sim) return ev;
   // 緊急地震速報（初報／警報への格上げ／予想最大震度の更新）
@@ -3903,7 +3969,7 @@ function audioCollect(t0,t1){
     e.reports.forEach((r,k)=>{
       const inW=r.t>t0&&r.t<=t1;
       const epi=r.epiName||'震源付近';
-      if(r.lv>=2&&lvm<2){ if(inW) ev.push({s:'eewWarn',p:90,k:true,x:'緊急地震速報。'+epi+'で地震。強い揺れに警戒してください。'}); spC=r.maxCls; spM=r.mag; spT=r.t; }
+      if(r.lv>=2&&lvm<2){ if(inW) ev.push({s:'eewWarn',p:90,k:true,x:'緊急地震速報。'+epi+'で地震。'+(eewRegionsTxt(r.areas)?eewRegionsTxt(r.areas)+'では':'')+'強い揺れに警戒してください。'}); spC=r.maxCls; spM=r.mag; spT=r.t; }
       else if(k===0){ if(inW) ev.push({s:'eewFcst',p:70,k:true,x:'緊急地震速報。'+epi+'で地震。'}); spC=r.maxCls; spM=r.mag; spT=r.t; }
       else if(r.maxCls!==spC||Math.abs(r.mag-spM)>=0.3||r.t-spT>=10){
         // 予想最大震度が変わった／予想Mが0.3以上変わった／10秒以上読み上げていない → 現在の推定を読み上げる
@@ -3956,6 +4022,10 @@ function audioCollect(t0,t1){
 function audioResync(t){      // シーク・巻き戻し・一時停止中: 鳴らさずに「発表済み」の状態だけ合わせる
   aPrev=t; aMaxCls=aMaxClsAt(t); aObs=new Map();
   if(sim&&sim.quakes.some(q=>q.tsu&&q.tsu.reports.length)) tsuState(t).obs.forEach((o,a)=>{ aObs.set(a,o.mx); });
+}
+function aSilence(){          // 読み上げ中・順番待ちの音声をすべて止める
+  aUtt.length=0;
+  try{ if(window.speechSynthesis){ window.speechSynthesis.cancel(); } }catch(e){}
 }
 function audioReset(){
   FX.length=0;
@@ -4019,8 +4089,9 @@ $('play').onclick=()=>{
   if(!sim) return;
   if(tcur>=sim.tEnd-0.01) tcur=0;
   playing=!playing; $('play').textContent=playing?'❚❚':'►';
+  if(!playing) aSilence();                                   // 停止したら読み上げも止める
 };
-$('restart').onclick=()=>{ if(!sim) return; tcur=0; $('seek').value=0; $('tlabel').textContent='0.0 s'; };
+$('restart').onclick=()=>{ if(!sim) return; aSilence(); tcur=0; $('seek').value=0; $('tlabel').textContent='0.0 s'; };
 $('seek').addEventListener('input',()=>{ if(!sim) return; tcur=Math.min(sToT(parseInt($('seek').value)),limT()); $('seek').value=tToS(tcur); $('tlabel').textContent=fmtT(tcur); });
 
 /* ---------- 実行 ---------- */
