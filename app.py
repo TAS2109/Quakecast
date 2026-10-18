@@ -2003,7 +2003,7 @@ INDEX_HTML = r"""<!doctype html>
   .presets button{font-size:12px;padding:5px 8px}
   .hint{font-size:11.5px;color:var(--sub);line-height:1.5;margin-top:6px}
   #status{font-size:12px;color:var(--sub);margin-top:8px;min-height:16px}
-  #runFab{position:absolute;z-index:1300;left:50%;bottom:142px;transform:translateX(-50%);padding:10px 24px;
+  #runFab{position:absolute;z-index:1300;left:50%;bottom:172px;transform:translateX(-50%);padding:10px 24px;
     border-radius:999px;font-size:15px;font-weight:800;background:var(--acc);border:2px solid #ffffff55;color:#04101f;
     box-shadow:0 4px 14px #000a;cursor:pointer;white-space:nowrap}
   #runFab:hover{filter:brightness(1.1)}
@@ -2026,18 +2026,18 @@ INDEX_HTML = r"""<!doctype html>
   #bar{position:absolute;z-index:1000;left:50%;bottom:26px;transform:translateX(-50%);
     width:min(760px,calc(100% - 20px));background:var(--panel);border:1px solid var(--line);
     border-radius:12px;padding:10px 12px}
-  #ctl{display:flex;gap:8px;align-items:center}
-  #ctl button{padding:6px 10px;min-width:40px}
-  #ctl input[type=range]{flex:1}
-  #ctl select{width:auto;padding:5px 6px;font-size:13px}
-  #tlabel{font-size:13px;min-width:64px;text-align:right;font-variant-numeric:tabular-nums}
+  #ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  #ctl #seek{order:-1;flex:0 0 100%;width:100%;margin:0 0 2px}           /* シークバーは凡例と同じ幅で1行目に */
+  #ctl button{padding:6px 10px;min-width:44px;text-align:center}
+  #ctl select{flex:0 0 96px;width:96px;padding:5px 6px;font-size:13px;text-align:center;text-align-last:center}
+  #tlabel{flex:1;font-size:13px;min-width:64px;text-align:left;margin-left:6px;font-variant-numeric:tabular-nums}
   #legend{margin-top:8px}
   #legend canvas{width:100%;height:12px;border-radius:6px;display:block}
   #ticks{display:flex;justify-content:space-between;font-size:10.5px;color:var(--sub);margin-top:2px}
   .epi{color:#ff4d4d;font-size:26px;font-weight:900;text-shadow:0 0 4px #000,0 0 8px #000;
     line-height:26px;text-align:center}
   .foot{font-size:10.5px;color:var(--sub);line-height:1.55;margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
-  #rightcol{position:absolute;z-index:1000;right:10px;top:56px;width:350px;max-height:calc(100% - 170px);
+  #rightcol{position:absolute;z-index:1000;right:10px;top:56px;width:350px;max-height:calc(100% - 200px);
     overflow:auto;display:flex;flex-direction:column;gap:8px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.5}
   .card h3{margin:0 0 5px;font-size:11.5px;color:var(--sub);font-weight:600}
@@ -2156,12 +2156,12 @@ INDEX_HTML = r"""<!doctype html>
   /* iPad など中間幅: 左の設定パネル（幅310px）と下の再生バー・実行ボタン・HUDが重ならないよう、パネルの右側へ寄せる */
   @media (min-width:701px) and (max-width:1400px){
     #bar{left:330px;right:10px;transform:none;width:auto;bottom:calc(14px + env(safe-area-inset-bottom,0px))}
-    #runFab{left:calc(330px + (100% - 340px) / 2);bottom:calc(134px + env(safe-area-inset-bottom,0px))}
+    #runFab{left:calc(330px + (100% - 340px) / 2);bottom:calc(164px + env(safe-area-inset-bottom,0px))}
     #panel{max-height:calc(100% - 20px - env(safe-area-inset-bottom,0px))}
   }
   @media (min-width:701px) and (max-width:1100px){
     #hud{top:54px;left:330px;transform:none}
-    #rightcol{top:100px;max-height:calc(100% - 270px)}
+    #rightcol{top:100px;max-height:calc(100% - 300px)}
   }
   @media (max-width:700px){
     #bar{bottom:calc(14px + env(safe-area-inset-bottom,0px))}
@@ -2182,8 +2182,8 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <div id="map"></div>
-<button id="toggle">⚙ 設定</button>
-<button id="runFab" class="idle" title="現在の地震設定でシミュレーションを実行（Enterキーでも可）">▶ シミュレーション実行</button>
+<button id="toggle">設定</button>
+<button id="runFab" class="idle" title="現在の地震設定でシミュレーションを実行（Enterキーでも可）">► シミュレーション実行</button>
 
 <div id="panel" class="open">
   <h1>地震 強震モニタ風シミュレーター</h1>
@@ -2193,11 +2193,11 @@ INDEX_HTML = r"""<!doctype html>
   <button id="qadd" class="sec">＋ 地震を追加</button>
   <div class="sl" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px;align-items:center">
     <select id="slSel" style="flex:1;min-width:110px"></select>
-    <button id="slSave" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">💾 保存</button>
-    <button id="slLoad" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">📂 読込</button>
-    <button id="slDel" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">🗑</button>
-    <button id="slExp" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">⬇ ファイル</button>
-    <button id="slImp" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">⬆ ファイル</button>
+    <button id="slSave" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">保存</button>
+    <button id="slLoad" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">読込</button>
+    <button id="slDel" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">削除</button>
+    <button id="slExp" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">↓ ファイル</button>
+    <button id="slImp" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">↑ ファイル</button>
     <input id="slFile" type="file" accept=".json,application/json" style="display:none">
   </div>
   <div class="hint">選択中の地震の震源は、地図をクリックして設定できます。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
@@ -2217,7 +2217,7 @@ INDEX_HTML = r"""<!doctype html>
   <h2>② プリセット（選択中の地震に適用）</h2>
   <div class="presets" id="presets"></div>
 
-  <button id="run" class="primary">▶ シミュレーション実行</button>
+  <button id="run" class="primary">► シミュレーション実行</button>
   <div id="status"></div>
 
   <div id="result" style="display:none">
@@ -2237,7 +2237,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <div id="audioAsk" style="position:fixed;inset:0;z-index:5000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.72);padding:16px">
   <div style="max-width:420px;width:100%;background:#1b2231;color:#e8edf7;border:1px solid rgba(255,255,255,.18);border-radius:12px;padding:18px 18px 16px;box-shadow:0 8px 30px rgba(0,0,0,.5);font-size:14px;line-height:1.6">
-    <div style="font-size:16px;font-weight:700;margin-bottom:8px">🔊 効果音・読み上げを使いますか？</div>
+    <div style="font-size:16px;font-weight:700;margin-bottom:8px">効果音・読み上げを使いますか？</div>
     <div>地震情報の発表に合わせて、効果音と日本語の読み上げが流れます。</div>
     <ul style="margin:8px 0 10px;padding-left:20px;color:#c4cde0;font-size:13px">
       <li>緊急地震速報や津波警報の音は<b>大きく鳴ることがあります</b>。周囲や音量にご注意ください。</li>
@@ -2251,6 +2251,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 </div>
+<div id="audioHint" style="display:none;position:fixed;z-index:4000;top:96px;left:50%;transform:translateX(-50%);background:#2f7cf6;color:#fff;font-size:13px;font-weight:700;padding:8px 14px;border-radius:20px;box-shadow:0 4px 14px rgba(0,0,0,.45);cursor:pointer;max-width:90%;text-align:center">効果音がオフです。ここをタップして有効にする</div>
 <div id="tabbar">
   <button id="tabMon" class="on">強震モニタ</button>
   <button id="tabInfo">地震情報<span class="badge" id="tabBadge">0</span></button>
@@ -2259,9 +2260,9 @@ INDEX_HTML = r"""<!doctype html>
 <div id="infoView">
   <div id="infoHead">
     <span class="it">震度速報・地震情報</span>
-    <button id="iRun" class="sec" style="width:auto;margin:0;padding:6px 12px">▶ シミュレーション実行</button>
-    <button id="iRestart" title="最初に戻る">⏮</button>
-    <button id="iPlay" title="再生/一時停止">▶</button>
+    <button id="iRun" class="sec" style="width:auto;margin:0;padding:6px 12px">► シミュレーション実行</button>
+    <button id="iRestart" title="最初に戻る">|◄</button>
+    <button id="iPlay" title="再生/一時停止">►</button>
     <span id="iTime">—</span>
     <label><input id="infoAuto" type="checkbox" checked>更新時に自動で切り替え（強震モニタ表示中）</label>
   </div>
@@ -2290,8 +2291,8 @@ INDEX_HTML = r"""<!doctype html>
 
 <div id="bar">
   <div id="ctl">
-    <button id="restart" title="最初に戻る">⏮</button>
-    <button id="play" title="再生/一時停止">▶</button>
+    <button id="restart" title="最初に戻る">|◄</button>
+    <button id="play" title="再生/一時停止">►</button>
     <input id="seek" type="range" min="0" max="0" step="1" value="0" disabled>
     <span id="tlabel">0.0 s</span>
     <select id="speed" title="再生速度">
@@ -3301,7 +3302,7 @@ function groupHtml(gi,n,prevN){
 }
 function updateInfo(ts){
   if(curTab==='info'){
-    $('iPlay').textContent=playing?'⏸':'▶';
+    $('iPlay').textContent=playing?'❚❚':'►';
     $('iTime').textContent=sim?clk(tcur)+'（経過 '+fmtT(tcur)+'）':'—';
   }
   if((ts||0)-lastInfo<150) return; lastInfo=ts||0;
@@ -3333,21 +3334,30 @@ function updateInfo(ts){
 /* ---------- 効果音・読み上げ ----------
    場面の構成は「リアルタイム地震ビューアー」(kotoho7様作)を参考にしているが、音は Web Audio で新規に合成したもの。
    読み上げはブラウザ標準の日本語音声。再生中(playing)に tcur が進んだ区間で発表された情報だけを鳴らす。 */
-let aCtx=null, aMaster=null, aPrev=-0.001, aMaxCls=-1, aObs=new Map(), aBusyUntil=0, aBusyPrio=0, aVoice=null;
+let aCtx=null, aMaster=null, aPrev=-0.001, aMaxCls=-1, aObs=new Map(), aBusyUntil=0, aBusyPrio=0, aVoice=null, aHintOn=false;
 const aOn=()=>$('sndOn').checked, aSp=()=>$('spkOn').checked, aVol=()=>{ const v=parseFloat($('sndVol').value); return isFinite(v)?v:0; };
 function aSave(){ try{ localStorage.setItem('kmAudio',JSON.stringify({s:aOn(),k:aSp(),v:aVol()})); }catch(e){} }
 try{ const sv=JSON.parse(localStorage.getItem('kmAudio')||'null');
   if(sv){ $('sndOn').checked=!!sv.s; $('spkOn').checked=!!sv.k; if(isFinite(sv.v)) $('sndVol').value=sv.v; } }catch(e){}
+function aHint(on){ if(aHintOn===on) return; aHintOn=on; $('audioHint').style.display=on?'block':'none'; }
+// ブラウザは「タップ/クリックの瞬間」でないと音を出せないため、操作のたびに有効化を試みる（スマホ対応）
 function audioUnlock(){
   try{
+    if(navigator.audioSession) navigator.audioSession.type='playback';    // iPhone: マナーモードでも効果音を鳴らす
     if(!aCtx){ const AC=window.AudioContext||window.webkitAudioContext; if(!AC) return;
-      aCtx=new AC(); aMaster=aCtx.createGain(); aMaster.connect(aCtx.destination); }
-    if(aCtx.state==='suspended') aCtx.resume();
-    aMaster.gain.value=0.5*aVol();
+      aCtx=new AC(); aMaster=aCtx.createGain();
+      const cp=aCtx.createDynamicsCompressor(); aMaster.connect(cp); cp.connect(aCtx.destination);   // 重なっても音割れしにくくする
+      aCtx.onstatechange=()=>{ if(aCtx.state==='running') aHint(false); }; }
+    aMaster.gain.value=1.4*aVol();
+    if(aCtx.state!=='running'){
+      const pr=aCtx.resume(); if(pr&&pr.then) pr.then(()=>{ if(aCtx.state==='running') aHint(false); }).catch(()=>{});
+      const b=aCtx.createBuffer(1,1,22050), s=aCtx.createBufferSource(); s.buffer=b; s.connect(aCtx.destination); s.start(0);   // iOS用: 無音を鳴らして出力を開始
+    }
   }catch(e){}
 }
-['pointerdown','keydown','touchstart'].forEach(ev=>document.addEventListener(ev,audioUnlock,{passive:true}));
-$('sndVol').addEventListener('input',()=>{ if(aMaster) aMaster.gain.value=0.5*aVol(); aSave(); });
+['pointerdown','pointerup','touchstart','touchend','click','keydown'].forEach(ev=>document.addEventListener(ev,audioUnlock,{passive:true}));
+$('audioHint').addEventListener('click',audioUnlock);
+$('sndVol').addEventListener('input',()=>{ if(aMaster) aMaster.gain.value=1.4*aVol(); aSave(); });
 $('sndOn').addEventListener('change',aSave);
 $('spkOn').addEventListener('change',()=>{ aSave(); if(!aSp()&&window.speechSynthesis) window.speechSynthesis.cancel(); });
 // 起動時に音声のON/OFFを選ばせる（選択はブラウザに保存し、次回からは聞かない）
@@ -3387,19 +3397,25 @@ const SFX={
   cancel(){ [[988,0],[784,0.2],[622,0.4]].forEach(p=>aTone(p[0],p[1],0.3,'triangle',0.3)); return 0.8; }
 };
 function audioPlay(name,prio,arg){
-  if(!aOn()||!aCtx||!SFX[name]) return;
+  if(!aOn()||!SFX[name]) return;
+  if(!aCtx) audioUnlock();
+  if(!aCtx) return;
+  if(aCtx.state!=='running'){ try{ aCtx.resume(); }catch(e){} aHint(true); return; }   // 音を出せない間は溜めずに捨て、タップを促す
   const now=aCtx.currentTime;
   if(now<aBusyUntil && prio<aBusyPrio) return;          // もっと重要な音が鳴っている間は鳴らさない
   aBusyPrio=prio; aBusyUntil=now+SFX[name](arg);
 }
-function audioSpeak(text,prio){
+// 読み上げ。keep=true は話している最中でも順番待ちにする。長い文は「。」で区切って順に話す（途中で切れるのを防ぐ）
+function audioSpeak(text,prio,keep){
   if(!aSp()||!window.speechSynthesis||!text) return;
   const ss=window.speechSynthesis, busy=ss.speaking||ss.pending;
-  if(prio>=90) ss.cancel(); else if(busy&&prio<70) return;   // 重要度の低い読み上げは、話している間は捨てる
-  const u=new SpeechSynthesisUtterance(text); u.lang='ja-JP'; u.rate=1.05; u.volume=Math.min(1,aVol()*1.2);
+  if(prio>=90) ss.cancel(); else if(busy&&!keep) return;
   if(!aVoice) aVoice=(ss.getVoices()||[]).find(v=>/^ja/i.test(v.lang))||null;
-  if(aVoice) u.voice=aVoice;
-  ss.speak(u);
+  const parts=[]; let cur='';
+  text.split('。').forEach(s=>{ if(!s) return; s+='。'; if(cur&&(cur+s).length>90){ parts.push(cur); cur=''; } cur+=s; });
+  if(cur) parts.push(cur);
+  parts.forEach(t=>{ const u=new SpeechSynthesisUtterance(t); u.lang='ja-JP'; u.rate=1.05; u.volume=Math.min(1,aVol()*1.2);
+    if(aVoice) u.voice=aVoice; ss.speak(u); });
 }
 function aMaxClsAt(t){
   if(!sim||!CUMV||CUMV.length!==sim.nf) return -1;
@@ -3407,18 +3423,52 @@ function aMaxClsAt(t){
   const m=CUMV[f]*0.1; return m<0.5?0:shindoCls(m);
 }
 function aMxCls(r){ if(r.mx&&r.mx[0]>0) return r.mx[0]; let m=0; (r.areas||[]).forEach(a=>{ if(a[1]>m) m=a[1]; }); return m; }
-function aMemTxt(r){
-  const ms=r.mem; if(!ms||!ms.length) return '';
-  const m=ms.reduce((p,q)=>q.mag>p.mag?q:p);
-  return '震源地は、'+m.epi+'。'+(m.depth<1?'深さはごく浅く':'深さは約'+Math.round(m.depth)+'キロ')+'。マグニチュード'+m.mag.toFixed(1)+(m.ge?'程度以上':'')+'。';
+const SPK_CLS=['0','1','2','3','4','ごじゃく','ごきょう','ろくじゃく','ろっきょう','7'];     // 震度の読み（5弱=ごじゃく など）
+const aSh=c=>SPK_CLS[c]!==undefined?SPK_CLS[c]:String(c);
+function aClockTxt(t){ const d=new Date(simClock0+t*1000); return d.getHours()+'時'+d.getMinutes()+'分'; }
+function aList(a,cap){ return a.length>cap?a.slice(0,cap).join('、')+'ほか':a.join('、'); }
+function aMainMem(r){ const ms=r.mem; return (ms&&ms.length)?ms.reduce((p,q)=>q.mag>p.mag?q:p):null; }
+function aMagTxt(m){ return m.mag.toFixed(1)+(m.ge?'程度以上':''); }
+function aDepTxt(m){ return m.depth<1?'ごく浅く':'約'+Math.round(m.depth)+'キロ'; }
+function aTsuTxt1(r){ return (r.tsu!=null&&TSU_TXT[r.tsu])?TSU_TXT[r.tsu].replace('。','。'):''; }
+// 震度別の地域（震度の大きい順）。minc 以上の階級を最大 maxLines 階級まで読む
+function aAreaLines(r,minc,maxLines,cap,lead){
+  const by={}; (r.areas||[]).forEach(a=>{ (by[a[1]]=by[a[1]]||[]).push(a[0]); });
+  const cs=Object.keys(by).map(Number).filter(c=>c>=minc).sort((p,q)=>q-p).slice(0,maxLines);
+  return cs.map(c=>'震度'+aSh(c)+'を観測した地域は、'+aList(by[c],cap)+'。').join('');
+}
+// 「何時何分ごろ、○○を震源とする最大震度○の地震が発生しました。地震の規模を示すマグニチュードは○、△△、△△で最大震度○を観測しました。」
+function aQuakeTxt(r,t0){
+  const m=aMainMem(r), mc=aMxCls(r), ar=r.areas||[];
+  let top=0; ar.forEach(a=>{ if(a[1]>top) top=a[1]; });
+  const names=ar.filter(a=>a[1]===top).map(a=>a[0]);
+  let s=aClockTxt(m?m.delay:t0)+'ごろ、'+(m?m.epi+'を震源とする':'')+(mc>0?'最大震度'+aSh(mc)+'の':'')+'地震が発生しました。';
+  if(m) s+='地震の規模を示すマグニチュードは'+aMagTxt(m)+(names.length?'、'+aList(names,8)+'で最大震度'+aSh(top)+'を観測しました。':'です。');
+  return s;
 }
 const INFO_SPK={
-  sokuho:r=>'震度速報。最大震度'+CLASS_LABEL[aMxCls(r)]+'を観測しました。',
-  gensen:r=>'震源に関する情報。'+aMemTxt(r),
-  gs:r=>'震源・震度に関する情報。'+aMemTxt(r)+(aMxCls(r)>0?'最大震度'+CLASS_LABEL[aMxCls(r)]+'を観測しています。':''),
-  kakuchi:r=>'各地の震度に関する情報。'+(aMxCls(r)>0?'最大震度'+CLASS_LABEL[aMxCls(r)]+'を観測しています。':''),
-  genkou:r=>'顕著な地震の震源要素更新のお知らせ。'+aMemTxt(r)
+  sokuho:(r,t0)=>'震度速報。'+aClockTxt(t0)+'ごろ、強い地震がありました。'+aAreaLines(r,3,3,8),
+  gensen:(r,t0)=>{ const m=aMainMem(r); return '震源に関する情報。'+aClockTxt(m?m.delay:t0)+'ごろ、'+(m?m.epi+'を震源とする':'')+'地震がありました。'
+    +(m?'震源の深さは'+aDepTxt(m)+'、マグニチュードは'+aMagTxt(m)+'です。':'')+aTsuTxt1(r); },
+  gs:(r,t0)=>'震源・震度に関する情報。'+aQuakeTxt(r,t0)+aTsuTxt1(r),
+  kakuchi:(r,t0)=>{ const a=aQuakeTxt(r,t0), mc=aMxCls(r); const o=aAreaLines(r,3,3,6).replace(/^震度[^、]*を観測した地域は、[^。]*。/,'');
+    return '各地の震度に関する情報。'+a+(o?'このほか、'+o:''); },
+  genkou:(r,t0)=>{ const m=aMainMem(r); return '顕著な地震の震源要素更新のお知らせ。'+(m?m.epi+'を震源とする地震の、震源の深さは'+aDepTxt(m)+'、マグニチュードは'+aMagTxt(m)+'です。':'')+aTsuTxt1(r); }
 };
+const aHl=h=>String(h).replace(/m/g,'メートル');
+// 津波: 大津波警報・津波警報の地域は全て、予想される高さごとにまとめて読む（注意報のみのときは地域名を読む）
+function aTsuTxt(st,top){
+  let out='';
+  [4,3].forEach(lv=>{
+    const by=new Map();
+    st.list.filter(e=>e.lv===lv).forEach(e=>{ const h=String(e.hl); if(!by.has(h)) by.set(h,[]); by.get(h).push(sim.tsuAreas[e.i][0]); });
+    if(!by.size) return;
+    out+=TSU_LV[lv]+'の地域です。';
+    by.forEach((names,h)=>{ out+='予想される津波の高さは、'+aHl(h)+'、'+names.join('、')+'。'; });
+  });
+  if(top===2){ const n=st.list.filter(e=>e.lv===2).map(e=>sim.tsuAreas[e.i][0]); if(n.length) out+='津波注意報の地域は、'+aList(n,8)+'。'; }
+  return out;
+}
 const aTsuLv=m=>(m>=5?1:0)+(m>=3?1:0)+(m>=1?1:0)+(m>0?1:0);
 // (t0,t1] の間に起きた「鳴らす出来事」を集める（p が大きいほど重要）
 function audioCollect(t0,t1){
@@ -3429,9 +3479,9 @@ function audioCollect(t0,t1){
     e.reports.forEach((r,k)=>{
       if(r.t>t0&&r.t<=t1){
         const epi=r.epiName||'震源付近';
-        if(r.lv>=2&&lvm<2) ev.push({s:'eewWarn',p:90,x:'緊急地震速報。'+epi+'で地震。強い揺れに警戒してください。'});
-        else if(k===0) ev.push({s:'eewFcst',p:70,x:'緊急地震速報。'+epi+'で地震。'});
-        else if(r.maxCls>cls&&r.maxCls>=1) ev.push({s:'eewUpd',p:50,x:'推定最大震度'+r.maxLabel+'。'});
+        if(r.lv>=2&&lvm<2) ev.push({s:'eewWarn',p:90,k:true,x:'緊急地震速報。'+epi+'で地震。強い揺れに警戒してください。'});
+        else if(k===0) ev.push({s:'eewFcst',p:70,k:true,x:'緊急地震速報。'+epi+'で地震。'});
+        else if(r.maxCls>cls&&r.maxCls>=1) ev.push({s:'eewUpd',p:50,x:'推定最大震度'+aSh(r.maxCls)+'。'});
       }
       if(r.lv>lvm) lvm=r.lv; if(r.maxCls>cls) cls=r.maxCls;
     });
@@ -3439,7 +3489,7 @@ function audioCollect(t0,t1){
   // 震度速報・地震情報
   if(sim.info) sim.info.groups.forEach(g=>g.releases.forEach(r=>{
     if(r.t>t0&&r.t<=t1){ const f=INFO_SPK[r.k];
-      ev.push({s:r.upd?'infoUpd':'infoNew',p:r.k==='sokuho'?80:60,x:(r.upd?'更新。':'')+(f?f(r):'')}); }
+      ev.push({s:r.upd?'infoUpd':'infoNew',p:r.k==='sokuho'?80:60,k:true,x:(r.upd?'情報を更新します。':'')+(f?f(r,g.t0):'')}); }
   }));
   // 津波警報・注意報・解除・観測
   const tq=sim.quakes.filter(q=>q.tsu&&q.tsu.reports.length);
@@ -3447,13 +3497,12 @@ function audioCollect(t0,t1){
     const st=tsuState(t1); let top=0; st.list.forEach(e=>{ if(e.lv>top) top=e.lv; });
     tq.forEach(qk=>qk.tsu.reports.forEach(r=>{
       if(r.t<=t0||r.t>t1) return;
-      if(r.kind==='cancel'||r.kind==='none') ev.push({s:'cancel',p:45,x:String(r.text||'').replace(/<[^>]*>/g,'')});
+      if(r.kind==='cancel'||r.kind==='none') ev.push({s:'cancel',p:45,k:true,x:String(r.text||'').replace(/<[^>]*>/g,'')});
       else if(top>0){
-        const names=st.list.filter(e=>e.lv===top).slice(0,4).map(e=>sim.tsuAreas[e.i][0]).join('、');
         const issue=(r.kind==='issue');
-        ev.push({s:['','tsuInfo','tsuAdv','tsuWarn','tsuMajor'][top],p:[0,40,85,95,100][top],
-          x:issue?TSU_MSG[top]+(names?'対象は、'+names+'などです。':''):TSU_LV[top]+'の内容が更新されました。'});
-      }else ev.push({s:'tsuInfo',p:40,x:String(r.text||'').replace(/<[^>]*>/g,'')});
+        ev.push({s:['','tsuInfo','tsuAdv','tsuWarn','tsuMajor'][top],p:[0,40,85,95,100][top],k:true,
+          x:(issue?TSU_MSG[top]:TSU_LV[top]+'の内容が更新されました。')+aTsuTxt(st,top)});
+      }else ev.push({s:'tsuInfo',p:40,k:true,x:String(r.text||'').replace(/<[^>]*>/g,'')});
     }));
     st.obs.forEach((o,a)=>{
       const prev=aObs.get(a)||0;
@@ -3467,7 +3516,7 @@ function audioCollect(t0,t1){
   // 観測された最大震度が上がった
   const clr=!!(sim.hasTsu&&t1>=sim.tSeis);
   if(!clr){ const c=aMaxClsAt(t1);
-    if(c>aMaxCls){ if(c>=1) ev.push({s:'newInt',a:c,p:65,x:c>=3?'最大震度'+CLASS_LABEL[c]+'を観測。':''}); aMaxCls=c; } }
+    if(c>aMaxCls){ if(c>=1) ev.push({s:'newInt',a:c,p:65,x:c>=3?'最大震度'+aSh(c)+'を観測。':''}); aMaxCls=c; } }
   return ev;
 }
 function audioResync(t){      // シーク・巻き戻し・一時停止中: 鳴らさずに「発表済み」の状態だけ合わせる
@@ -3479,7 +3528,8 @@ function audioReset(){
   if(window.speechSynthesis) window.speechSynthesis.cancel();
 }
 function audioStep(ts){
-  if(!sim){ aPrev=-0.001; aMaxCls=-1; aObs=new Map(); return; }
+  if(!sim){ aPrev=-0.001; aMaxCls=-1; aObs=new Map(); aHint(false); return; }
+  if(!aOn()) aHint(false);
   const t1=tcur;
   if(!playing||t1<aPrev-1e-6||ts-seekStamp<800){ audioResync(t1); return; }
   if(t1<=aPrev) return;
@@ -3487,9 +3537,9 @@ function audioStep(ts){
   if(!ev.length) return;
   ev.sort((p,q)=>q.p-p.p);
   audioPlay(ev[0].s,ev[0].p,ev[0].a);
-  const sp=ev.find(e=>e.x); if(sp) audioSpeak(sp.x,sp.p);
+  const sp=ev.find(e=>e.x); if(sp) audioSpeak(sp.x,sp.p,sp.k);
 }
-$('sndTest').onclick=()=>{ audioUnlock(); audioPlay('infoNew',100); audioSpeak('音声のテストです。震度速報。最大震度5弱を観測しました。',100); };
+$('sndTest').onclick=()=>{ audioUnlock(); audioPlay('infoNew',100); audioSpeak('音声のテストです。震度速報。最大震度ごじゃくを観測しました。',100); };
 
 function tick(ts){
   if(sim && playing){
@@ -3514,7 +3564,7 @@ function tick(ts){
         if(!done){ waitFlag=true; $('status').textContent='EEW演算待ち…（先読みを確保中）'; }
       }
     }
-    if(tcur>=sim.tEnd){ tcur=sim.tEnd; playing=false; $('play').textContent='▶'; }
+    if(tcur>=sim.tEnd){ tcur=sim.tEnd; playing=false; $('play').textContent='►'; }
     $('seek').value=tToS(tcur); $('tlabel').textContent=fmtT(tcur);
   }
   lastTs=ts; draw(ts); updateInfo(ts); audioStep(ts); requestAnimationFrame(tick);
@@ -3524,7 +3574,7 @@ requestAnimationFrame(tick);
 $('play').onclick=()=>{
   if(!sim) return;
   if(tcur>=sim.tEnd-0.01) tcur=0;
-  playing=!playing; $('play').textContent=playing?'⏸':'▶';
+  playing=!playing; $('play').textContent=playing?'❚❚':'►';
 };
 $('restart').onclick=()=>{ if(!sim) return; tcur=0; $('seek').value=0; $('tlabel').textContent='0.0 s'; };
 $('seek').addEventListener('input',()=>{ if(!sim) return; tcur=Math.min(sToT(parseInt($('seek').value)),limT()); $('seek').value=tToS(tcur); $('tlabel').textContent=fmtT(tcur); });
@@ -3560,7 +3610,7 @@ $('run').onclick=async()=>{
       $('seek').disabled=false; $('seek').max=v.tsuExt?2000:Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
       showResult(v);
       $('status').textContent='再生中（EEW演算中）';
-      playing=true; $('play').textContent='⏸'; $('run').disabled=$('runFab').disabled=false;
+      playing=true; $('play').textContent='❚❚'; $('run').disabled=$('runFab').disabled=false;
       $('runFab').classList.remove('idle'); $('runFab').textContent='↻ もう一度実行';
       if(window.innerWidth<=700) $('panel').classList.remove('open');
     }else if(!sim){ return; }
@@ -3586,7 +3636,7 @@ $('run').onclick=async()=>{
     }
     if(buf.trim()) await handle(JSON.parse(buf));
   }catch(e){ if(e.name!=='AbortError') $('status').textContent='通信エラー: '+e; }
-  finally{ if(ctl===runCtl){ $('run').disabled=$('runFab').disabled=false; if($('runFab').textContent==='計算中…') $('runFab').textContent=sim?'↻ もう一度実行':'▶ シミュレーション実行'; } }
+  finally{ if(ctl===runCtl){ $('run').disabled=$('runFab').disabled=false; if($('runFab').textContent==='計算中…') $('runFab').textContent=sim?'↻ もう一度実行':'► シミュレーション実行'; } }
 };
 
 function showResult(j){
