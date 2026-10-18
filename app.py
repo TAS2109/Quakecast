@@ -1422,7 +1422,7 @@ _TSU_LON = np.array([a[2] for a in TSU_AREAS])
 _TSU_FAC = np.array([a[3] for a in TSU_AREAS], dtype=float)
 _TSU_AMP = np.array([a[4] for a in TSU_AREAS])
 TSU_LVN = {1: "津波予報", 2: "津波注意報", 3: "津波警報", 4: "大津波警報"}
-_TSU_RANK = {"若干の海面変動": 0, "1m": 1, "3m": 2, "5m": 3, "10m": 4, "10m超": 5, "巨大": 6}
+_TSU_RANK = {"": 0, "若干の海面変動": 0, "1m": 1, "高い": 2, "3m": 2, "5m": 3, "10m": 4, "10m超": 5, "巨大": 6}
 _TSU_MSG = {
     4: "大津波警報を発表しました。巨大な津波が襲来します。ただちに高台や避難ビルなど安全な場所へ避難してください。",
     3: "津波警報を発表しました。津波が襲来します。ただちに海岸から離れ、高台や避難ビルなど安全な場所へ避難してください。",
@@ -1710,12 +1710,13 @@ def tsunami_for_quake(lat0, lon0, mag, depth):
     # 第1報は震源・規模のデータベース検索による予測: 安全側に余裕を見るため大きめで、予報区ごとにばらつく
     H1 = _tsu_model(m1, lat0, lon0, depth, sea_f)[0] * 1.2 * np.exp(rng.normal(0, 0.3, n))
     H2 = _tsu_model(m2, lat0, lon0, depth, sea_f)[0]
+    safe = 1.35 if mag >= 8.0 else 1.0                            # M8以上は警報等の予想高さを実際より高めに見積もる（安全側）
     Ht = H2 * eps                                                 # 実際に来襲する津波の高さ
     t_true = tm * (1.0 + rng.normal(0, 0.06, n))
     stages = [(180.0 + int(rng.integers(-15, 16)), H1, m1, giant, 0.0),
               ((660.0 if mag >= 7.0 else 900.0) + int(rng.integers(0, 120)),
-               H2 * np.exp(rng.normal(0, 0.1, n)), m2, False, 0.0)]
-    lH2, lHt = np.log(np.maximum(H2, 1e-6)), np.log(np.maximum(Ht, 1e-6))
+               H2 * safe * np.exp(rng.normal(0, 0.1, n)), m2, False, 0.0)]
+    lH2, lHt = np.log(np.maximum(H2 * safe, 1e-6)), np.log(np.maximum(Ht, 1e-6))
     for tk, w in ((1500.0, 0.45), (2400.0, 0.65), (3600.0, 0.8), (5400.0, 0.9)):
         # 沖合・沿岸の観測を取り込むほど実際の津波に近づく: 予想の拡大（引き上げ・追加）も縮小（切替）も起こる
         Hk = np.exp((1.0 - w) * lH2 + w * lHt + rng.normal(0, 0.08, n))
@@ -1726,7 +1727,9 @@ def tsunami_for_quake(lat0, lon0, mag, depth):
         for i in range(n):
             lv, lb = _tsu_grade(float(H[i]))
             if lv:
-                d[i] = [lv, "巨大" if (gflag and lv == 4) else lb]
+                if gflag:                                         # M8以上の第1報: 大津波警報=巨大、津波警報=高い、津波注意報=表記なし
+                    lb = {4: "巨大", 3: "高い", 2: ""}.get(lv, lb)
+                d[i] = [lv, lb]
         if any(v[0] >= 2 for v in d.values()):                   # 警報・注意報があれば予報(若干の変動)は省く
             d = {i: v for i, v in d.items() if v[0] >= 2}
         return d
@@ -2210,7 +2213,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" style="width:auto"> その時点で観測された最大震度を表示（各観測点の最大値を保持）</label>
-  <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="muOn" type="checkbox" style="width:auto"> 震度計が未入電となる可能性（計測震度5.5以上の観測点が、震度が大きいほど高い確率で「未入電(5弱以上)」になる）</label>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="muOn" type="checkbox" style="width:auto"> 震度計が未入電となる可能性（計測震度5.5以上の観測点が、震度が大きいほど高い確率で「未入電(5弱以上)」になる。確率は低め：6.5で約1割）</label>
   <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,.12)">
     <label style="display:flex;align-items:center;gap:6px"><input id="sndOn" type="checkbox" checked style="width:auto"> 効果音（緊急地震速報・震度速報／地震情報・津波・最大震度の更新）</label>
     <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="spkOn" type="checkbox" checked style="width:auto"> 読み上げ（ブラウザ標準の日本語音声）</label>
@@ -2308,7 +2311,7 @@ INDEX_HTML = r"""<!doctype html>
       <option value="2">×2</option><option value="5">×5</option><option value="10">×10</option>
     </select>
     <select id="tsuSpeed" title="地震動の計算範囲を過ぎた後（津波フェーズ）の再生速度">
-      <option value="60" selected>津波×60</option><option value="300">津波×300</option><option value="1800">津波×1800</option>
+      <option value="1">津波×1</option><option value="5">津波×5</option><option value="10">津波×10</option><option value="30">津波×30</option><option value="60" selected>津波×60</option><option value="300">津波×300</option><option value="1800">津波×1800</option>
     </select>
   </div>
   <div id="legend"><canvas id="lgc" width="600" height="12"></canvas>
@@ -2593,6 +2596,7 @@ let PEAK=null, PEAKV=null, peakF=-1;   // 観測点ごとの「その時点ま�
 let CUMV=null, CUMI=null;   // フレームごとの「その時点までの最大震度(×10)」と観測点
 let CUMV2=null, CUMI2=null; // 同上（未入電になった観測点を除く）
 let MUF=null, MUFIRST=1e9, MUI=-1;   // 観測点ごとの未入電になるフレーム(-1=ならない)／最初の未入電の時刻と観測点
+const MU_PMAX=0.2;   // 未入電確率の上限係数（計測震度5.5で0、6.0で約6%、6.5で約10%、7.0で約13%）。大きくするほど未入電が増える
 const muOn=()=>{ const e=document.getElementById('muOn'); return !!(e&&e.checked); };
 let sim=null, Q=null, tcur=0, playing=false, lastTs=0, runCtl=null, waitFlag=false;
 // EEWの演算が追いついていない地震があれば、その地震の確定済み時刻までしか再生しない
@@ -3023,7 +3027,7 @@ function buildTsuGeo(){
     out[i]=left[k].lines; usedI.add(i); usedK.add(k);
     fuzzy.push(AR[i][0]+' ← '+left[k].nm+'（最寄り '+Math.round(d)+'km）');
   }
-  TSUGEO=out; TSU_ANCH={};
+  TSUGEO=out; TSU_ANCH={}; TSUW={}; TSUPC={};
   console.log('tsunami_areas.geojson: '+hit+'/'+TSUGEO_RAW.features.length+' features matched by name, '+Object.keys(out).length+'/'+AR.length+' areas have a coastline');
   if(fuzzy.length) console.log('tsunami_areas.geojson: 名称が違うが割り当てた予報区:\n  '+fuzzy.join('\n  '));
   const noGeo=AR.map(a=>a[0]).filter((n,i)=>!out[i]);
@@ -3034,7 +3038,14 @@ function buildTsuGeo(){
 }
 
 /* ---------- 津波観測値の棒グラフ（観測地点から上へ積み上がる） ---------- */
-let TSU_ANCH={};
+let TSU_ANCH={}, TSUW={}, TSUPC={};   // TSUW: 予報区ごとの海岸線の世界座標、TSUPC: 画面座標（地図が動かない間は使い回す）
+function tsuWorld(i){
+  let w=TSUW[i]; if(w) return w;
+  w=(TSUGEO[i]||[]).map(ln=>{ const a=new Float32Array(ln.length*2);
+    for(let k=0;k<ln.length;k++){ const sn=Math.sin(ln[k][1]*Math.PI/180); a[2*k]=(ln[k][0]+180)/360; a[2*k+1]=0.5-Math.log((1+sn)/(1-sn))/(4*Math.PI); }
+    return a; });
+  return (TSUW[i]=w);
+}
 function tsuAnchor(i){                                   // 観測地点 [lat,lon]: 海岸線があればその中ほど、無ければ代表点
   if(TSU_ANCH[i]) return TSU_ANCH[i];
   const a=sim.tsuAreas[i]; let r=[a[1],a[2]];
@@ -3058,10 +3069,10 @@ function drawTsuBars(st,z){
   for(const [i,o,p] of items){
     const x=Math.round(p.x-bw/2), y0=p.y;
     let prev=0;
-    for(const h of o.segs){                              // 観測のたびに1段ずつ積み上がる（段の色はその時点の波高の階級）
+    for(const h of o.segs){                              // 観測のたびに1段ずつ積み上がる（棒全体の色は現在の最大波高の階級）
       if(h<=prev) continue;
       const ya=y0-tsuBarPx(prev), yb=y0-tsuBarPx(h);
-      ctx.fillStyle=tsuBarColor(h); ctx.fillRect(x,yb,bw,ya-yb);
+      ctx.fillStyle=tsuBarColor(o.mx); ctx.fillRect(x,yb,bw,ya-yb);   // 段ごとではなく、棒全体を現在の最大波高の色にする
       ctx.strokeStyle='rgba(0,0,0,.85)'; ctx.lineWidth=1; ctx.strokeRect(x+.5,yb+.5,bw-1,Math.max(ya-yb-1,0));
       prev=h;
     }
@@ -3086,17 +3097,22 @@ function drawTsuCoast(st,z){
   for(const e of st.list){
     const lines=TSUGEO[e.i];
     if(!lines){ rest.push(e); continue; }
-    const paths=[]; let best=null, bestN=0;
-    for(const ln of lines){
-      const pts=[]; let lx=-1e9, ly=-1e9;
-      for(let k=0;k<ln.length;k++){
-        const p=map.latLngToContainerPoint([ln[k][1],ln[k][0]]);
-        if(k===0||k===ln.length-1||Math.abs(p.x-lx)+Math.abs(p.y-ly)>=2){ pts.push(p); lx=p.x; ly=p.y; }
+    let ce=TSUPC[e.i]; const vk=OX+','+OY+','+SC;
+    if(!ce||ce.k!==vk){                                  // 地図が動いたときだけ投影し直す（以前は毎フレーム全頂点を変換していた）
+      const paths=[]; let best=null, bestN=0;
+      for(const a of tsuWorld(e.i)){
+        const n=a.length>>1, pts=[]; let lx=-1e9, ly=-1e9;
+        for(let k=0;k<n;k++){
+          const x=OX+a[2*k]*SC, y=OY+a[2*k+1]*SC;
+          if(k===0||k===n-1||Math.abs(x-lx)+Math.abs(y-ly)>=2){ pts.push({x:x,y:y}); lx=x; ly=y; }
+        }
+        if(pts.length<2) continue;
+        paths.push(pts);
+        if(n>bestN){ bestN=n; best=pts; }
       }
-      if(pts.length<2) continue;
-      paths.push(pts);
-      if(ln.length>bestN){ bestN=ln.length; best=pts; }
+      ce=TSUPC[e.i]={k:vk,paths:paths,best:best};
     }
+    const paths=ce.paths, best=ce.best;
     if(!paths.length) continue;
     ctx.beginPath();
     for(const pts of paths){ ctx.moveTo(pts[0].x,pts[0].y); for(let k=1;k<pts.length;k++) ctx.lineTo(pts[k].x,pts[k].y); }
@@ -3605,14 +3621,20 @@ function audioCollect(t0,t1){
           x:(issue?TSU_MSG[top]:TSU_LV[top]+'の内容が更新されました。')+aTsuTxt(st,top)});
       }else ev.push({s:'tsuInfo',p:40,k:true,x:String(r.text||'').replace(/<[^>]*>/g,'')});
     }));
+    const nobs=[]; let lvUp=false;                      // 観測が更新された予報区を集めて、1回の読み上げにまとめる（階級が上がったときだけ効果音）
     st.obs.forEach((o,a)=>{
       const prev=aObs.get(a)||0;
-      if(aTsuLv(o.mx)>aTsuLv(prev)){
-        const nm=(sim.tsuAreas[a]||['沿岸'])[0];
-        ev.push({s:'tsuObs',p:55,x:'津波を観測しました。'+nm+'で'+o.mx.toFixed(1)+'メートル。'});
+      if(o.mx>prev+1e-6){
+        nobs.push({nm:(sim.tsuAreas[a]||['沿岸'])[0],mx:o.mx});
+        if(aTsuLv(o.mx)>aTsuLv(prev)) lvUp=true;
+        aObs.set(a,o.mx);
       }
-      if(o.mx>prev) aObs.set(a,o.mx);
     });
+    if(nobs.length){
+      nobs.sort((p,q)=>q.mx-p.mx); const top4=nobs.slice(0,4);
+      ev.push({s:lvUp?'tsuObs':'',p:lvUp?55:35,x:'津波観測に関する情報。'+top4.map(e=>e.nm+'で'+e.mx.toFixed(1)+'メートル').join('、')
+        +(nobs.length>top4.length?'、ほか'+(nobs.length-top4.length)+'か所。':'。')});
+    }
   }
   // 観測された最大震度が上がった
   const clr=!!(sim.hasTsu&&t1>=sim.tSeis);
@@ -3713,7 +3735,7 @@ $('run').onclick=async()=>{
         for(let f=0;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++){ const x=Q[o+i]; if(x>pk[i]) pk[i]=x; if(x>=55&&on[i]<0) on[i]=f; } }
         // 未入電: 計測震度5.5以上に達した陸上観測点が、確率 1-0.5^(計測震度-5.5) で未入電になる（6.5で1/2）。抽選は実行ごとに1回
         for(let i=0;i<N;i++){ if((SEA&&SEA[i])||pk[i]<55) continue;
-          if(Math.random()<1-Math.pow(0.5,pk[i]/10-5.5)){ MUF[i]=on[i]; if(on[i]<MUFIRST){ MUFIRST=on[i]; MUI=i; } } }
+          if(Math.random()<MU_PMAX*(1-Math.pow(0.5,pk[i]/10-5.5))){ MUF[i]=on[i]; if(on[i]<MUFIRST){ MUFIRST=on[i]; MUI=i; } } }
         let mv=-999, mi=-1, mv2=-999, mi2=-1;   // 陸上観測点の累積最大（CUMV2は未入電の観測点を除く）
         for(let f=0;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++){ if(SEA&&SEA[i]) continue; const x=Q[o+i];
             if(x>mv){ mv=x; mi=i; }
