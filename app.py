@@ -2037,17 +2037,15 @@ INDEX_HTML = r"""<!doctype html>
   .epi{color:#ff4d4d;font-size:26px;font-weight:900;text-shadow:0 0 4px #000,0 0 8px #000;
     line-height:26px;text-align:center}
   .foot{font-size:10.5px;color:var(--sub);line-height:1.55;margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
-  #rightcol{position:absolute;z-index:1000;right:10px;top:56px;width:350px;max-height:calc(100% - 200px);
+  #rightcol{position:absolute;z-index:1000;right:4px;top:56px;width:300px;max-height:calc(100% - 200px);
     overflow:auto;display:flex;flex-direction:column;gap:8px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.5}
   .card h3{margin:0 0 5px;font-size:11.5px;color:var(--sub);font-weight:600}
   .card .sub{color:var(--sub);font-size:11px;margin-top:3px}
   #rank td.no{color:var(--sub);width:14px}
   .eewcard{border-width:2px;padding:5px 8px}
-  .eewcard .eh{display:flex;align-items:center;gap:6px;height:24px;margin-bottom:4px}
-  .eewcard .ett{flex:1;min-width:0;font-size:11.5px;color:#cfd8ea;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .eewcard .lvbadge{font-size:14px;font-weight:800;padding:1px 8px;border-radius:6px;background:#0006;min-width:74px;text-align:center;white-space:nowrap}
-  .eewcard .eno{font-size:12px;font-weight:700;white-space:nowrap}
+  .eewcard .eh{display:flex;align-items:center;gap:6px;min-height:24px;margin-bottom:5px}
+  .eewcard .ett{flex:1;min-width:0;font-size:17px;color:#fff;font-weight:800;line-height:1.3;white-space:normal;text-shadow:0 0 4px #0008}
   .eewcard .tiles{display:grid;grid-template-columns:1.15fr 1fr .9fr;gap:5px}
   .eewcard .tile{background:#0005;border-radius:6px;padding:2px 3px 1px;text-align:center;height:48px;overflow:hidden}
   .eewcard .tile .k{font-size:9.5px;color:#cfd8ea;line-height:1.25}
@@ -2055,7 +2053,9 @@ INDEX_HTML = r"""<!doctype html>
   .eewcard .eewDep{font-size:19px;line-height:1.5}
   .eewcard .eewDep small{font-size:11px;margin-left:2px;font-weight:600}
   .eewcard .chipbig{display:inline-block;min-width:42px;border-radius:7px;padding:0 6px;font-size:20px;line-height:1.3;color:#fff;text-shadow:0 0 3px #000a}
-  .eewcard .pos,.eewcard .warn{height:16px;font-size:11.5px;line-height:16px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .eewcard .pos{height:16px;font-size:11.5px;line-height:16px;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .eewcard .warn{margin-top:5px;padding:4px 8px;border-radius:6px;background:#000b;border-left:5px solid #ffd23b;color:#fff3b0;font-size:14.5px;font-weight:800;line-height:1.4;white-space:normal}
+  .eewcard .warn:empty{display:none}
   .eewcard .pos{margin-top:4px}
   .eewcard details.histbox{margin-top:2px}
   .eewcard details.histbox>summary{cursor:pointer;font-size:10.5px;color:#cfd8ea;font-weight:600;user-select:none}
@@ -2083,6 +2083,11 @@ INDEX_HTML = r"""<!doctype html>
   .tsucard.tl2{background:#4a3f08ee;border-color:#ffd23b}
   .tsucard.tl3{background:#7a1010ee;border-color:#ff4d4d;animation:eewb 1s infinite}
   .tsucard.tl4{background:#2a0a3eee;border-color:#c04bff;animation:eewb .6s infinite}
+  #mxIco{position:absolute;z-index:1000;right:314px;bottom:226px;display:none;flex-direction:column;align-items:center;gap:3px}
+  #mxIco .mk{font-size:11px;font-weight:700;color:#fff;text-shadow:0 0 3px #000,0 0 6px #000}
+  #mxIco .mxb{width:78px;height:78px;border-radius:14px;display:flex;align-items:center;justify-content:center;border:2px solid rgba(255,255,255,.85);box-shadow:0 2px 10px rgba(0,0,0,.5);font-weight:900}
+  #mxIco .n{font-size:46px;line-height:1}
+  #mxIco .s{font-size:22px;line-height:1;align-self:flex-end;margin-bottom:13px;margin-left:1px}
   #obs{display:none;align-items:center;gap:8px;padding:5px 8px}
   #obs .ok{font-size:11px;color:var(--sub);white-space:nowrap}
   #obs .ov{font-size:12.5px;font-weight:700;white-space:nowrap}
@@ -2166,6 +2171,7 @@ INDEX_HTML = r"""<!doctype html>
   @media (max-width:700px){
     #bar{bottom:calc(14px + env(safe-area-inset-bottom,0px))}
     #tabbar{top:50px;left:10px;right:auto}
+    #mxIco{right:auto;left:10px;bottom:226px}
     #infoView{padding-top:92px}
     #infoHead{padding-right:16px}
     #infoMain{flex-direction:column}
@@ -2204,6 +2210,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" style="width:auto"> その時点で観測された最大震度を表示（各観測点の最大値を保持）</label>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="muOn" type="checkbox" style="width:auto"> 震度計が未入電となる可能性（計測震度5.5以上の観測点が、震度が大きいほど高い確率で「未入電(5弱以上)」になる）</label>
   <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,.12)">
     <label style="display:flex;align-items:center;gap:6px"><input id="sndOn" type="checkbox" checked style="width:auto"> 効果音（緊急地震速報・震度速報／地震情報・津波・最大震度の更新）</label>
     <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="spkOn" type="checkbox" checked style="width:auto"> 読み上げ（ブラウザ標準の日本語音声）</label>
@@ -2279,6 +2286,7 @@ INDEX_HTML = r"""<!doctype html>
   <span><span class="lbl">現在の最大</span><b id="hM">-</b></span>
 </div>
 
+<div id="mxIco"><div class="mk">最大震度</div><div class="mxb"></div></div>
 <div id="rightcol">
   <div id="obs" class="card"><span class="ok">観測最大震度</span><span class="ov" id="obsV"></span><span class="oa" id="obsA"></span></div>
   <div id="eewcards"></div>
@@ -2300,7 +2308,7 @@ INDEX_HTML = r"""<!doctype html>
       <option value="2">×2</option><option value="5">×5</option><option value="10">×10</option>
     </select>
     <select id="tsuSpeed" title="地震動の計算範囲を過ぎた後（津波フェーズ）の再生速度">
-      <option value="60">津波×60</option><option value="300" selected>津波×300</option><option value="1800">津波×1800</option>
+      <option value="60" selected>津波×60</option><option value="300">津波×300</option><option value="1800">津波×1800</option>
     </select>
   </div>
   <div id="legend"><canvas id="lgc" width="600" height="12"></canvas>
@@ -2528,10 +2536,12 @@ $('toggle').onclick=()=>$('panel').classList.toggle('open');
 if(window.innerWidth<=700) $('panel').classList.remove('open');
 
 /* ---------- 観測点 ---------- */
-let N=0, SLON=null, SLAT=null, PX=null, PY=null, VALS=null, viewDirty=true, AREA=null, ANAMES={}, AM=null, SEA=null, SEAIDX=[];
+let N=0, SLON=null, SLAT=null, WX=null, WY=null, OX=0, OY=0, SC=256, PX=null, PY=null, VALS=null, viewDirty=true, AREA=null, ANAMES={}, AM=null, SEA=null, SEAIDX=[];
 fetch('/api/stations').then(r=>r.json()).then(j=>{
   SLON=Float32Array.from(j.lon); SLAT=Float32Array.from(j.lat); N=SLON.length;
   AREA=Int32Array.from(j.area); ANAMES=j.anames; SEA=Uint8Array.from(j.sea||new Array(N).fill(0)); SEAIDX=[]; for(let i=0;i<N;i++) if(SEA[i]) SEAIDX.push(i); let mx=0; for(const a of AREA) if(a>mx) mx=a; AM=new Float32Array(mx+1);
+  WX=new Float32Array(N); WY=new Float32Array(N);   // 正規化メルカトル座標(0..1)。再投影を足し算と掛け算だけで行うため最初に1回だけ計算
+  for(let i=0;i<N;i++){ const sn=Math.sin(SLAT[i]*Math.PI/180); WX[i]=(SLON[i]+180)/360; WY[i]=0.5-Math.log((1+sn)/(1-sn))/(4*Math.PI); }
   PX=new Float32Array(N); PY=new Float32Array(N); VALS=new Float32Array(N).fill(-3.1); viewDirty=true; loadGeo(); loadTsuGeo();
 });
 
@@ -2548,7 +2558,8 @@ function resizeCanvas(){
 map.on('resize',resizeCanvas); map.on('move zoomend viewreset',()=>{viewDirty=true;}); resizeCanvas();
 
 function updatePoints(){
-  for(let i=0;i<N;i++){ const p=map.latLngToContainerPoint([SLAT[i],SLON[i]]); PX[i]=p.x; PY[i]=p.y; }
+  SC=256*Math.pow(2,map.getZoom()); const p0=map.latLngToContainerPoint([0,0]); OX=p0.x-0.5*SC; OY=p0.y-0.5*SC;
+  if(WX) for(let i=0;i<N;i++){ PX[i]=OX+WX[i]*SC; PY[i]=OY+WY[i]*SC; }   // 以前は観測点ごとに latLngToContainerPoint を呼んでいた（毎フレーム数千回）
   viewDirty=false;
 }
 function circlePts(lat0,lon0,rkm,n){
@@ -2557,7 +2568,7 @@ function circlePts(lat0,lon0,rkm,n){
     const th=i/n*2*Math.PI;
     const lat=Math.asin(Math.sin(la)*Math.cos(d)+Math.cos(la)*Math.sin(d)*Math.cos(th));
     const lon=lo+Math.atan2(Math.sin(th)*Math.sin(d)*Math.cos(la),Math.cos(d)-Math.sin(la)*Math.sin(lat));
-    pts.push(map.latLngToContainerPoint([lat*180/Math.PI,lon*180/Math.PI]));
+    const sn=Math.sin(lat); pts.push({x:OX+((lon*180/Math.PI+180)/360)*SC, y:OY+(0.5-Math.log((1+sn)/(1-sn))/(4*Math.PI))*SC});
   }
   return pts;
 }
@@ -2580,6 +2591,9 @@ function frac(x){ return x-Math.floor(x); }
 /* ---------- シミュレーション状態 ---------- */
 let PEAK=null, PEAKV=null, peakF=-1;   // 観測点ごとの「その時点までの最大震度」(×10)
 let CUMV=null, CUMI=null;   // フレームごとの「その時点までの最大震度(×10)」と観測点
+let CUMV2=null, CUMI2=null; // 同上（未入電になった観測点を除く）
+let MUF=null, MUFIRST=1e9, MUI=-1;   // 観測点ごとの未入電になるフレーム(-1=ならない)／最初の未入電の時刻と観測点
+const muOn=()=>{ const e=document.getElementById('muOn'); return !!(e&&e.checked); };
 let sim=null, Q=null, tcur=0, playing=false, lastTs=0, runCtl=null, waitFlag=false;
 // EEWの演算が追いついていない地震があれば、その地震の確定済み時刻までしか再生しない
 const limT=()=>{ if(!sim) return 0; let lim=sim.tEnd; for(const q of sim.quakes) if(!q.eewDone) lim=Math.min(lim,q.eewUpto||0); return lim; };
@@ -2692,6 +2706,7 @@ function drawPredFill(pv,z){
   ctx.drawImage(predCv,0,0); ctx.restore();
 }
 
+const BKT=Array.from({length:LUT_N},()=>[]);
 function draw(ts){
   const s=map.getSize(); ctx.clearRect(0,0,s.x,s.y);
   if(!N) return;
@@ -2699,6 +2714,8 @@ function draw(ts){
   // 津波情報への切り替え: 地震動の計算範囲が終わり津波フェーズに入ったら、地震情報（観測点の震度・予想震度・
   // P/S波・EEW・ランキング・観測最大震度）は消して、津波の表示だけにする。巻き戻せば地震情報に戻る。
   const clr=!!(sim && sim.hasTsu && tcur>=sim.tSeis);
+  let fcur=0; if(sim){ fcur=Math.round(tcur/sim.dt); if(fcur<0)fcur=0; if(fcur>sim.nf-1)fcur=sim.nf-1; }
+  const muEn=!!(sim&&MUF&&muOn());
   if(sim) valuesAt(tcur);
   else { const tk=Math.floor((ts||0)/160); for(let i=0;i<N;i++) VALS[i]=-3.1+(frac(Math.sin(i*12.9898+tk*78.233)*43758.5453)-0.5)*0.14; }
 
@@ -2713,13 +2730,19 @@ function draw(ts){
     DV=PEAKV;
   }
   const z=map.getZoom(), r0=Math.max(2.0,(z-3.6)*0.95);
-  const buckets=new Array(LUT_N); for(let k=0;k<LUT_N;k++) buckets[k]=[];
+  const buckets=BKT; for(let k=0;k<LUT_N;k++) buckets[k].length=0;   // 配列は使い回す（毎フレームの確保とGCを避ける）
   let vmax=-99, vmaxI=-1; AM.fill(-99);
+  const muList=[];                                     // 未入電になっている観測点
   for(let i=0;i<N;i++){
     const v=VALS[i];
     const isSea=!!(SEA&&SEA[i]);
-    if(!isSea){ if(v>vmax){ vmax=v; vmaxI=i; } const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v; }   // 海底観測点は最大・ランキングに含めない
+    const mu=muEn&&!isSea&&MUF[i]>=0&&fcur>=MUF[i];     // 未入電の観測点
+    if(!isSea){                                          // 海底観測点は最大・ランキングに含めない
+      if(mu) muList.push(i);
+      else{ if(v>vmax){ vmax=v; vmaxI=i; } const ar=AREA[i]; if(v>AM[ar]) AM[ar]=v; }
+    }
     if(isSea && seaMode!=='normal') continue;           // 海底は「薄く/非表示」のとき通常描画から外す
+    if(mu) continue;                                     // 未入電は下で別に描く
     buckets[lutK(DV[i])].push(i);
   }
   // EEWの予想震度で地図を薄く塗りつぶす（観測点ごとの予想震度の階級色。高い階級を上に重ねる）
@@ -2741,19 +2764,25 @@ function draw(ts){
     const b=buckets[k]; if(clr||!b.length) continue;
     const v=LUT_MIN+k*LUT_STEP;
     const num=v>=0.49, cl=num?shindoCls(v+0.01):0;
-    const r=num?rn*(cl>=5?1.2:1.0):r0*(v<0?0.85:1.0);
-    ctx.fillStyle=LUT[k]; ctx.beginPath();
+    const zero=!num&&v>=-0.05;                          // 震度0（計測震度0〜0.5未満）: 震度1以上と同じ大きさの灰色の円（数字なし）
+    const r=num?rn*(cl>=5?1.2:1.0):(zero?rn:r0*(v<0?0.85:1.0));
+    ctx.fillStyle=zero?'#7f8896':LUT[k]; ctx.beginPath();
     for(let j=0;j<b.length;j++){ const i=b[j]; ctx.moveTo(PX[i]+r,PY[i]); ctx.arc(PX[i],PY[i],r,0,6.2832); }
     ctx.fill();
-    if(num){
+    if(num||zero){
       ctx.strokeStyle='rgba(255,255,255,.85)'; ctx.lineWidth=1; ctx.stroke();
-      if(showTxt){
+      if(num&&showTxt){
         ctx.font='bold '+Math.round(r*(cl>=5?1.0:1.25))+'px sans-serif';
         ctx.fillStyle=(cl===2||cl===3)?'#111':'#fff';
         const t=NUM_LABEL[cl];
         for(let j=0;j<b.length;j++){ const i=b[j]; ctx.fillText(t,PX[i],PY[i]+0.5); }
       }
     }
+  }
+  if(!clr&&muList.length){                               // 未入電: 5弱と同じ色で数字なしの円
+    const r=rn*1.2; ctx.fillStyle=clsColor(5); ctx.beginPath();
+    for(const i of muList){ ctx.moveTo(PX[i]+r,PY[i]); ctx.arc(PX[i],PY[i],r,0,6.2832); }
+    ctx.fill(); ctx.strokeStyle='rgba(255,255,255,.85)'; ctx.lineWidth=1; ctx.stroke();
   }
   const setDisp=(el,v)=>{ if(el._d!==v){ el.style.display=v; el._d=v; } };
   setDisp($('rank'),clr?'none':''); setDisp($('eewcards'),clr?'none':'');
@@ -2786,7 +2815,8 @@ function draw(ts){
     const hm=$('hM'); const m=Math.max(vmax,-3);
     if(clr) $('obs').style.display='none';              // updateObs が display を直接触るため setDisp は使わない
     else { const nf=sim.nf; let f=Math.round(tcur/sim.dt); if(f<0)f=0; if(f>nf-1)f=nf-1;
-      if(CUMV&&CUMV.length===nf) updateObs(CUMV[f]*0.1,CUMI[f]); else updateObs(-9,-1); }
+      if(CUMV&&CUMV.length===nf){ if(muEn) updateObs(CUMV2[f]*0.1,CUMI2[f],f>=MUFIRST); else updateObs(CUMV[f]*0.1,CUMI[f],false); } else updateObs(-9,-1,false); }
+    updateMxIcon(vmax,!clr,muList.length>0);            // その瞬間の最大震度（陸上観測点の現在値の最大）
     if(clr){ hm.textContent='—'; hm.style.color='#93a0b8'; }
     else if(m<0.5){ hm.textContent='—'; hm.style.color='#93a0b8'; }
     else { hm.textContent=fx1(m)+'（'+CLASS_LABEL[shindoCls(m)]+'）'; hm.style.color=clsColor(shindoCls(m)); }
@@ -2814,9 +2844,26 @@ const EEW_LBL=['待機中','予報','警報','特別警報'];
 function eewSet(el,html){ if(el._h!==html){ el.innerHTML=html; el._h=html; } }
 function eewTxt(el,t){ if(el._h!==t){ el.textContent=t; el.title=t; el._h=t; } }
 // その時点で観測された最大震度（陸上観測点）。チェックボックスで表示/非表示
-function updateObs(m,i){
+// その瞬間の最大震度のアイコン（EEW欄の左隣。「最大震度を表示」の設定とは無関係に常に出す）
+function updateMxIcon(m,show,mu){
+  const el=$('mxIco');
+  if(!show){ if(el._d!=='none'){ el.style.display='none'; el._d='none'; } return; }
+  if(el._d!=='flex'){ el.style.display='flex'; el._d='flex'; }
+  const c=(mu&&(m<0.5||shindoCls(m)<5))?-2:(m<0.5?-1:shindoCls(m));   // -2: 未入電（5弱以上が未入電で、入電済みの最大が5弱未満のとき）
+  if(el._k===c) return; el._k=c;
+  const box=el.querySelector('.mxb');
+  if(c===-2){ box.style.background=clsColor(5); box.style.color='#fff'; box.innerHTML=''; return; }
+  if(c<0){ box.style.background='#3a4357'; box.style.color='#93a0b8'; box.innerHTML='<span class="n">-</span>'; return; }
+  const L=CLASS_LABEL[c], n=L.charAt(0), s=L.length>1?L.slice(1):'';
+  box.style.background=clsColor(c); box.style.color=(c===2||c===3)?'#111':'#fff';
+  box.innerHTML='<span class="n">'+n+'</span>'+(s?'<span class="s">'+s+'</span>':'');
+}
+function updateObs(m,i,mu){
   const box=$('obs'), on=!!sim && $('showObs').checked;
   box.style.display=on?'flex':'none'; if(!on) return;
+  if(mu&&(m<0.5||i<0||shindoCls(m)<5)){
+    eewSet($('obsV'),'<span class="chip" style="background:'+clsColor(5)+';color:#fff">未入電</span>');
+    eewTxt($('obsA'),MUI>=0?(ANAMES[AREA[MUI]]||('区域'+AREA[MUI])):''); return; }
   if(m<0.5||i<0){ eewSet($('obsV'),'<span style="color:#93a0b8">—</span>'); eewTxt($('obsA'),''); return; }
   const c=shindoCls(m), tc=(c===2||c===3)?'#111':'#fff';
   eewSet($('obsV'),'<span class="chip" style="background:'+clsColor(c)+';color:'+tc+'">'+CLASS_LABEL[c]+'</span> '+fx1(m));
@@ -2828,7 +2875,7 @@ function buildEewCards(n){
   for(let i=0;i<n;i++){
     const c=document.createElement('div'); c.className='card eewcard lv0';
     c.innerHTML='<div class="eh"><span class="ett r-ett">緊急地震速報'+(n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span>地震'+(i+1):'')+'</span>'
-      +'<span class="lvbadge r-lv">待機中</span><span class="eno r-no"></span></div>'
+      +'</div>'
       +'<div class="tiles">'
       +'<div class="tile"><div class="k">予想最大震度</div><div class="v r-max"><span class="chipbig" style="background:#3a4357">-</span></div></div>'
       +'<div class="tile"><div class="k">マグニチュード</div><div class="v r-mag">-</div></div>'
@@ -2837,7 +2884,7 @@ function buildEewCards(n){
       +'<div class="warn r-warn"></div>'
       +'<details class="histbox"><summary>報の履歴</summary><table class="hist r-hist"></table></details>';
     box.appendChild(c);
-    const els={}; ['ett','lv','no','max','mag','dep','pos','warn','hist'].forEach(k=>els[k]=c.querySelector('.r-'+k));
+    const els={}; ['ett','max','mag','dep','pos','warn','hist'].forEach(k=>els[k]=c.querySelector('.r-'+k));
     eewCards.push({el:c, r:k=>els[k]});
   }
 }
@@ -2848,7 +2895,7 @@ function eewTitle(i,cur,lvmax){
   const n=sim?sim.quakes.length:1;
   const mk=n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span>地震'+(i+1):'';
   if(!cur) return '緊急地震速報'+mk;
-  return '緊急地震速報('+EEW_LBL[lvmax]+')　'+escH(cur.epiName||'震源付近')+'で地震　#'+cur.no+mk;
+  return '緊急地震速報('+EEW_LBL[lvmax]+')　'+escH(cur.epiName||'震源付近')+'で地震　#'+cur.no+(cur.final?'(最終)':'')+mk;
 }
 function updateEewCard(qk,i){
   const C=eewCards[i]; if(!C) return;
@@ -2859,7 +2906,6 @@ function updateEewCard(qk,i){
   if(!cur){
     card.className='card eewcard lv0';
     eewSet(R('ett'),eewTitle(i,null,0));
-    eewSet(R('lv'),e?'発表前':'発表なし'); eewSet(R('no'),'');
     eewSet(R('max'),'<span class="chipbig" style="background:#3a4357">-</span>');
     eewSet(R('mag'),'-'); eewSet(R('dep'),'-');
     eewTxt(R('pos'),e?(tcur<qk.delay?'発生前（'+qk.delay+'秒後に発生）':'観測点でP波を検知中…'):'発表基準に達しませんでした');
@@ -2868,8 +2914,6 @@ function updateEewCard(qk,i){
   }
   card.className='card eewcard lv'+lvmax;
   eewSet(R('ett'),eewTitle(i,cur,lvmax));
-  eewSet(R('lv'),EEW_LBL[lvmax]);
-  eewSet(R('no'),'第'+cur.no+'報'+(cur.final?'（最終）':''));
   const tc=(cur.maxCls===2||cur.maxCls===3)?'#111':'#fff';
   eewSet(R('max'),'<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
   eewSet(R('mag'),'M'+cur.mag.toFixed(1));
@@ -3423,6 +3467,28 @@ function audioPlay(name,prio,arg){
   aBusyPrio=prio; aBusyUntil=now+SFX[name](arg);
 }
 // 読み上げ。keep=true は話している最中でも順番待ちにする。長い文は「。」で区切って順に話す（途中で切れるのを防ぐ）
+// 読み上げの読み間違い対策: 読みを間違えやすい語を、ひらがなに置き換えてから読み上げる（長い語から順に置換）
+const YOMI=[
+ ['大津波警報','おおつなみけいほう'],['三八上北','さんぱちかみきた'],['九十九里','くじゅうくり'],['外房','そとぼう'],['内房','うちぼう'],
+ ['東京都23区','とうきょうとにじゅうさんく'],['23区','にじゅうさんく'],
+ ['石狩','いしかり'],['空知','そらち'],['後志','しりべし'],['胆振','いぶり'],['日高','ひだか'],['渡島','おしま'],['檜山','ひやま'],['上川','かみかわ'],
+ ['留萌','るもい'],['宗谷','そうや'],['網走','あばしり'],['十勝','とかち'],['釧路','くしろ'],['根室','ねむろ'],['内浦湾','うちうらわん'],['噴火湾','ふんかわん'],
+ ['色丹島','しこたんとう'],['択捉島','えとろふとう'],['国後島','くなしりとう'],
+ ['津軽','つがる'],['下北','しもきた'],['庄内','しょうない'],['村山','むらやま'],['最上','もがみ'],['置賜','おきたま'],['浜通り','はまどおり'],['中通り','なかどおり'],['会津','あいづ'],
+ ['三陸','さんりく'],['陸奥湾','むつわん'],['房総','ぼうそう'],['茨城','いばらき'],['栃木','とちぎ'],['群馬','ぐんま'],['埼玉','さいたま'],['神奈川','かながわ'],
+ ['多摩','たま'],['富士五湖','ふじごこ'],['三浦半島','みうらはんとう'],['相模湾','さがみわん'],['伊豆諸島','いずしょとう'],['伊豆','いず'],['小笠原','おがさわら'],['駿河湾','するがわん'],['遠州灘','えんしゅうなだ'],
+ ['上越','じょうえつ'],['中越','ちゅうえつ'],['下越','かえつ'],['佐渡','さど'],['能登','のと'],['加賀','かが'],['嶺北','れいほく'],['嶺南','れいなん'],['飛騨','ひだ'],['美濃','みの'],
+ ['伊勢','いせ'],['三河','みかわ'],['若狭','わかさ'],['淡路島','あわじしま'],['丹後','たんご'],['但馬','たじま'],['和歌山','わかやま'],['兵庫','ひょうご'],['熊野灘','くまのなだ'],['紀伊','きい'],
+ ['鳥取','とっとり'],['島根','しまね'],['隠岐','おき'],['出雲','いずも'],['石見','いわみ'],['瀬戸内','せとうち'],['愛媛','えひめ'],['東予','とうよ'],['中予','ちゅうよ'],['南予','なんよ'],
+ ['宇和海','うわかい'],['豊後水道','ぶんごすいどう'],['豊後','ぶんご'],['土佐湾','とさわん'],['伊予灘','いよなだ'],['安芸灘','あきなだ'],['周防灘','すおうなだ'],['響灘','ひびきなだ'],
+ ['筑豊','ちくほう'],['筑後','ちくご'],['北九州','きたきゅうしゅう'],['有明','ありあけ'],['島原半島','しまばらはんとう'],['壱岐','いき'],['対馬','つしま'],['五島','ごとう'],
+ ['阿蘇','あそ'],['球磨','くま'],['天草灘','あまくさなだ'],['天草','あまくさ'],['芦北','あしきた'],['日向灘','ひゅうがなだ'],['薩摩','さつま'],['大隅','おおすみ'],['十島村','としまむら'],
+ ['甑島','こしきしま'],['種子島','たねがしま'],['屋久島','やくしま'],['奄美','あまみ'],['錦江湾','きんこうわん'],
+ ['久米島','くめじま'],['大東島','だいとうじま'],['宮古島','みやこじま'],['石垣島','いしがきじま'],['与那国島','よなぐにじま'],['西表島','いりおもてじま'],['八重山','やえやま'],['本島','ほんとう'],
+ ['北東部','ほくとうぶ'],['北西部','ほくせいぶ'],['南東部','なんとうぶ'],['南西部','なんせいぶ'],['北中部','ほくちゅうぶ'],['中北部','ちゅうほくぶ'],['中南部','ちゅうなんぶ'],['中東部','ちゅうとうぶ'],['中西部','ちゅうせいぶ'],
+ ['北部','ほくぶ'],['南部','なんぶ'],['東部','とうぶ'],['西部','せいぶ'],['中部','ちゅうぶ'],['山沿い','やまぞい'],['平野部','へいやぶ'],['沿岸','えんがん'],['内陸','ないりく'],['近海','きんかい']
+].sort((a,b)=>b[0].length-a[0].length);
+function aYomi(t){ let s=String(t); for(const p of YOMI) if(s.indexOf(p[0])>=0) s=s.split(p[0]).join(p[1]); return s; }
 const aUtt=[]; let aSpeakAt=0, aPrimed=false;    // aUtt: 話している途中でブラウザに破棄されないよう参照を保持する
 function aPrimeSpeech(){            // iPhone等: 最初の操作の中で一度だけ無音の読み上げを行い、以後の自動読み上げを許可させる
   if(aPrimed||!aSp()||!window.speechSynthesis) return; aPrimed=true;
@@ -3437,7 +3503,7 @@ function audioSpeak(text,prio,keep){
     if(busy&&Date.now()-aSpeakAt>180000){ ss.cancel(); aUtt.length=0; busy=false; }   // 固まったときの復帰
     if(!aVoice) aVoice=(ss.getVoices()||[]).find(v=>/^ja/i.test(v.lang))||null;
     const parts=[]; let cur='';
-    text.split('。').forEach(s=>{ if(!s) return; s+='。'; if(cur&&(cur+s).length>90){ parts.push(cur); cur=''; } cur+=s; });
+    aYomi(text).split('。').forEach(s=>{ if(!s) return; s+='。'; if(cur&&(cur+s).length>90){ parts.push(cur); cur=''; } cur+=s; });
     if(cur) parts.push(cur);
     const go=()=>{
       try{ ss.resume(); }catch(e){}
@@ -3455,7 +3521,7 @@ function audioSpeak(text,prio,keep){
 function aMaxClsAt(t){
   if(!sim||!CUMV||CUMV.length!==sim.nf) return -1;
   let f=Math.round(Math.min(t,sim.tSeis)/sim.dt); if(f<0) f=0; if(f>sim.nf-1) f=sim.nf-1;
-  const m=CUMV[f]*0.1; return m<0.5?0:shindoCls(m);
+  const m=((muOn()&&CUMV2&&CUMV2.length===sim.nf)?CUMV2:CUMV)[f]*0.1; return m<0.5?0:shindoCls(m);
 }
 function aMxCls(r){ if(r.mx&&r.mx[0]>0) return r.mx[0]; let m=0; (r.areas||[]).forEach(a=>{ if(a[1]>m) m=a[1]; }); return m; }
 const SPK_CLS=['0','1','2','3','4','ごじゃく','ごきょう','ろくじゃく','ろっきょう','7'];     // 震度の読み（5弱=ごじゃく など）
@@ -3470,7 +3536,7 @@ function aTsuTxt1(r){ return (r.tsu!=null&&TSU_TXT[r.tsu])?TSU_TXT[r.tsu].replac
 function aAreaLines(r,minc,maxLines,cap,lead){
   const by={}; (r.areas||[]).forEach(a=>{ (by[a[1]]=by[a[1]]||[]).push(a[0]); });
   const cs=Object.keys(by).map(Number).filter(c=>c>=minc).sort((p,q)=>q-p).slice(0,maxLines);
-  return cs.map(c=>'震度'+aSh(c)+'を観測した地域は、'+aList(by[c],cap)+'。').join('');
+  return cs.map(c=>'震度'+aSh(c)+'、'+aList(by[c],cap)+'。').join('');
 }
 // 「何時何分ごろ、○○を震源とする最大震度○の地震が発生しました。地震の規模を示すマグニチュードは○、△△、△△で最大震度○を観測しました。」
 function aQuakeTxt(r,t0){
@@ -3486,7 +3552,7 @@ const INFO_SPK={
   gensen:(r,t0)=>{ const m=aMainMem(r); return '震源に関する情報。'+aClockTxt(m?m.delay:t0)+'ごろ、'+(m?m.epi+'を震源とする':'')+'地震がありました。'
     +(m?'震源の深さは'+aDepTxt(m)+'、マグニチュードは'+aMagTxt(m)+'です。':'')+aTsuTxt1(r); },
   gs:(r,t0)=>'震源・震度に関する情報。'+aQuakeTxt(r,t0)+aTsuTxt1(r),
-  kakuchi:(r,t0)=>{ const a=aQuakeTxt(r,t0), mc=aMxCls(r); const o=aAreaLines(r,3,3,6).replace(/^震度[^、]*を観測した地域は、[^。]*。/,'');
+  kakuchi:(r,t0)=>{ const a=aQuakeTxt(r,t0), mc=aMxCls(r); const o=aAreaLines(r,3,3,6).replace(/^震度[^、]*、[^。]*。/,'');
     return '各地の震度に関する情報。'+a+(o?'このほか、'+o:''); },
   genkou:(r,t0)=>{ const m=aMainMem(r); return '顕著な地震の震源要素更新のお知らせ。'+(m?m.epi+'を震源とする地震の、震源の深さは'+aDepTxt(m)+'、マグニチュードは'+aMagTxt(m)+'です。':'')+aTsuTxt1(r); }
 };
@@ -3602,8 +3668,17 @@ function tick(ts){
     if(tcur>=sim.tEnd){ tcur=sim.tEnd; playing=false; $('play').textContent='►'; }
     $('seek').value=tToS(tcur); $('tlabel').textContent=fmtT(tcur);
   }
-  lastTs=ts; draw(ts); updateInfo(ts); audioStep(ts); requestAnimationFrame(tick);
+  lastTs=ts;
+  // 再生中・地図の移動やズーム中・設定やスライダーの操作直後・時刻が動いたときだけ毎フレーム描く。
+  // それ以外（一時停止中や待機中）は描画を約4〜6fpsに間引く（以前は何も変わらなくても毎フレーム全観測点を描き直していた）
+  const mp=map.latLngToContainerPoint([0,0]), mk=mp.x+','+mp.y+','+map.getZoom();
+  if(playing||viewDirty||uiDirty||tcur!==lastDrawT||mk!==lastMapKey||ts-lastDrawTs>=(sim?250:160)){
+    draw(ts); lastDrawTs=ts; lastDrawT=tcur; lastMapKey=mk; uiDirty=false;
+  }
+  updateInfo(ts); audioStep(ts); requestAnimationFrame(tick);
 }
+let lastDrawTs=0, lastDrawT=-1, lastMapKey='', uiDirty=true;
+['input','change','click','keyup','pointerup'].forEach(e=>document.addEventListener(e,()=>{ uiDirty=true; },true));
 requestAnimationFrame(tick);
 
 $('play').onclick=()=>{
@@ -3632,8 +3707,19 @@ $('run').onclick=async()=>{
       for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
       if(v.gz) u=new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
       Q=new Int8Array(u.buffer,u.byteOffset,u.length);
-      { const nf=v.nf; CUMV=new Int16Array(nf); CUMI=new Int32Array(nf); let mv=-999, mi=-1;   // 陸上観測点の累積最大
-        for(let f=0;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++){ if(SEA&&SEA[i]) continue; const x=Q[o+i]; if(x>mv){ mv=x; mi=i; } } CUMV[f]=mv; CUMI[f]=mi; } }
+      { const nf=v.nf; CUMV=new Int16Array(nf); CUMI=new Int32Array(nf); CUMV2=new Int16Array(nf); CUMI2=new Int32Array(nf);
+        MUF=new Int32Array(N).fill(-1); MUFIRST=1e9; MUI=-1;
+        const pk=new Int16Array(N).fill(-128), on=new Int32Array(N).fill(-1);
+        for(let f=0;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++){ const x=Q[o+i]; if(x>pk[i]) pk[i]=x; if(x>=55&&on[i]<0) on[i]=f; } }
+        // 未入電: 計測震度5.5以上に達した陸上観測点が、確率 1-0.5^(計測震度-5.5) で未入電になる（6.5で1/2）。抽選は実行ごとに1回
+        for(let i=0;i<N;i++){ if((SEA&&SEA[i])||pk[i]<55) continue;
+          if(Math.random()<1-Math.pow(0.5,pk[i]/10-5.5)){ MUF[i]=on[i]; if(on[i]<MUFIRST){ MUFIRST=on[i]; MUI=i; } } }
+        let mv=-999, mi=-1, mv2=-999, mi2=-1;   // 陸上観測点の累積最大（CUMV2は未入電の観測点を除く）
+        for(let f=0;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++){ if(SEA&&SEA[i]) continue; const x=Q[o+i];
+            if(x>mv){ mv=x; mi=i; }
+            if(MUF[i]>=0&&f>=MUF[i]) continue;
+            if(x>mv2){ mv2=x; mi2=i; } }
+          CUMV[f]=mv; CUMI[f]=mi; CUMV2[f]=mv2; CUMI2[f]=mi2; } }
       PEAK=null; peakF=-1;
       v.quakes.forEach(q=>{ q.eew={reports:[]}; q.eewUpto=0; q.eewDone=false; });
       // 地震動の計算範囲(tSeis)の後ろに、津波・地震情報の発表が終わるまで時間軸を延長する
