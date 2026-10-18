@@ -1981,7 +1981,7 @@ def _shift_tsu(ts, delay):
     return {
         "reports": [dict(r, t=round(r["t"] + delay, 1),
                          areas=[dict(a, ts=round(a["ts"] + delay, 1)) for a in r["areas"]]) for r in ts["reports"]],
-        "obs": [{"a": o["a"], "m": [[round(t + delay, 1), h] for t, h in o["m"]], "pk": round(o["pk"] + delay, 1)}
+        "obs": [{"a": o["a"], "m": [[round(w[0] + delay, 1)] + list(w[1:]) for w in o["m"]], "pk": round(o["pk"] + delay, 1)}
                 for o in ts["obs"]],
         "end": round(ts["end"] + delay, 1) if ts["reports"] else 0.0,
     }
