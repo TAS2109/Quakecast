@@ -332,13 +332,18 @@ _PREF_PTS = {
     "沖縄県": [(127.68, 26.21), (127.9, 26.6), (124.15, 24.34), (123.0, 24.45)],
 }
 _PREF_REGION = {}
+# 最も大きな地域区分（9910 北海道 / 9920 東北 / 9931 関東 / 9932 伊豆諸島 / 9933 小笠原 / 9934 北陸 / 9935 甲信 /
+#   9936 東海 / 9941 近畿 / 9942 中国 / 9943 四国 / 9951 九州 / 9952 奄美(群島) / 9960 沖縄）
+_EEW_REGIONS = ["北海道", "東北", "関東", "伊豆諸島", "小笠原", "北陸", "甲信", "東海", "近畿", "中国", "四国", "九州", "奄美群島", "沖縄"]
+_EEW_ISLAND_REGIONS = ("伊豆諸島", "小笠原", "奄美群島")        # 地域内の一部でも対象なら、地域名だけで表記する
 for _reg, _prefs in {
     "北海道": ["北海道"],
     "東北": ["青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県"],
     "関東": ["茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県"],
-    "北陸・甲信越": ["新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県"],
-    "東海": ["岐阜県", "静岡県", "愛知県"],
-    "近畿": ["三重県", "滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県"],
+    "北陸": ["新潟県", "富山県", "石川県", "福井県"],
+    "甲信": ["山梨県", "長野県"],
+    "東海": ["岐阜県", "静岡県", "愛知県", "三重県"],
+    "近畿": ["滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県"],
     "中国": ["鳥取県", "島根県", "岡山県", "広島県", "山口県"],
     "四国": ["徳島県", "香川県", "愛媛県", "高知県"],
     "九州": ["福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県"],
@@ -346,6 +351,18 @@ for _reg, _prefs in {
 }.items():
     for _p in _prefs:
         _PREF_REGION[_p] = _reg
+
+
+def _area_region(nm, pref):
+    """区域名・都道府県 → 地域区分。東京都の伊豆諸島・小笠原、鹿児島県の奄美は別の地域区分にする"""
+    if pref == "東京都":
+        if nm.startswith("小笠原"):
+            return "小笠原"
+        if "伊豆諸島" in nm or nm.startswith(("伊豆大島", "利島", "新島", "神津島", "三宅島", "御蔵島", "八丈島", "青ヶ島")):
+            return "伊豆諸島"
+    if pref == "鹿児島県" and ("奄美" in nm or "トカラ" in nm):
+        return "奄美群島"
+    return _PREF_REGION[pref]
 
 
 def _build_area_geo():
@@ -373,7 +390,7 @@ def _build_area_geo():
         else:
             if nm.startswith("伊豆諸島") or nm.startswith("小笠原"):
                 pref = "東京都"
-        out[int(a)] = (pref, _PREF_REGION[pref])
+        out[int(a)] = (pref, _area_region(nm, pref))
     return out
 
 
@@ -381,35 +398,31 @@ AREA_GEO = _build_area_geo()
 
 # ---------------------------------------------------------------------
 # 緊急地震速報（警報）の対象地域の表記（気象庁の一般向けの表現に準拠）
-#   地方単位区域（複数県からなる地方の全県が対象）→「○○地方」／都道府県単位（県内の全区域）→「○○県」／
-#   県内の一部のみ →「○○県(北部、中部)」。離島の区域（伊豆諸島など）は「県内全域」の判定から除く（概略）。
+#   最も大きな地域区分は _EEW_REGIONS の14区分。区分内の全域が対象 →「東北」など区分名／
+#   区分内の一部のみ →「○○県」または「○○県(北部、中部)」。
+#   伊豆諸島・小笠原・奄美群島は独立した区分なので、一部でも対象なら区分名で表記する。
+#   沖縄の離島（大東島・宮古島・八重山）は「全域」の判定から除く（概略）。
 # ---------------------------------------------------------------------
-_EEW_REGIONS = [
-    ("北海道", ["北海道"]),
-    ("東北地方", ["青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県"]),
-    ("関東甲信地方", ["茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県", "山梨県", "長野県"]),
-    ("北陸地方", ["新潟県", "富山県", "石川県", "福井県"]),
-    ("東海地方", ["岐阜県", "静岡県", "愛知県", "三重県"]),
-    ("近畿地方", ["滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県"]),
-    ("中国地方", ["鳥取県", "島根県", "岡山県", "広島県"]),
-    ("四国地方", ["徳島県", "香川県", "愛媛県", "高知県"]),
-    ("九州北部地方", ["山口県", "福岡県", "佐賀県", "長崎県", "熊本県", "大分県"]),
-    ("九州南部・奄美地方", ["宮崎県", "鹿児島県"]),
-    ("沖縄県", ["沖縄県"]),
-]
 _EEW_REMOTE = ("伊豆諸島", "小笠原", "大東島", "宮古島", "八重山")
-_PREF_LAND = None
+_REG_LAND = None
 
 
-def _pref_land_areas():
-    global _PREF_LAND
-    if _PREF_LAND is None:
+def _reg_land_areas():
+    """地域区分 → 都道府県 → {区域ID: 区域名}（陸域のみ）"""
+    global _REG_LAND
+    if _REG_LAND is None:
         d = {}
         for a in np.unique(ST_AREA[ST_LAND]):
             a = int(a)
-            d.setdefault(AREA_GEO.get(a, ("", ""))[0], {})[a] = AREA_NAMES.get(a, "区域%d" % a)
-        _PREF_LAND = d
-    return _PREF_LAND
+            pf, rg = AREA_GEO.get(a, ("", ""))
+            d.setdefault(rg, {}).setdefault(pf, {})[a] = AREA_NAMES.get(a, "区域%d" % a)
+        _REG_LAND = d
+    return _REG_LAND
+
+
+def _pref_short(p):
+    """都道府県名の表記（「山梨県」→「山梨」、「東京都」→「東京」、「京都府」→「京都」。北海道はそのまま）"""
+    return p[:-1] if p[-1:] in "都府県" and len(p) > 2 else p
 
 
 def _eew_warn_text(areas):
@@ -417,13 +430,16 @@ def _eew_warn_text(areas):
     ids = {a["i"]: a["cls"] for a in areas if "i" in a}
     if not ids:
         return ""
-    pl = _pref_land_areas()
+    rl = _reg_land_areas()
+    pord = list(_PREF_PTS)
     items = []
-    for ri, (reg, prefs) in enumerate(_EEW_REGIONS):
-        act = [p for p in prefs if p in pl]
+    for ri, reg in enumerate(_EEW_REGIONS):
+        pm = rl.get(reg)
+        if not pm:
+            continue
         full, part, mx = [], [], 0
-        for p in act:
-            tot = pl[p]
+        for p in sorted(pm, key=lambda x: pord.index(x) if x in pord else 99):
+            tot = pm[p]
             hit = [a for a in tot if a in ids]
             if not hit:
                 continue
@@ -436,10 +452,10 @@ def _eew_warn_text(areas):
                 part.append((p, nms))
         if not full and not part:
             continue
-        if len(act) >= 2 and len(full) == len(act):
+        if reg in _EEW_ISLAND_REGIONS or (not part and len(full) == len(pm)):
             items.append((mx, ri, reg))
         else:
-            txt = [p for p in full] + ["%s(%s)" % (p, "、".join(n)) for p, n in part]
+            txt = [_pref_short(p) for p in full] + ["%s(%s)" % (_pref_short(p), "、".join(n)) for p, n in part]
             items.append((mx, ri, "、".join(txt)))
     items.sort(key=lambda x: (-x[0], x[1]))
     return "、".join(t for _, _, t in items)
@@ -3719,7 +3735,7 @@ function updateEewCard(qk,i){
   if(lvmax>=2){
     if(cur.areas.length){
       const byRegion=new Set(cur.areas.map(a=>a.pref)).size>6, best={};
-      cur.areas.forEach(a=>{ const key=byRegion?a.region:a.pref; if(!(key in best)||a.cls>best[key]) best[key]=a.cls; });
+      cur.areas.forEach(a=>{ const key=byRegion?a.region:a.pref.replace(/^(.+)[都府県]$/,'$1'); if(!(key in best)||a.cls>best[key]) best[key]=a.cls; });
       w='警報対象：'+Object.keys(best).sort((p,q)=>best[q]-best[p]).join('、');
     }else w='警報対象：該当地域なし';
   }
@@ -4352,6 +4368,7 @@ function audioPlay(name,prio,arg){
 // 読み上げ。keep=true は話している最中でも順番待ちにする。長い文は「。」で区切って順に話す（途中で切れるのを防ぐ）
 // 読み上げの読み間違い対策: 読みを間違えやすい語を、ひらがなに置き換えてから読み上げる（長い語から順に置換）
 const YOMI=[
+ ['奄美群島','あまみぐんとう'],['北海道','ほっかいどう'],['東北','とうほく'],['関東','かんとう'],['北陸','ほくりく'],['甲信','こうしん'],['東海','とうかい'],['近畿','きんき'],['中国','ちゅうごく'],['四国','しこく'],['九州','きゅうしゅう'],['沖縄','おきなわ'],
  ['大津波警報','おおつなみけいほう'],['三八上北','さんぱちかみきた'],['九十九里','くじゅうくり'],['外房','そとぼう'],['内房','うちぼう'],
  ['東京都23区','とうきょうとにじゅうさんく'],['23区','にじゅうさんく'],
  ['石狩','いしかり'],['空知','そらち'],['後志','しりべし'],['胆振','いぶり'],['日高','ひだか'],['渡島','おしま'],['檜山','ひやま'],['上川','かみかわ'],
@@ -4465,16 +4482,10 @@ function aTsuTxt(st,top){
 const aTsuLv=m=>(m>=5?1:0)+(m>=3?1:0)+(m>=1?1:0)+(m>0?1:0);
 // (t0,t1] の間に起きた「鳴らす出来事」を集める（p が大きいほど重要）
 // 警報の対象地域を、読み上げ用の地方名（東北・関東・北陸・甲信…）にまとめる。予想震度の大きい地方から順に並べる
-const EEW_SPK_REG={'北海道':'北海道','青森県':'東北','岩手県':'東北','宮城県':'東北','秋田県':'東北','山形県':'東北','福島県':'東北',
-  '茨城県':'関東','栃木県':'関東','群馬県':'関東','埼玉県':'関東','千葉県':'関東','東京都':'関東','神奈川県':'関東',
-  '新潟県':'北陸','富山県':'北陸','石川県':'北陸','福井県':'北陸','山梨県':'甲信','長野県':'甲信',
-  '岐阜県':'東海','静岡県':'東海','愛知県':'東海','三重県':'東海','滋賀県':'近畿','京都府':'近畿','大阪府':'近畿','兵庫県':'近畿','奈良県':'近畿','和歌山県':'近畿',
-  '鳥取県':'中国','島根県':'中国','岡山県':'中国','広島県':'中国','山口県':'中国','徳島県':'四国','香川県':'四国','愛媛県':'四国','高知県':'四国',
-  '福岡県':'九州北部','佐賀県':'九州北部','長崎県':'九州北部','熊本県':'九州北部','大分県':'九州北部','宮崎県':'九州南部','鹿児島県':'九州南部','沖縄県':'沖縄'};
-const EEW_SPK_ORD=['北海道','東北','関東','北陸','甲信','東海','近畿','中国','四国','九州北部','九州南部','沖縄'];
+const EEW_SPK_ORD=['北海道','東北','関東','伊豆諸島','小笠原','北陸','甲信','東海','近畿','中国','四国','九州','奄美群島','沖縄'];
 function eewRegionsTxt(areas){
   const best={};
-  (areas||[]).forEach(a=>{ const g=EEW_SPK_REG[a.pref]; if(!g) return; if(!(g in best)||a.cls>best[g]) best[g]=a.cls; });
+  (areas||[]).forEach(a=>{ const g=a.region; if(!g||EEW_SPK_ORD.indexOf(g)<0) return; if(!(g in best)||a.cls>best[g]) best[g]=a.cls; });
   const ks=Object.keys(best).sort((p,q)=>best[q]-best[p]||EEW_SPK_ORD.indexOf(p)-EEW_SPK_ORD.indexOf(q));
   return ks.join('、');
 }
