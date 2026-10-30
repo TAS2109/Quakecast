@@ -380,6 +380,71 @@ def _build_area_geo():
 AREA_GEO = _build_area_geo()
 
 # ---------------------------------------------------------------------
+# 緊急地震速報（警報）の対象地域の表記（気象庁の一般向けの表現に準拠）
+#   地方単位区域（複数県からなる地方の全県が対象）→「○○地方」／都道府県単位（県内の全区域）→「○○県」／
+#   県内の一部のみ →「○○県(北部、中部)」。離島の区域（伊豆諸島など）は「県内全域」の判定から除く（概略）。
+# ---------------------------------------------------------------------
+_EEW_REGIONS = [
+    ("北海道", ["北海道"]),
+    ("東北地方", ["青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県"]),
+    ("関東甲信地方", ["茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県", "山梨県", "長野県"]),
+    ("北陸地方", ["新潟県", "富山県", "石川県", "福井県"]),
+    ("東海地方", ["岐阜県", "静岡県", "愛知県", "三重県"]),
+    ("近畿地方", ["滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県"]),
+    ("中国地方", ["鳥取県", "島根県", "岡山県", "広島県"]),
+    ("四国地方", ["徳島県", "香川県", "愛媛県", "高知県"]),
+    ("九州北部地方", ["山口県", "福岡県", "佐賀県", "長崎県", "熊本県", "大分県"]),
+    ("九州南部・奄美地方", ["宮崎県", "鹿児島県"]),
+    ("沖縄県", ["沖縄県"]),
+]
+_EEW_REMOTE = ("伊豆諸島", "小笠原", "大東島", "宮古島", "八重山")
+_PREF_LAND = None
+
+
+def _pref_land_areas():
+    global _PREF_LAND
+    if _PREF_LAND is None:
+        d = {}
+        for a in np.unique(ST_AREA[ST_LAND]):
+            a = int(a)
+            d.setdefault(AREA_GEO.get(a, ("", ""))[0], {})[a] = AREA_NAMES.get(a, "区域%d" % a)
+        _PREF_LAND = d
+    return _PREF_LAND
+
+
+def _eew_warn_text(areas):
+    """警報対象地域（区域のリスト）→ 発表文の地域表記。件数の上限なし"""
+    ids = {a["i"]: a["cls"] for a in areas if "i" in a}
+    if not ids:
+        return ""
+    pl = _pref_land_areas()
+    items = []
+    for ri, (reg, prefs) in enumerate(_EEW_REGIONS):
+        act = [p for p in prefs if p in pl]
+        full, part, mx = [], [], 0
+        for p in act:
+            tot = pl[p]
+            hit = [a for a in tot if a in ids]
+            if not hit:
+                continue
+            mx = max([mx] + [ids[a] for a in hit])
+            main = {a for a, nm in tot.items() if not any(k in nm for k in _EEW_REMOTE)} or set(tot)
+            if main <= set(hit):
+                full.append(p)
+            else:
+                nms = [(tot[a][len(p):] if tot[a].startswith(p) and len(tot[a]) > len(p) else tot[a]) for a in sorted(hit)]
+                part.append((p, nms))
+        if not full and not part:
+            continue
+        if len(act) >= 2 and len(full) == len(act):
+            items.append((mx, ri, reg))
+        else:
+            txt = [p for p in full] + ["%s(%s)" % (p, "、".join(n)) for p, n in part]
+            items.append((mx, ri, "、".join(txt)))
+    items.sort(key=lambda x: (-x[0], x[1]))
+    return "、".join(t for _, _, t in items)
+
+# ---------------------------------------------------------------------
 # 海底観測網（S-net・DONET・N-net・気象庁の海底地震計など）: data/seafloor.csv（任意）
 #   列: name, network, lon, lat [, arv, dep]     先頭が # の行はコメント
 #   arv/dep が空なら、最寄りの陸上観測点5点の中央値を使う（地盤増幅の実測値が無いための仮置き）。
@@ -1584,13 +1649,11 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     pf, rg = AREA_GEO.get(int(a), ("その他", "その他"))
                     areas.append({"name": AREA_NAMES.get(int(a), "区域%d" % int(a)),
                                   "pref": pf, "region": rg,
-                                  "label": lb, "cls": c,
+                                  "label": lb, "cls": c, "i": int(a),
                                   "ts": round(float(ats[a]), 1) if np.isfinite(ats[a]) else None})
-                    if len(areas) >= 60:
-                        break
                 for a_ in areas:                    # 発表済みの対象地域は取り消さない
                     warned[a_["name"]] = a_
-                areas = sorted(warned.values(), key=lambda x: -x["cls"])[:60]
+                areas = sorted(warned.values(), key=lambda x: -x["cls"])
 
             if lv >= 1:
                 after_peak = is_last                  # 発表終了の目安に達した → 最終報
@@ -1628,7 +1691,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                             "epiName": epi_name,
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
-                            "maxCls": cls_e, "plum": bool(plum_used), "deepEst": deep_est, "lv": lv, "areas": areas, "final": after_peak,
+                            "maxCls": cls_e, "plum": bool(plum_used), "deepEst": deep_est, "lv": lv, "areas": areas, "wtxt": _eew_warn_text(areas), "final": after_peak,
                             # 観測点ごとの予想震度（×10, int8, base64）: 地図の塗りつぶし用
                             "pq": base64.b64encode(np.clip(np.round(np.nan_to_num(pq_vals, nan=-9.0) * 10.0), -127, 127)
                                                    .astype(np.int8).tobytes()).decode("ascii")}
@@ -1804,8 +1867,6 @@ def build_info(quakes, groups, grp_rt, tsus, dt):
             e = [AREA_NAMES.get(int(a), "区域%d" % int(a)), c_, _t1(v), int(cc[a]) if cnt else None,
                  AREA_GEO.get(int(a), ("", ""))[0]]
             res.append(e)
-            if len(res) >= 150:
-                break
         return res
 
     out, end, end0 = [], 0.0, 0.0
@@ -1912,9 +1973,12 @@ def build_info(quakes, groups, grp_rt, tsus, dt):
             tgk = max(tlast + 1500.0 + jit(-60, 61), tk + 600.0)
             add(tgk, "genkou", False, mem=mem_at(tgk, len(members) - 1), old=[m["mag1"] for m in members],
                 tsu=tsu_at(tgk))
+        # 計測震度（小数第1位）は震度階級より大幅に遅れて発表する: 最後の地震の約2時間後の「各地の震度に関する情報」で初めて載せる
+        tkm = max(tlast + 7200.0 + jit(-300, 301), tk + 3600.0)
+        add(tkm, "kakuchi", True, mem=mem_at(tkm, len(members) - 1), areas=areas_ge(row_at(tkm), 1, True), dtl=True)
         rels.sort(key=lambda r: r["t"])
         end = max(end, rels[-1]["t"])
-        end0 = max(end0, max([r_["t"] for r_ in rels if r_["k"] != "genkou"] or [0.0]))
+        end0 = max(end0, max([r_["t"] for r_ in rels if r_["k"] != "genkou" and not r_.get("dtl")] or [0.0]))
         out.append({"t0": t0g, "members": mem_at(1e9, len(members) - 1), "releases": rels})
     return {"groups": out, "end": round(end + 20.0, 1), "end0": round(end0 + 20.0, 1)}
 
@@ -2559,8 +2623,8 @@ def api_simulate():
     if not (1 <= len(quakes) <= MAX_QUAKES):
         return _json_response({"error": "地震は1〜%d個まで指定できます" % MAX_QUAKES}, 400)
     for q in quakes:
-        if not (10.0 <= q["lat"] <= 55.0 and 110.0 <= q["lon"] <= 165.0):
-            return _json_response({"error": "震源は日本周辺（緯度10〜55, 経度110〜165）で指定してください"}, 400)
+        if not (-10.0 <= q["lat"] <= 70.0 and 90.0 <= q["lon"] <= 180.0):
+            return _json_response({"error": "震源は北緯-10〜70度（負は南緯）、東経90〜180度の範囲で指定してください"}, 400)
         q["mag"] = min(max(q["mag"], 0.0), 15.0)
         q["depth"] = min(max(q["depth"], 0.0), 699.0)
         q["delay"] = float(int(round(min(max(q["delay"], 0.0), 300.0))))   # 発生時刻（秒後）: 整数秒
@@ -2662,6 +2726,7 @@ INDEX_HTML = r"""<!doctype html>
   input[type=number],select{width:100%;padding:7px 8px;border-radius:7px;border:1px solid var(--line);
     background:#0e131c;color:var(--txt);font-size:14px}
   input[type=range]{width:100%}
+  input[type=checkbox],input[type=radio]{flex:none!important;width:16px!important;height:16px!important;min-width:16px!important;min-height:16px!important;margin:0 4px 0 0;accent-color:var(--acc)}
   button{cursor:pointer;border:1px solid var(--line);background:#1d2636;color:var(--txt);
     border-radius:8px;padding:8px 12px;font-size:14px}
   button:hover{background:#26324a}
@@ -2679,6 +2744,9 @@ INDEX_HTML = r"""<!doctype html>
   #runFab.idle{animation:runpulse 1.6s infinite}
   @keyframes runpulse{50%{box-shadow:0 0 0 9px #3b9cff44,0 4px 14px #000a}}
   #toggle{position:absolute;z-index:1200;top:10px;left:10px;display:none;padding:7px 10px}
+  #rcToggle{position:absolute;z-index:1200;top:10px;right:10px;display:none;padding:7px 10px}
+  .pclose{display:none;float:right;padding:3px 10px;font-size:12px}
+  body.rcHide #rightcol{display:none}
   table{width:100%;border-collapse:collapse;font-size:12.5px}
   td{padding:3px 4px;border-bottom:1px solid #222b3b}
   td.num{text-align:right;white-space:nowrap}
@@ -2697,6 +2765,10 @@ INDEX_HTML = r"""<!doctype html>
   #simClk #clkD{font-size:10.5px;color:#9fb0cf}
   #simClk .clkCtl{display:none;margin-top:4px;gap:4px;align-items:center;justify-content:flex-end}
   #simClk.edit .clkCtl{display:flex}
+  #simClk .clkHint{font-size:11px;color:#7fb8ff;cursor:pointer;margin-top:2px;text-decoration:underline}
+  #simClk.edit .clkHint{display:none}
+  #simClk{border-color:#3b6fb5;cursor:pointer}
+  #simClk #clkT{text-decoration:underline dotted #7fb8ff;text-underline-offset:3px}
   #simClk input{background:#0e1422;color:#e6ecf8;border:1px solid #2c3a57;border-radius:4px;font-size:11px;padding:2px 3px}
   #simClk button{background:#2c3a57;color:#e6ecf8;border:0;border-radius:4px;font-size:11px;padding:3px 6px;cursor:pointer}
   #bar{position:absolute;z-index:1000;left:50%;bottom:26px;transform:translateX(-50%);
@@ -2800,7 +2872,7 @@ INDEX_HTML = r"""<!doctype html>
   #imLegend{position:absolute;z-index:1000;left:10px;bottom:10px;display:flex;gap:3px;align-items:center;padding:5px 7px;
     background:var(--panel);border:1px solid var(--line);border-radius:8px;font-size:11px;color:var(--sub)}
   #imLegend .chip{min-width:0;padding:1px 5px;font-size:11px}
-  .imk{display:flex;align-items:center;justify-content:center;width:100%;height:100%;border:1px solid #0b1220;border-radius:5px;
+  .imk{display:flex;align-items:center;justify-content:center;width:100%;height:100%;border:1px solid #0b1220;border-radius:2px;
     font-size:11px;font-weight:800;line-height:1;box-shadow:0 0 0 1px #0008}
   #infoBody{flex:1 1 45%;min-width:0;overflow:auto;padding:14px 16px 40px}
   .itw{max-height:340px;overflow:auto}
@@ -2848,9 +2920,15 @@ INDEX_HTML = r"""<!doctype html>
   }
   @media (max-width:700px){
     #bar{bottom:calc(14px + env(safe-area-inset-bottom,0px))}
-    #tabbar{top:50px;left:10px;right:auto}
-    #mxIco{right:auto;left:10px;bottom:226px}
-    #infoView{padding-top:92px}
+    #tabbar{top:10px;left:74px;right:auto}
+    #tabbar button{padding:6px 10px;font-size:12px}
+    #mxIco{right:auto;left:10px;bottom:calc(240px + env(safe-area-inset-bottom,0px))}
+    #infoView{padding-top:54px}
+    #simClk{right:auto;left:10px;bottom:calc(172px + env(safe-area-inset-bottom,0px))}
+    #simClk #clkT{font-size:15px}
+    #runFab{left:auto;right:10px;transform:none;bottom:calc(172px + env(safe-area-inset-bottom,0px));padding:9px 16px;font-size:14px}
+    .pclose{display:inline-block}
+    #rcToggle{display:block}
     #infoHead{padding-right:16px}
     #infoMain{flex-direction:column}
     #infoMapCol{flex:none;height:42%;border-right:none;border-bottom:1px solid var(--line)}
@@ -2858,7 +2936,7 @@ INDEX_HTML = r"""<!doctype html>
     #panel{width:calc(100% - 20px);max-height:62%;top:92px;display:none}
     #panel.open{display:block}
     #toggle{display:block}
-    #hud{top:10px;left:auto;right:60px;transform:none;padding:5px 9px;gap:8px;font-size:12px}
+    #hud{top:50px;left:10px;right:10px;transform:none;padding:5px 9px;gap:8px;font-size:12px;justify-content:space-between}
     #hud .lbl{display:none}
     #rightcol{top:92px;width:min(320px,calc(100% - 20px));max-height:calc(100% - 230px)}
   }
@@ -2867,10 +2945,11 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <div id="map"></div>
 <button id="toggle">設定</button>
+<button id="rcToggle" type="button">情報 ▲</button>
 <button id="runFab" class="idle" title="現在の地震設定でシミュレーションを実行（Enterキーでも可）">► シミュレーション実行</button>
 
 <div id="panel" class="open">
-  <h1>Quakecast</h1>
+  <h1>Quakecast<button id="panelClose" class="pclose" type="button">✕ 閉じる</button></h1>
 
   <h2>① 地震（複数指定できます）</h2>
   <div id="qlist"></div>
@@ -2884,9 +2963,9 @@ INDEX_HTML = r"""<!doctype html>
     <button id="slImp" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">↑ ファイル</button>
     <input id="slFile" type="file" accept=".json,application/json" style="display:none">
   </div>
-  <div class="hint">選択中の地震の震源は、地図をクリックして設定できます。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
+  <div class="hint">選択中の地震の震源は、地図をクリックして設定できます（北緯-10〜70°・東経90〜180°）。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
 
-  <label style="display:flex;align-items:center;gap:6px;margin-top:10px"><input id="showPred" type="checkbox" checked style="width:auto"> 予想震度を地図に薄く塗る</label>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:10px">地図の塗りつぶし <select id="fillMode" style="width:auto;flex:1"><option value="both" selected>警報対象＋予想震度</option><option value="pred">予想震度</option><option value="warn">警報対象範囲</option><option value="off">塗りつぶさない</option></select></label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" style="width:auto"> その時点で観測された最大震度を表示（各観測点の最大値を保持）</label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="muOn" type="checkbox" style="width:auto"> 震度計が未入電となる可能性（計測震度5.5以上の観測点が、震度が大きいほど高い確率で「未入電(5弱以上)」になる。確率は低め：6.5で約1割）</label>
   <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,.12)">
@@ -2897,7 +2976,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px">海底震度計
     <select id="seaMode" style="width:auto"><option value="thin" selected>薄く表示（数字なし）</option><option value="off">非表示</option><option value="normal">通常表示</option></select></label>
-  <div class="hint">黄色の○＋＝EEW推定震源／✕＝設定した震源（番号は地震番号）／地図の薄い塗り＝予想震度</div>
+  <div class="hint">黄色の○＋＝EEW推定震源／✕＝設定した震源（番号は地震番号）／地図の塗り＝予想震度／赤＝警報対象範囲（上の設定で切替）</div>
 
   <h2>② プリセット（選択中の地震に適用）</h2>
   <div class="presets" id="presets"></div>
@@ -2975,8 +3054,8 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
-<div id="simClk" title="クリックで時刻を変更"><div id="clkT">--:--:--</div><div id="clkD"></div>
-    <div class="clkCtl"><input type="datetime-local" step="1" id="clkIn"><button id="clkNow" type="button">現在時刻</button></div></div>
+<div id="simClk" title="クリックで時刻を変更"><div id="clkT">--:--:--</div><div id="clkD"></div><div class="clkHint" id="clkHint">✎ タップして時刻を設定</div>
+    <div class="clkCtl"><input type="datetime-local" step="1" id="clkIn"><button id="clkNow" type="button">現在時刻</button><button id="clkClose" type="button">閉じる</button></div></div>
   <div id="bar">
   <div id="ctl">
     <button id="restart" title="最初に戻る">|◄</button>
@@ -3044,7 +3123,7 @@ function clsColor(k){ const c=CLASS_RGB[k]; return 'rgb('+c[0]+','+c[1]+','+c[2]
 })();
 
 /* ---------- 地図 ---------- */
-const map = L.map('map',{zoomSnap:0.25,minZoom:4,maxZoom:11,worldCopyJump:false,zoomAnimation:false,markerZoomAnimation:false,fadeAnimation:false}).setView([36.3,137.6],5.5);
+const map = L.map('map',{zoomSnap:0.25,minZoom:3,maxZoom:11,worldCopyJump:false,zoomAnimation:false,markerZoomAnimation:false,fadeAnimation:false}).setView([36.3,137.6],5.5);
 const ESRI='https://server.arcgisonline.com/ArcGIS/rest/services/';
 const esri=(path,attr,maxNative)=>L.tileLayer(ESRI+path+'/MapServer/tile/{z}/{y}/{x}',
   {attribution:attr,maxNativeZoom:maxNative||16,maxZoom:19});
@@ -3083,8 +3162,8 @@ function renderQuakes(){
     const b=document.createElement('div'); b.className='qb'+(i===selQ?' sel':''); b.style.borderLeftColor=QCOL[i%QCOL.length];
     b.innerHTML='<div class="qh"><b>地震'+(i+1)+'</b><span class="qd">'+(i===selQ?'地図クリックで震源を設定':'')+'</span>'
       +(QS.length>1?'<button class="qx" title="この地震を削除">✕</button>':'')+'</div>'
-      +'<div class="row"><div><label>緯度</label><input data-f="lat" type="number" step="0.01"></div>'
-      +'<div><label>経度</label><input data-f="lon" type="number" step="0.01"></div></div>'
+      +'<div class="row"><div><label>北緯（°）</label><input data-f="lat" type="number" min="-10" max="70" step="0.01"></div>'
+      +'<div><label>東経（°）</label><input data-f="lon" type="number" min="90" max="180" step="0.01"></div></div>'
       +'<label>マグニチュード（スライダーは9.9まで／右の欄は15まで入力可）</label>'
       +'<div class="row" style="align-items:center"><div style="flex:2.2"><input data-f="magr" type="range" min="0" max="9.9" step="0.1"></div>'
       +'<div><input data-f="mag" type="number" min="0" max="15" step="0.1"></div></div>'
@@ -3095,8 +3174,10 @@ function renderQuakes(){
     F('mag').value=q.mag.toFixed(1); F('magr').value=Math.min(q.mag,9.9);
     F('depth').value=q.depth; F('delay').value=q.delay;
     const num=(f,fn)=>F(f).addEventListener('input',()=>{ const v=parseFloat(F(f).value); if(isFinite(v)) fn(v); });
-    num('lat',v=>{ q.lat=v; syncMarkers(); });
-    num('lon',v=>{ q.lon=v; syncMarkers(); });
+    num('lat',v=>{ q.lat=clampN(v,-10,70); syncMarkers(); });
+    num('lon',v=>{ q.lon=clampN(v,90,180); syncMarkers(); });
+    F('lat').addEventListener('change',()=>{ F('lat').value=q.lat.toFixed(2); });
+    F('lon').addEventListener('change',()=>{ F('lon').value=q.lon.toFixed(2); });
     num('mag',v=>{ q.mag=clampN(v,0,15); F('magr').value=Math.min(q.mag,9.9); });
     num('depth',v=>{ q.depth=clampN(v,0,699); });
     num('delay',v=>{ q.delay=Math.round(clampN(v,0,300)); });
@@ -3116,7 +3197,7 @@ function renderQuakes(){
   $('qadd').textContent=QS.length>=MAX_Q?'地震は最大'+MAX_Q+'個までです':'＋ 地震を追加';
 }
 function setEpi(lat,lon,pan){
-  lat=Math.round(lat*100)/100; lon=Math.round(lon*100)/100;
+  lat=Math.round(clampN(lat,-10,70)*100)/100; lon=Math.round(clampN(lon,90,180)*100)/100;
   const q=QS[selQ]; q.lat=lat; q.lon=lon;
   const b=$('qlist').children[selQ];
   if(b){ b.querySelector('[data-f="lat"]').value=lat.toFixed(2); b.querySelector('[data-f="lon"]').value=lon.toFixed(2); }
@@ -3213,6 +3294,8 @@ PRESETS.forEach(p=>{
   };
   $('presets').appendChild(b); }
 $('toggle').onclick=()=>$('panel').classList.toggle('open');
+$('panelClose').onclick=()=>$('panel').classList.remove('open');
+$('rcToggle').onclick=()=>{ const h=document.body.classList.toggle('rcHide'); $('rcToggle').textContent=h?'情報 ▼':'情報 ▲'; };
 if(window.innerWidth<=700) $('panel').classList.remove('open');
 
 /* ---------- 観測点 ---------- */
@@ -3326,15 +3409,16 @@ function loadGeo(){
     console.log('areas.geojson: '+hit+'/'+gj.features.length+' features matched');
   }).catch(()=>{});
 }
-function drawPredPolygons(pv,z){
+function drawPredPolygons(pv,z,warn,mode){
   const val=new Float32Array(AM.length).fill(-99);
-  for(let i=0;i<N;i++) val[AREA[i]]=pv[i]/10;
+  if(pv) for(let i=0;i<N;i++) val[AREA[i]]=pv[i]/10;
   const s=256*Math.pow(2,z), p0=map.latLngToContainerPoint([0,0]);
   const ox=p0.x-0.5*s, oy=p0.y-0.5*s, W=cv.width/(window.devicePixelRatio||1), H=cv.height/(window.devicePixelRatio||1);
   ctx.save(); ctx.globalAlpha=0.38;
-  for(let c=1;c<10;c++){
+  for(let c=1;c<10&&pv&&mode!=='warn';c++){
     ctx.fillStyle=clsColor(c); ctx.beginPath(); let any=false;
     for(const g of GEO){
+      if(warn&&warn.has(g.id)) continue;
       const v=val[g.id]; if(!(v>=0.5) || shindoCls(v)!==c) continue;
       for(const r of g.rings){
         let minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
@@ -3345,6 +3429,12 @@ function drawPredPolygons(pv,z){
       }
     }
     if(any) ctx.fill('evenodd');
+  }
+  if(warn&&warn.size){                                 // 警報対象範囲は赤で塗る
+    ctx.globalAlpha=0.5; ctx.fillStyle='#ff2a2a'; ctx.beginPath(); let any2=false;
+    for(const g of GEO){ if(!warn.has(g.id)) continue;
+      for(const r of g.rings){ for(let i=0;i<r.length;i+=2){ const x=ox+r[i]*s, y=oy+r[i+1]*s; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); } ctx.closePath(); any2=true; } }
+    if(any2) ctx.fill('evenodd');
   }
   ctx.restore();
 }
@@ -3358,6 +3448,9 @@ function predOf(rep){
   }
   return rep._pv;
 }
+function warnAreaSet(){                               // 警報対象になっている区域ID（全地震の最新のEEWの和集合）
+  const st=new Set(); for(const cur of eewCurs){ if(cur&&cur.areas) for(const a of cur.areas) if(a.i!=null) st.add(a.i); } return st;
+}
 function mergedPred(){                                 // 各地震の現在の予想震度を、観測点ごとに最大で合成
   const list=[]; for(const cur of eewCurs){ if(cur&&cur.pq){ const pv=predOf(cur); if(pv.length===N) list.push(pv); } }
   if(!list.length) return null;
@@ -3366,8 +3459,8 @@ function mergedPred(){                                 // 各地震の現在の�
   for(let k=1;k<list.length;k++){ const pv=list[k]; for(let i=0;i<N;i++) if(pv[i]>out[i]) out[i]=pv[i]; }
   return out;
 }
-function drawPredFill(pv,z){
-  if(GEO && GEO.length){ drawPredPolygons(pv,z); return; }   // 区域境界データがあればそちらで塗る
+function drawPredFill(pv,z,warn,mode){
+  if(GEO && GEO.length){ drawPredPolygons(pv,z,warn,mode); return; }   // 区域境界データがあればそちらで塗る
   const dpr=window.devicePixelRatio||1, w=cv.width, h=cv.height;
   if(!predCv) predCv=document.createElement('canvas');
   if(predCv.width!==w||predCv.height!==h){ predCv.width=w; predCv.height=h; }
@@ -3376,13 +3469,16 @@ function drawPredFill(pv,z){
   const mpp=156543.03*Math.cos(36*Math.PI/180)/Math.pow(2,z);   // m/px
   const r=Math.max(6,22000/mpp);                                // 観測点1つが受け持つ半径≈22km
   const byCls=[]; for(let k=0;k<10;k++) byCls.push([]);
-  for(let i=0;i<N;i++){ const v=pv[i]/10; if(v>=0.5) byCls[shindoCls(v)].push(i); }
+  if(pv&&mode!=='warn') for(let i=0;i<N;i++){ if(warn&&warn.has(AREA[i])) continue; const v=pv[i]/10; if(v>=0.5) byCls[shindoCls(v)].push(i); }
   for(let k=1;k<10;k++){                                        // 弱い階級から順に、強い階級を上書き
     const b=byCls[k]; if(!b.length) continue;
     g.fillStyle=clsColor(k); g.beginPath();
     for(let j=0;j<b.length;j++){ const i=b[j]; g.moveTo(PX[i]+r,PY[i]); g.arc(PX[i],PY[i],r,0,6.2832); }
     g.fill();
   }
+  if(warn&&warn.size){ g.fillStyle='#ff2a2a'; g.beginPath();
+    for(let i=0;i<N;i++){ if(!warn.has(AREA[i])||(SEA&&SEA[i])) continue; g.moveTo(PX[i]+r,PY[i]); g.arc(PX[i],PY[i],r,0,6.2832); }
+    g.fill(); }
   ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=0.3;
   ctx.drawImage(predCv,0,0); ctx.restore();
 }
@@ -3427,7 +3523,9 @@ function draw(ts){
     buckets[lutK(DV[i])].push(i);
   }
   // EEWの予想震度で地図を薄く塗りつぶす（観測点ごとの予想震度の階級色。高い階級を上に重ねる）
-  if(sim && !clr && $('showPred').checked){ const pv=mergedPred(); if(pv) drawPredFill(pv,z); }
+  { const fm=$('fillMode').value;
+    if(sim && !clr && fm!=='off'){ const pv=(fm==='warn')?null:mergedPred(), wa=(fm==='pred')?null:warnAreaSet();
+      if(pv||(wa&&wa.size)) drawPredFill(pv,z,wa,fm); } }
   // 海底震度計: 薄く（数字・縁取りなし、小さめ）。陸上の観測点より先に描いて下に敷く
   if(!clr && seaMode==='thin' && SEAIDX.length){
     ctx.save(); ctx.globalAlpha=0.3;
@@ -3651,7 +3749,9 @@ function clkSetTo(ms){ if(ms===null){ clkOrigin=null; if(sim) simClock0=Date.now
 setInterval(clkRefresh,250);
 document.addEventListener('DOMContentLoaded',()=>{
   const box=document.getElementById('simClk'), inp=document.getElementById('clkIn');
-  document.getElementById('clkT').onclick=()=>{ box.classList.toggle('edit'); inp.value=clkLocalStr(clkNowMs()); };
+  const clkTg=()=>{ box.classList.toggle('edit'); inp.value=clkLocalStr(clkNowMs()); };
+  document.getElementById('clkT').onclick=clkTg; document.getElementById('clkHint').onclick=clkTg;
+  document.getElementById('clkClose').onclick=()=>box.classList.remove('edit');
   inp.onchange=()=>{ const ms=Date.parse(inp.value); if(!isNaN(ms)) clkSetTo(ms); };
   document.getElementById('clkNow').onclick=()=>{ clkSetTo(null); inp.value=clkLocalStr(Date.now()); };
   clkRefresh(); });
@@ -3881,7 +3981,7 @@ function updateTsu(ts,st){
     const r=st.last, many=sim.quakes.length>1;
     // 発令・続報の文面は、全地震を合わせた現在の最高階級に合わせる（地震ごとの文面だと他の地震の警報と食い違うため）
     const txt=((r.kind==='issue'||r.kind==='update')&&top)?TSU_MSG[top]:r.text;
-    h+='<div class="tm">発表 '+clk(r.t)+(many?'　地震'+(r.qi+1):'')+(r.giant?'　※巨大地震（M8を超える）':'　M'+r.mag.toFixed(1))+'</div>'
+    h+='<div class="tm">発表 '+clk(r.t)+(many?'　地震'+(r.qi+1):'')+(r.giant?'　※M8以上の巨大地震':'　M'+r.mag.toFixed(1))+'</div>'
       +'<div class="tx">'+txt+'</div>';
   }else h+='<div class="tx" style="color:#93a0b8">地震発生から約3分で第1報を発表します</div>';
   if(st.list.length){
@@ -3938,6 +4038,10 @@ function ensureInfoMap(){
     imap=L.map('imap',{zoomSnap:0.25,minZoom:4,maxZoom:11,worldCopyJump:false,zoomAnimation:false,markerZoomAnimation:false,fadeAnimation:false}).setView([36.3,137.6],5.5);
     L.layerGroup([esri('Canvas/World_Dark_Gray_Base',ATTR_BASE),esri('Canvas/World_Dark_Gray_Reference','')]).addTo(imap);
     imLayer=L.layerGroup().addTo(imap);
+    fetch('/api/areas_geojson').then(r=>r.ok?r.json():null).then(gj=>{      // 地域区分の境界線
+      if(!gj||!gj.features) return;
+      L.geoJSON(gj,{interactive:false,style:{color:'#8aa0c0',weight:1,opacity:.7,fill:false}}).addTo(imap).bringToBack();
+    }).catch(()=>{});
     let lg='<span>震度</span>'; for(let c=1;c<=9;c++) lg+=chipHtml2(c);
     $('imLegend').innerHTML=lg;
   }
@@ -3959,7 +4063,7 @@ function infoState(vis){
     (ms||[]).forEach(m=>epis.push({m:m,gi:gi}));
     if(ar) ar.areas.forEach(a=>{
       const o=areas.get(a[0]), n=a.length>3?a[3]:null;
-      if(!o||a[1]>o.c||(a[1]===o.c&&a[2]>o.v)) areas.set(a[0],{c:a[1],v:a[2],n:n});
+      if(!o||a[1]>o.c||(a[1]===o.c&&a[2]>o.v)) areas.set(a[0],{c:a[1],v:a[2],n:n,d:!!ar.dtl});
     });
   });
   return {areas:areas,epis:epis};
@@ -3967,10 +4071,10 @@ function infoState(vis){
 function tableHtml(st){
   const rows=Array.from(st.areas.entries()).sort((a,b)=>b[1].c-a[1].c||b[1].v-a[1].v||(a[0]<b[0]?-1:1));
   if(!rows.length) return '';
-  const hasN=rows.some(r=>r[1].n!=null);
+  const hasV=rows.some(r=>r[1].d), hasN=false;   // 計測震度・観測点数は、発表（約2時間後）があるまで出さない
   return '<div class="igc"><div class="igh"><span class="gt">各地の震度（区域別）</span><span class="gs">'+rows.length+'区域（最新の発表内容）</span></div>'
-    +'<div class="itw"><table class="itbl"><tr><th>震度</th><th>区域</th><th class="num">計測震度</th>'+(hasN?'<th class="num">観測点数</th>':'')+'</tr>'
-    +rows.map(r=>'<tr><td>'+chipHtml(r[1].c)+'</td><td>'+escH(r[0])+'</td><td class="num">'+fx1(r[1].v)+'</td>'
+    +'<div class="itw"><table class="itbl"><tr><th>震度</th><th>区域</th>'+(hasV?'<th class="num">計測震度</th>':'')+(hasN?'<th class="num">観測点数</th>':'')+'</tr>'
+    +rows.map(r=>'<tr><td>'+chipHtml(r[1].c)+'</td><td>'+escH(r[0])+'</td>'+(hasV?'<td class="num">'+fx1(r[1].v)+'</td>':'')
       +(hasN?'<td class="num">'+(r[1].n!=null?r[1].n:'')+'</td>':'')+'</tr>').join('')
     +'</table></div></div>';
 }
@@ -3981,8 +4085,8 @@ function drawInfoMap(){
   const pts=[];
   Array.from(st.areas.entries()).sort((a,b)=>a[1].c-b[1].c).forEach(r=>{
     const nm=r[0], o=r[1], id=NAME2ID[nm], c=id!=null?AREAC[id]:null; if(!c) return;
-    const ic=L.divIcon({className:'',html:'<div class="imk" style="background:'+clsColor(o.c)+';color:'+((o.c===2||o.c===3)?'#111':'#fff')+'">'+CLASS_LABEL[o.c]+'</div>',iconSize:[o.c>=5?30:24,18],iconAnchor:[o.c>=5?15:12,9]});
-    L.marker(c,{icon:ic,keyboard:false,zIndexOffset:o.c*10}).bindTooltip(escH(nm)+'　震度'+CLASS_LABEL[o.c]+(o.n!=null?'（'+o.n+'点）':'')).addTo(imLayer);
+    const ic=L.divIcon({className:'',html:'<div class="imk" style="background:'+clsColor(o.c)+';color:'+((o.c===2||o.c===3)?'#111':'#fff')+'">'+CLASS_LABEL[o.c]+'</div>',iconSize:[24,24],iconAnchor:[12,12]});
+    L.marker(c,{icon:ic,keyboard:false,zIndexOffset:o.c*10}).bindTooltip(escH(nm)+'　震度'+CLASS_LABEL[o.c]+'').addTo(imLayer);
     pts.push(c);
   });
   st.epis.forEach(e=>{
@@ -4013,7 +4117,7 @@ function chipHtml(c){ return '<span class="chip" style="background:'+clsColor(c)
 function jdt(t){ const d=new Date(simClock0+t*1000); return d.getDate()+'日'+d.getHours()+'時'+pad2(d.getMinutes())+'分'; }
 function jfull(t){ const d=new Date(simClock0+t*1000); return (d.getMonth()+1)+'月'+d.getDate()+'日 '+d.getHours()+'時'+pad2(d.getMinutes())+'分'; }
 function llTxt(m){ return (m.lat>=0?'北緯':'南緯')+Math.abs(m.lat).toFixed(1)+'度、'+(m.lon>=0?'東経':'西経')+Math.abs(m.lon).toFixed(1)+'度'; }
-function magTxt(m){ return m.gst?'M8以上の巨大地震と推定':(m.ge?'M'+m.mag.toFixed(1)+'程度以上':'M'+m.mag.toFixed(1)); }
+function magTxt(m){ return m.gst?'M8以上の巨大地震':(m.ge?'M'+m.mag.toFixed(1)+'程度以上':'M'+m.mag.toFixed(1)); }
 // 気象庁の発表文に近い形: 「○日○時○分ころ、地震がありました。」＋震源地（緯度経度）・深さ・規模
 function memHtml(ms){
   return ms.map(m=>'<div class="bl">'+jdt(m.delay)+'ころ、地震がありました。</div>'
@@ -4036,7 +4140,7 @@ function areasByPref(areas,detail){
     pf.forEach((list,p)=>{
       h+='<span class="pf"><b>'+escH(p)+'</b> '+list.map(a=>{
         const nm=(a[4]&&a[0].indexOf(a[4])===0&&a[0].length>a[4].length)?a[0].slice(a[4].length):a[0];
-        return escH(nm)+(detail&&a[3]!=null?' <i>('+fx1(a[2])+'／'+a[3]+'点)</i>':'');
+        return escH(nm)+(detail?' <i>('+fx1(a[2])+')</i>':'');
       }).join('、')+'</span>';
     });
     return '<div class="ic">'+chipHtml(c)+'<div class="ia">'+h+'</div></div>';
@@ -4101,7 +4205,7 @@ function relHtml(r,isNew,t0){
   }
   else if(r.k==='miu') b=memHtml(r.mem)+'<div class="im">震度5弱以上未入電となっていた観測点の震度を確認しました。</div>'
     +(r.rec||[]).map(e=>'<div class="ic">'+chipHtml(e[1])+'<div class="ia">'+escH(e[0])+'（計測震度 '+fx1(e[2])+'）</div></div>').join('')+mxLine;
-  else b=memHtml(r.mem)+mxLine+'<div class="inote">震度1以上を観測した地域（計測震度／観測点数）</div>'+areasByPref(r.areas,true);
+  else b=memHtml(r.mem)+mxLine+'<div class="inote">震度1以上を観測した地域'+(r.dtl?'（計測震度）':'')+'</div>'+areasByPref(r.areas,!!r.dtl);
   if(r.mu&&r.mu.length&&r.k!=='miu') b+='<div class="inote" style="color:#ffb54a">震度5弱以上未入電の観測点があります：'+r.mu.map(escH).join('、')+'</div>';
   return '<div class="ir'+(isNew?' new':'')+'"><div class="rh"><b>'+INFO_KIND[r.k]+'</b>'+(r.upd?'<span class="ru">更新</span>':'')
     +'<span class="rt">'+jfull(r.t)+' 気象庁発表</span></div>'+b+'</div>';
@@ -4110,7 +4214,7 @@ function groupHtml(gi,n,prevN){
   const G=sim.info.groups[gi], rel=G.releases.slice(0,n), last=rel[rel.length-1];
   let ms=null; for(let k=rel.length-1;k>=0;k--) if(rel[k].mem){ ms=rel[k].mem; break; }
   let sub='震源の情報を待っています…';
-  if(ms){ const mm=ms.reduce((p,q)=>q.mag>p.mag?q:p); sub=escH(mm.epi)+'　M'+mm.mag.toFixed(1)+(ms.length>1?'　ほか'+(ms.length-1)+'件':''); }
+  if(ms){ const mm=ms.find(m=>m.gst)||ms.reduce((p,q)=>q.mag>p.mag?q:p); sub=escH(mm.epi)+'　'+magTxt(mm)+(ms.length>1?'　ほか'+(ms.length-1)+'件':''); }
   const many=sim.info.groups.length>1;
   let h='<div class="igc"><div class="igh"><span class="gt">地震'+(many?' '+(gi+1):'')+'</span><span class="gs">発生 '+clk(G.t0)+'頃　'+sub
     +(G.members.length>1?'<br><span class="gm">近接して発生した'+G.members.length+'つの地震を、一つの地震としてまとめて発表しています</span>':'')+'</span>'
@@ -4311,7 +4415,7 @@ const aSh=c=>SPK_CLS[c]!==undefined?SPK_CLS[c]:String(c);
 function aClockTxt(t){ const d=new Date(simClock0+t*1000); return d.getHours()+'時'+d.getMinutes()+'分'; }
 function aList(a,cap){ return a.length>cap?a.slice(0,cap).join('、')+'ほか':a.join('、'); }
 function aMainMem(r){ const ms=r.mem; return (ms&&ms.length)?ms.reduce((p,q)=>q.mag>p.mag?q:p):null; }
-function aMagTxt(m){ return m.gst?'8以上の巨大地震と推定':m.mag.toFixed(1)+(m.ge?'程度以上':''); }
+function aMagTxt(m){ return m.gst?'8以上の巨大地震':m.mag.toFixed(1)+(m.ge?'程度以上':''); }
 function aDepTxt(m){ return m.depth<1?'ごく浅く':'約'+Math.round(m.depth)+'キロ'; }
 function aTsuTxt1(r){ return (r.tsu!=null&&TSU_TXT[r.tsu])?TSU_TXT[r.tsu].replace('。','。'):''; }
 // 震度別の地域（震度の大きい順）。minc 以上の階級を最大 maxLines 階級まで読む
