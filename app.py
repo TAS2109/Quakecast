@@ -1998,7 +1998,7 @@ def sim_multi(quakes, dt=1.0, gz=False):
     観測点ごとのリアルタイム震度・最終震度は、全地震の最大値を採用する。
     戻り値: (基本データdict, [各地震の (tp, rt, t_end)])"""
     cores = [quake_core(q["lat"], q["lon"], q["mag"], q["depth"], dt) for q in quakes]
-    tsus = [_shift_tsu(tsunami_for_quake(q["lat"], q["lon"], q["mag"], q["depth"], t_p1=_t_p_first(c, q)), q["delay"])
+    tsus = [_shift_tsu(tsunami_for_quake(q["lat"], q["lon"], q["mag"], q["depth"], t_p1=_t_p_first(c, q), t_eew_end=min(c["t_end"], 540.0)), q["delay"])
             for q, c in zip(quakes, cores)]
     t_end = max(q["delay"] + c["t_end"] for q, c in zip(quakes, cores))
     nf = int(t_end / dt) + 1
@@ -2390,7 +2390,7 @@ def _tsu_first_time(t_p1, t_arr, rng):
     return float(min(t, max(t_arr - 300.0, 180.0 + j)))
 
 
-def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0):
+def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0, t_eew_end=0.0):
     """1つの地震の津波警報等・津波観測の時系列（その地震の発生を0秒とするローカル時間）
     t_p1: 陸上観測点に最初にP波が届く時刻[秒]（近地か遠地かの判定と第1報の発表時刻に使う）"""
     src = classify_source(mag, depth, lat0, lon0)
@@ -2401,7 +2401,7 @@ def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0):
     h_true, tm, deff = _tsu_model(mag, lat0, lon0, depth, sea_f)
     if float(h_true.max()) < 0.05:
         if mag >= 6.0:                                            # 震源に関する情報の付加文（津波の心配なし）
-            t_none = 150.0 if t_p1 <= TSU_NEAR_P_S else t_p1 + 480.0   # 遠地は揺れ（地震波）の到達後
+            t_none = 150.0 if t_p1 <= TSU_NEAR_P_S else max(t_p1 + 480.0, t_eew_end + 600.0)   # 遠地は揺れ（地震波）の到達後、EEW最終報から10分以上あけて
             res["reports"].append({"t": t_none, "no": 1, "kind": "none", "mag": round(mag, 1), "giant": False,
                                    "text": "この地震による津波の心配はありません。", "areas": []})
             res["end"] = max(600.0, t_none + 450.0)
@@ -2424,6 +2424,8 @@ def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0):
         sig = tm[h_true >= 0.05]
     t_arr = float(sig.min())                                      # 最初の津波到達（予想）
     t1 = _tsu_first_time(t_p1, t_arr, rng)                        # 第1報の発表時刻（近地約3分・遠地は後ろへ）
+    if not near:                                                  # 遠地: EEW最終報から約20分あけて発表（津波到達の5分前までは待つ）
+        t1 = max(t1, min(t_eew_end + 1200.0 + int(rng.integers(-60, 61)), max(t_arr - 300.0, t1)))
     stages = [(t1, H1, m1, giant, 0.0),
               (t1 + (480.0 if mag >= 7.0 else 720.0) + int(rng.integers(0, 120)),
                H2 * safe * np.exp(rng.normal(0, 0.1, n)), m2, False, 0.0)]
@@ -2484,7 +2486,7 @@ def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0):
             kind, text = "update", _TSU_MSG[top]
         res["reports"].append({
             "t": float(ts_), "no": no, "kind": kind,
-            "mag": round(mm, 1), "giant": bool(gflag), "text": text,
+            "mag": round(mm, 1), "giant": bool(gflag or (si == 0 and mag >= 8.0)), "text": text,
             "areas": [{"i": i, "lv": v[0], "hl": v[1], "ts": round(float(tm[i]), 1),
                        "imm": bool(tm[i] <= ts_ + 60.0)} for i, v in sorted(new.items())]})
         ever |= set(new)
@@ -2872,7 +2874,7 @@ INDEX_HTML = r"""<!doctype html>
   #imLegend{position:absolute;z-index:1000;left:10px;bottom:10px;display:flex;gap:3px;align-items:center;padding:5px 7px;
     background:var(--panel);border:1px solid var(--line);border-radius:8px;font-size:11px;color:var(--sub)}
   #imLegend .chip{min-width:0;padding:1px 5px;font-size:11px}
-  .imk{display:flex;align-items:center;justify-content:center;width:100%;height:100%;border:1px solid #0b1220;border-radius:2px;
+  .imk{display:flex;align-items:center;justify-content:center;width:100%;height:100%;border:1px solid #0b1220;border-radius:6px;
     font-size:11px;font-weight:800;line-height:1;box-shadow:0 0 0 1px #0008}
   #infoBody{flex:1 1 45%;min-width:0;overflow:auto;padding:14px 16px 40px}
   .itw{max-height:340px;overflow:auto}
@@ -2913,6 +2915,8 @@ INDEX_HTML = r"""<!doctype html>
     #bar{left:330px;right:10px;transform:none;width:auto;bottom:calc(14px + env(safe-area-inset-bottom,0px))}
     #runFab{left:calc(330px + (100% - 340px) / 2);bottom:calc(164px + env(safe-area-inset-bottom,0px))}
     #panel{max-height:calc(100% - 20px - env(safe-area-inset-bottom,0px))}
+    #simClk{bottom:calc(172px + env(safe-area-inset-bottom,0px))}
+    #mxIco{bottom:calc(236px + env(safe-area-inset-bottom,0px))}
   }
   @media (min-width:701px) and (max-width:1100px){
     #hud{top:54px;left:330px;transform:none}
@@ -3025,7 +3029,7 @@ INDEX_HTML = r"""<!doctype html>
   <div id="infoHead">
     <span class="it">震度速報・地震情報</span>
     <button id="iRun" class="sec" style="width:auto;margin:0;padding:6px 12px">► シミュレーション実行</button>
-    <button id="iRestart" title="最初に戻る">|◄</button>
+    <button id="iRestart" title="最初に戻る（リセット）" style="white-space:nowrap">↺ 最初から</button>
     <button id="iPlay" title="再生/一時停止">►</button>
     <span id="iTime">—</span>
     <label><input id="infoAuto" type="checkbox" checked>更新時に自動で切り替え（強震モニタ表示中）</label>
@@ -3058,7 +3062,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="clkCtl"><input type="datetime-local" step="1" id="clkIn"><button id="clkNow" type="button">現在時刻</button><button id="clkClose" type="button">閉じる</button></div></div>
   <div id="bar">
   <div id="ctl">
-    <button id="restart" title="最初に戻る">|◄</button>
+    <button id="restart" title="最初に戻る（リセット）" style="min-width:auto;white-space:nowrap">↺ 最初から</button>
     <button id="play" title="再生/一時停止">►</button>
     <input id="seek" type="range" min="0" max="0" step="1" value="0" disabled>
     <span id="tlabel">0.0 s</span>
@@ -3204,7 +3208,7 @@ function setEpi(lat,lon,pan){
   syncMarkers();
   if(pan) map.panTo([lat,lon]);
 }
-map.on('click',e=>setEpi(e.latlng.lat,e.latlng.lng,false));
+map.on('click',e=>{ if(typeof playing!=='undefined'&&playing) return; setEpi(e.latlng.lat,e.latlng.lng,false); });   // 再生中は震源を動かさない
 $('qadd').onclick=()=>{
   if(QS.length>=MAX_Q) return;
   const c=map.getCenter();
@@ -4415,6 +4419,7 @@ const aSh=c=>SPK_CLS[c]!==undefined?SPK_CLS[c]:String(c);
 function aClockTxt(t){ const d=new Date(simClock0+t*1000); return d.getHours()+'時'+d.getMinutes()+'分'; }
 function aList(a,cap){ return a.length>cap?a.slice(0,cap).join('、')+'ほか':a.join('、'); }
 function aMainMem(r){ const ms=r.mem; return (ms&&ms.length)?ms.reduce((p,q)=>q.mag>p.mag?q:p):null; }
+function aQkWord(mc){ return mc>=5?'強い地震':(mc===4?'やや強い地震':'地震'); }   // 最大震度4=やや強い／5弱以上=強い
 function aMagTxt(m){ return m.gst?'8以上の巨大地震':m.mag.toFixed(1)+(m.ge?'程度以上':''); }
 function aDepTxt(m){ return m.depth<1?'ごく浅く':'約'+Math.round(m.depth)+'キロ'; }
 function aTsuTxt1(r){ return (r.tsu!=null&&TSU_TXT[r.tsu])?TSU_TXT[r.tsu].replace('。','。'):''; }
@@ -4435,8 +4440,8 @@ function aQuakeTxt(r,t0){
 }
 const INFO_SPK={
   miu:(r)=>'未入電だった観測点の震度を更新します。'+(r.rec||[]).slice(0,3).map(e=>e[0]+'で震度'+aSh(e[1])).join('、')+'。',
-  sokuho:(r,t0)=>'震度速報。'+aClockTxt(t0)+'ごろ、強い地震がありました。'+aAreaLines(r,3,3,8),
-  gensen:(r,t0)=>{ const m=aMainMem(r); return '震源に関する情報。'+aClockTxt(m?m.delay:t0)+'ごろ、'+(m?m.epi+'を震源とする':'')+'地震がありました。'
+  sokuho:(r,t0)=>'震度速報。'+aClockTxt(t0)+'ごろ、'+aQkWord(aMxCls(r))+'がありました。'+aAreaLines(r,3,3,8),
+  gensen:(r,t0)=>{ const m=aMainMem(r); return '震源に関する情報。'+aClockTxt(m?m.delay:t0)+'ごろ、'+(m?m.epi+'を震源とする':'')+aQkWord(aMxCls(r))+'がありました。'
     +(m?'震源の深さは'+aDepTxt(m)+'、マグニチュードは'+aMagTxt(m)+'です。':'')+aTsuTxt1(r); },
   gs:(r,t0)=>'震源・震度に関する情報。'+aQuakeTxt(r,t0)+aTsuTxt1(r),
   kakuchi:(r,t0)=>{ const a=aQuakeTxt(r,t0), mc=aMxCls(r); const o=aAreaLines(r,3,3,6).replace(/^震度[^、]*、[^。]*。/,'');
