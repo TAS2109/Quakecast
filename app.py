@@ -495,6 +495,7 @@ DEEP_Q = {
     "c0": 0.0,           # 深発地震の全体オフセット [log10(PGV)]（異常震域の効く割合 s を掛けて加える）
     "g": 0.0,            # 距離減衰の追加項: g*log10(震源距離/300km)（+なら遠方ほど強い）
     "dm": 0.0,           # 規模依存の追加項: dm*(Mw-6.5)
+    "gain": 0.0,         # 深発地震の震度の伸び: m01 += s*gain*(m01-2)（強い揺れほど大きく、弱い揺れは小さく）
 }
 _QP = DATA_DIR / "deep_params.json"
 if _QP.exists():                                   # 較正結果があれば上書き
@@ -521,6 +522,34 @@ if _STP.exists():
         print("[station_terms.json] 観測点補正項を読み込み: %d/%d点" % (_n, len(_tm)))
     except Exception as e:
         print("[station_terms.json] 読み込み失敗:", e)
+
+# 観測済みの地震（プリセットなど）の観測補正。make_event_corr.py が data/event_corrections.json に書き出す。
+# 観測（K-NET/KiK-net の計測震度）と予測式の差を、観測点の周りで空間的に滑らかにしたもの。
+# 震源・規模・深さがその地震に近いとき（ずれるほど弱める）だけ、予測震度に足す。予測式そのものは変えない。
+EVENT_CORR = []
+_ECP = DATA_DIR / "event_corrections.json"
+if _ECP.exists():
+    try:
+        with open(_ECP, encoding="utf-8") as _f:
+            for _e in json.load(_f):
+                _c = np.array(_e["corr"], dtype=np.float64)
+                if len(_c) == N_ST:
+                    EVENT_CORR.append(dict(name=_e.get("name", ""), lat=_e["lat"], lon=_e["lon"], mag=_e["mag"], depth=_e["depth"], corr=_c))
+        print("[event_corrections.json] 観測補正を読み込み: %d件" % len(EVENT_CORR), [e["name"] for e in EVENT_CORR])
+    except Exception as e:
+        print("[event_corrections.json] 読み込み失敗:", e)
+
+
+def _event_corr_for(mag, depth, lat0, lon0):
+    """震源が観測済みの地震に近ければ、観測補正（観測点ごとの震度の加算量）を返す。遠いほど弱め、離れたら None"""
+    tot = None
+    for e in EVENT_CORR:
+        dl = math.hypot((lat0 - e["lat"]) * 110.57, (lon0 - e["lon"]) * 111.32 * math.cos(math.radians(e["lat"])))
+        u = max(dl / 40.0, abs(depth - e["depth"]) / 40.0, abs(mag - e["mag"]) / 0.3)
+        w = min(1.0, 1.5 * (1.0 - u)) if u < 1.0 else 0.0       # u<=1/3（約13km・13km・M0.1）までは全量、そこから0へ
+        if w > 0.0:
+            tot = e["corr"] * w if tot is None else tot + e["corr"] * w
+    return tot
 
 # 沈み込む板ごとの海溝鎖（連続した線。進行方向の右が陸側）
 _SLAB_CHAINS = {
@@ -779,6 +808,13 @@ def final_intensity(mag, depth, lat0, lon0, min_x=0.0, anomaly=True):
     pgv600 = 10.0 ** log_pgv600
     pgv = pgv600 * ST_ARV * (4000.0 - ST_DEP)             # 地盤増幅を考慮
     m01 = 2.68 + 1.72 * np.log10(pgv)                     # PGV → 計測震度
+    if anomaly and depth > DEEP_ANOM_D0 and DEEP_Q.get("gain", 0.0) != 0.0:   # 深発地震: 震度の伸びを補正
+        s_a = float(np.clip((depth - DEEP_ANOM_D0) / (DEEP_ANOM_D1 - DEEP_ANOM_D0), 0.0, 1.0))
+        m01 = m01 + s_a * DEEP_Q["gain"] * (m01 - 2.0)
+    if anomaly and EVENT_CORR and depth > DEEP_ANOM_D0:    # 観測済みの地震に近い震源なら観測補正を足す
+        ec = _event_corr_for(mag, depth, lat0, lon0)
+        if ec is not None:
+            m01 = m01 + ec
     return m01, dist, depth_p, src
 
 
