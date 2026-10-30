@@ -483,17 +483,19 @@ DEEP_ANOM_D0, DEEP_ANOM_D1 = 40.0, 100.0   # 異常震域が効き始める深�
 # 深さ項(0.0038*深さ)は深さ-10が d0[km] を超えると傾きを slope 倍に抑える（DEEP_Q の "d0","slope"。較正対象）
 #（元の式のまま深発地震に使うと遠方まで震度が過大になる）
 DEEP_Q = {
-    "c_slab": 0.00076,
-    "c_cold": 0.0049,
-    "c_hot": 0.0033,
-    "zvf": 261.0,
-    "wvf": 20.0,
-    "zcrust": 35.0,
-    "lmax": 3000.0,
-    "d0": 30.0,
-    "slope": 0.0,
+    "c_slab": 0.0014,    # スラブ内の減衰係数 [log10(PGV)/km]（GMPEの平均0.002より小さいほど遠くまで強く伝わる）
+    "c_cold": 0.0014,    # スラブが浅い側（前弧）のマントルウェッジ
+    "c_hot": 0.0050,     # スラブが深い側（背弧）のマントルウェッジ（高温・低Q）
+    "zvf": 110.0,        # ウェッジが高温になるスラブ上面の深さ（火山フロント直下の深さ）[km]
+    "wvf": 20.0,         # 上記の切り替わり幅 [km]
+    "zcrust": 35.0,      # 地殻の厚さ（この区間は補正しない）[km]
+    "lmax": 3000.0,      # スラブ内の伝播距離の上限 [km]
+    "d0": 100.0,         # 距離減衰式の深さ項の傾きを抑え始める深さ [km]
+    "slope": 0.7,        # d0 を超えた分の深さ項の傾きの倍率
+    "c0": 0.0,           # 深発地震の全体オフセット [log10(PGV)]（異常震域の効く割合 s を掛けて加える）
+    "g": 0.0,            # 距離減衰の追加項: g*log10(震源距離/300km)（+なら遠方ほど強い）
+    "dm": 0.0,           # 規模依存の追加項: dm*(Mw-6.5)
 }
-
 _QP = DATA_DIR / "deep_params.json"
 if _QP.exists():                                   # 較正結果があれば上書き
     try:
@@ -502,6 +504,23 @@ if _QP.exists():                                   # 較正結果があれば上
         print("[deep_params.json] 深発地震の減衰係数を読み込み:", DEEP_Q)
     except Exception as e:
         print("[deep_params.json] 読み込み失敗:", e)
+
+# 観測点ごとの補正項 [log10(PGV)]（calibrate_deep.py が data/station_terms.json に書き出す）。
+# 深発地震の異常震域の枠内（深さ40km以深）にだけ適用し、浅い地震の予測は変えない。
+ST_TERM = np.zeros(N_ST)
+_STP = DATA_DIR / "station_terms.json"
+if _STP.exists():
+    try:
+        with open(_STP, encoding="utf-8") as _f:
+            _tm = json.load(_f)
+        _key = {"%.4f,%.4f" % (a, b): i for i, (a, b) in enumerate(zip(ST_LON, ST_LAT))}
+        _n = 0
+        for _k, _v in _tm.items():
+            if _k in _key:
+                ST_TERM[_key[_k]] = float(_v); _n += 1
+        print("[station_terms.json] 観測点補正項を読み込み: %d/%d点" % (_n, len(_tm)))
+    except Exception as e:
+        print("[station_terms.json] 読み込み失敗:", e)
 
 # 沈み込む板ごとの海溝鎖（連続した線。進行方向の右が陸側）
 _SLAB_CHAINS = {
@@ -592,7 +611,7 @@ def _source_chain(lat0, lon0):
     return best[1]
 
 
-def deep_anomaly_dlog(depth, x_hypo, lat0, lon0, q=None):
+def deep_anomaly_dlog(depth, x_hypo, lat0, lon0, q=None, mw=6.5):
     """深発地震の異常震域による log10(PGV) の補正量（観測点ごと）。浅い地震は0。
     震源→観測点直下のスラブ上面（スラブ内: 低減衰）→ 地殻の底（ウェッジ: 前弧側は低減衰・背弧側は高減衰）の
     2区間で、GMPEに元から含まれる非弾性減衰(-0.002/km)との差を積算する"""
@@ -607,7 +626,9 @@ def deep_anomaly_dlog(depth, x_hypo, lat0, lon0, q=None):
     hot = 1.0 / (1.0 + np.exp(-(z - q["zvf"]) / q["wvf"]))        # スラブが深い所の上ほど高温ウェッジ
     c_w = q["c_cold"] + (q["c_hot"] - q["c_cold"]) * hot
     d = (0.002 - q["c_slab"]) * l1 + (0.002 - c_w) * lw
-    return s * np.clip(d, -3.0, 3.0)
+    extra = (q.get("c0", 0.0) + q.get("g", 0.0) * np.log10(np.maximum(x_hypo, 10.0) / 300.0)
+             + q.get("dm", 0.0) * (mw - 6.5) + ST_TERM)
+    return s * (np.clip(d, -3.0, 3.0) + extra)
 
 
 def _deff(depth_p):
@@ -754,7 +775,7 @@ def final_intensity(mag, depth, lat0, lon0, min_x=0.0, anomaly=True):
         - 1.29
     )
     if anomaly and depth > DEEP_ANOM_D0:                  # 深発地震の異常震域
-        log_pgv600 = log_pgv600 + deep_anomaly_dlog(depth, x_hypo, lat0, lon0)
+        log_pgv600 = log_pgv600 + deep_anomaly_dlog(depth, x_hypo, lat0, lon0, mw=mw)
     pgv600 = 10.0 ** log_pgv600
     pgv = pgv600 * ST_ARV * (4000.0 - ST_DEP)             # 地盤増幅を考慮
     m01 = 2.68 + 1.72 * np.log10(pgv)                     # PGV → 計測震度
