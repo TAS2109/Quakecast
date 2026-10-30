@@ -22,6 +22,7 @@ Webアプリ（震度計算ロジックはPythonへ移植）。
   data/stations.csv … 観測点（経度・緯度・地盤増幅ARV・地盤深さ・所属区域）  [不変データ]
   data/areas.csv    … 区域名                                              [不変データ]
   data/jma2001.json … JMA2001走時表の近似式係数                            [不変データ]
+  data/deep_params.json … （任意）深発地震の減衰係数。calibrate_deep.py が実観測から較正して出力  [任意]
 
 起動:  python app.py        (開発)
        gunicorn app:app     (本番 / Render)
@@ -462,99 +463,156 @@ TRENCHES = {
 
 
 # ---------------------------------------------------------------------
-# 深発地震の異常震域
-#   沈み込む冷たい海洋プレート（スラブ）内は地震波の減衰が小さく(Qが高い)、火山フロントより
-#   太平洋側（前弧側）では震源から遠くても強く揺れる。一方、火山フロントより日本海側（背弧側）は
-#   高温のマントルウェッジを通るため減衰が大きく、震源の真上でも揺れが小さい。
-#   → 火山フロント（概略）からの符号付き距離を観測点ごとに求め、深発地震の時だけ
-#     PGVの距離減衰（非弾性減衰項）を前弧側で弱め・背弧側で強める。
+# 深発地震の異常震域（スラブ導波モデル）
+#   沈み込む冷たい海洋プレート（スラブ）の内部は地震波の減衰が小さい(Qが高い)ため、スラブ内の深発地震の
+#   波は、スラブ沿いに遠くまで届き、スラブが浅くなる太平洋側（前弧側）で強く揺れる。一方、スラブより上の
+#   マントルウェッジは、スラブが深くなる側（火山フロントより背弧側）で高温・低Qになり、そこを通る波は
+#   大きく減衰する（→ 震源の真上でも日本海側は小さい）。
+#   観測点ごとに、
+#     ① 震源 → 観測点直下のスラブ上面 : スラブ内を伝わる区間（減衰が小さい: c_slab）
+#     ② スラブ上面 → 地殻の底        : マントルウェッジを上がる区間（スラブが浅いほど低温で減衰小: c_cold、
+#                                       深いほど高温で減衰大: c_hot）
+#   の2区間で、距離減衰式に元から含まれる非弾性減衰(-0.002/km)との差を log10(PGV) に加える。
+#   観測点直下のスラブ上面の深さは、海溝軸（TRENCHESを連ねた鎖）からの距離と概略の沈み込み形状から求める
+#   （火山フロントの座標は使わない）。
+#   ※係数は暫定値。実観測（気象庁の震度データベース等）に合わせるには calibrate_deep.py で較正し、
+#     結果を data/deep_params.json に置けば自動で読み込む。
 #   ※緊急地震速報の予測はこの効果を見込まない（実際にも予測が難しいため。PLUM法で補う）
 # ---------------------------------------------------------------------
-# 火山フロントの概略（経度, 緯度）。進行方向の左側＝太平洋側（前弧側）になる向きに並べる
-_VF_LINES = [
-    [(144.5, 43.6), (142.7, 43.4), (141.4, 42.7), (140.8, 42.5), (140.7, 42.07), (140.9, 40.65),
-     (141.0, 39.85), (140.8, 38.96), (140.45, 38.14), (140.07, 37.6), (139.97, 37.12), (139.38, 36.8),
-     (139.18, 36.55), (138.53, 36.4), (138.37, 35.97), (138.73, 35.36), (139.4, 34.73), (139.53, 34.08),
-     (139.77, 33.1), (139.76, 32.46), (140.3, 29.8)],                       # 千島〜東北〜伊豆・小笠原
-    [(138.73, 35.36), (137.48, 35.89), (136.77, 36.15), (133.55, 35.37), (132.62, 35.14), (131.1, 32.88),
-     (130.86, 31.93), (130.66, 31.58), (130.2, 30.46), (129.72, 29.64), (128.23, 27.86)],   # 中部〜西日本〜九州〜琉球
-]
-VF_FORE_COEF = 0.0004    # 前弧側かつスラブ沿い: 距離1kmあたりlog10(PGV)の増分（非弾性減衰 -0.002 を2割弱める）
-VF_OFF_COEF = 0.0004     # スラブから外れた経路: 距離1kmあたりlog10(PGV)の減分（減衰が大きい）
-VF_WIDTH_KM = 40.0       # 火山フロント付近で前弧/背弧が切り替わる幅
-SLAB_L_KM = 450.0        # 沈み込む海溝からこの距離程度までが「スラブ沿いに揺れが伝わる」範囲
-DEEP_ANOM_D0, DEEP_ANOM_D1 = 60.0, 180.0   # 異常震域が効き始める深さ〜最大になる深さ[km]
-DEEP_SLOPE_D0, DEEP_SLOPE = 100.0, 0.7     # 深さ項(0.0038*深さ)は深さ-10が100kmを超えると傾きを0.7倍に抑える
-                                           # （元の式のまま深発地震に使うと遠方まで震度が過大になる）
+DEEP_ANOM_D0, DEEP_ANOM_D1 = 40.0, 100.0   # 異常震域が効き始める深さ〜最大になる深さ[km]
+# 深さ項(0.0038*深さ)は深さ-10が d0[km] を超えると傾きを slope 倍に抑える（DEEP_Q の "d0","slope"。較正対象）
+#（元の式のまま深発地震に使うと遠方まで震度が過大になる）
+DEEP_Q = {
+    "c_slab": 0.00076,
+    "c_cold": 0.0049,
+    "c_hot": 0.0033,
+    "zvf": 261.0,
+    "wvf": 20.0,
+    "zcrust": 35.0,
+    "lmax": 3000.0,
+    "d0": 30.0,
+    "slope": 0.0,
+}
+
+_QP = DATA_DIR / "deep_params.json"
+if _QP.exists():                                   # 較正結果があれば上書き
+    try:
+        with open(_QP, encoding="utf-8") as _f:
+            DEEP_Q.update({k: float(v) for k, v in json.load(_f).items() if k in DEEP_Q})
+        print("[deep_params.json] 深発地震の減衰係数を読み込み:", DEEP_Q)
+    except Exception as e:
+        print("[deep_params.json] 読み込み失敗:", e)
+
+# 沈み込む板ごとの海溝鎖（連続した線。進行方向の右が陸側）
+_SLAB_CHAINS = {
+    "PAC": [(155.0, 48.5), (150.5, 45.5), (147.3, 43.3), (145.0, 41.3), (144.0, 39.5), (143.7, 38.0),
+            (143.0, 36.5), (142.5, 35.3), (142.1, 33.5), (141.9, 31.5), (142.3, 29.0), (143.0, 26.0)],   # 千島〜日本〜伊豆・小笠原
+    "PSP": [(138.5, 34.6), (137.7, 33.9), (136.7, 33.3), (135.7, 32.7), (134.5, 32.2), (133.2, 31.7),
+            (132.2, 31.2), (131.0, 29.7), (129.8, 28.0), (128.5, 26.0), (126.5, 24.2), (124.5, 23.4),
+            (122.5, 23.2)],                                                                              # 南海〜琉球
+    "SAG": [(139.2, 34.9), (139.9, 34.4), (140.9, 34.3)],                                                # 相模
+}
+# スラブ上面の深さ[km]  vs  海溝軸からの陸側水平距離[km]（概略）
+_SLAB_TAB = {
+    "pac": ([0, 50, 150, 250, 350, 500, 700, 900, 1050, 4000], [0, 10, 35, 90, 150, 250, 400, 520, 600, 660]),
+    "izu": ([0, 60, 120, 200, 250, 300, 350, 500, 4000],       [0, 30, 60, 120, 300, 500, 640, 680, 700]),
+    "psp": ([0, 60, 150, 250, 350, 450, 600, 4000],            [0, 20, 45, 80, 130, 200, 300, 450]),
+    "ryu": ([0, 100, 200, 300, 450, 600, 4000],                [0, 40, 100, 160, 250, 350, 600]),
+}
 
 
-def _deff(depth_p):
-    """距離減衰式の深さ項に使う有効な深さ（深発地震で過大にならないよう頭打ち気味にする）"""
-    return np.minimum(depth_p, DEEP_SLOPE_D0) + DEEP_SLOPE * np.maximum(depth_p - DEEP_SLOPE_D0, 0.0)
+def _extend_line(pts, km=900.0):
+    """折れ線の両端を、端の線分の向きにkm延長する（端付近の距離計算が不連続にならないように）"""
+    def ext(xp, yp, xq, yq):
+        kx = 111.32 * math.cos(math.radians(yq))
+        vx, vy = (xq - xp) * kx, (yq - yp) * 110.57
+        n = math.hypot(vx, vy) or 1.0
+        return (xq + vx / n * km / kx, yq + vy / n * km / 110.57)
+    return [ext(pts[1][0], pts[1][1], pts[0][0], pts[0][1])] + list(pts) + [ext(pts[-2][0], pts[-2][1], pts[-1][0], pts[-1][1])]
 
 
-def _vf_signed_km():
-    """観測点ごとの火山フロントまでの符号付き距離[km]（正＝太平洋側＝前弧側、負＝日本海側＝背弧側）"""
-    kx = 111.32 * np.cos(np.radians(ST_LAT))
-    ky = 110.57
-    best = np.full(N_ST, 1e9)
-    sgn = np.ones(N_ST)
-    for pts in _VF_LINES:
-        for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
-            ax, ay = (x1 - ST_LON) * kx, (y1 - ST_LAT) * ky
-            bx, by = (x2 - ST_LON) * kx, (y2 - ST_LAT) * ky
-            vx, vy = bx - ax, by - ay
-            l2 = np.maximum(vx * vx + vy * vy, 1e-9)
-            t = np.clip(-(ax * vx + ay * vy) / l2, 0.0, 1.0)
-            d = np.hypot(ax + t * vx, ay + t * vy)
-            cr = vx * (-ay) - vy * (-ax)                  # 観測点が線分の左(+)か右(-)か
-            m = d < best
-            best = np.where(m, d, best)
-            sgn = np.where(m, np.where(cr >= 0.0, 1.0, -1.0), sgn)
-    return best * sgn
-
-
-ST_VF = _vf_signed_km()
-_VF_G = np.tanh(ST_VF / VF_WIDTH_KM)
-_VF_FORE = np.clip(_VF_G, 0.0, 1.0)
-_VF_BACK = np.clip(-_VF_G, 0.0, 1.0)
-
-
-def _poly_dist_km(pts, lon, lat):
-    """点(lon,lat)（配列可）から折れ線ptsまでの距離[km]"""
+def _signed_dist_km(pts, lon, lat):
+    """折れ線ptsまでの符号付き距離[km]（進行方向の左が正）。lon/latは配列可"""
+    lon = np.asarray(lon, dtype=np.float64)
+    lat = np.asarray(lat, dtype=np.float64)
     kx = 111.32 * np.cos(np.radians(lat))
     ky = 110.57
-    best = np.full(np.shape(lon), 1e9)
+    best = np.full(lon.shape, 1e9)
+    sgn = np.ones(lon.shape)
     for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
         ax, ay = (x1 - lon) * kx, (y1 - lat) * ky
         bx, by = (x2 - lon) * kx, (y2 - lat) * ky
         vx, vy = bx - ax, by - ay
         l2 = np.maximum(vx * vx + vy * vy, 1e-9)
         t = np.clip(-(ax * vx + ay * vy) / l2, 0.0, 1.0)
-        best = np.minimum(best, np.hypot(ax + t * vx, ay + t * vy))
-    return best
+        d = np.hypot(ax + t * vx, ay + t * vy)
+        cr = vx * (-ay) - vy * (-ax)
+        m = d < best
+        best = np.where(m, d, best)
+        sgn = np.where(m, np.where(cr >= 0.0, 1.0, -1.0), sgn)
+    return best * sgn
 
 
-def _slab_weight(lat0, lon0):
-    """観測点ごとの「スラブ沿いに揺れが伝わる度合い」0〜1。震源に最も近い海溝（沈み込む板）を軸に、
-    その海溝から離れるほど小さい（例: 小笠原の深発地震は関東・東北の太平洋側に伝わりやすく、近畿以西は伝わりにくい）"""
+_SLAB_EXT = {k: _extend_line(v) for k, v in _SLAB_CHAINS.items()}
+_SLAB_Z_CACHE = {}
+
+
+def _slab_depth_km(chain, lon, lat):
+    """観測点直下のスラブ上面の深さ[km]（海溝より海側は0）"""
+    dl = -_signed_dist_km(_SLAB_EXT[chain], lon, lat)           # 陸側が正
+    def tb(k):
+        x, y = _SLAB_TAB[k]
+        return np.interp(np.maximum(dl, 0.0), x, y)
+    if chain == "PAC":                                           # 千島・日本海溝(pac) → 伊豆・小笠原(izu: 急傾斜) を緯度で接続
+        w = np.clip((36.0 - lat) / 3.0, 0.0, 1.0)
+        z = (1 - w) * tb("pac") + w * tb("izu")
+    elif chain == "PSP":                                         # 南海(psp) → 琉球(ryu)
+        w = np.clip((131.0 - lon) / 2.0, 0.0, 1.0)
+        z = (1 - w) * tb("psp") + w * tb("ryu")
+    else:
+        z = tb("psp")
+    return np.where(dl <= 0.0, 0.0, z)
+
+
+def _station_slab_depth(chain):
+    z = _SLAB_Z_CACHE.get((chain, N_ST))
+    if z is None:
+        z = _slab_depth_km(chain, ST_LON, ST_LAT)
+        _SLAB_Z_CACHE[(chain, N_ST)] = z
+    return z
+
+
+def _source_chain(lat0, lon0):
+    """震源が属する板（最寄りの海溝鎖）"""
     best = None
-    for pts in TRENCHES.values():
-        d = float(_poly_dist_km(pts, np.array([lon0]), np.array([lat0]))[0])
+    for name, pts in _SLAB_CHAINS.items():
+        d = min(abs(float(_signed_dist_km(pts[i:i + 2], np.array([lon0]), np.array([lat0]))[0])) for i in range(len(pts) - 1))
         if best is None or d < best[0]:
-            best = (d, pts)
-    return np.exp(-(_poly_dist_km(best[1], ST_LON, ST_LAT) / SLAB_L_KM) ** 2)
+            best = (d, name)
+    return best[1]
 
 
-def deep_anomaly_dlog(depth, x_hypo, lat0, lon0):
+def deep_anomaly_dlog(depth, x_hypo, lat0, lon0, q=None):
     """深発地震の異常震域による log10(PGV) の補正量（観測点ごと）。浅い地震は0。
-    スラブ沿い（かつ火山フロントの太平洋側）は減衰が小さく、それ以外の経路は減衰が大きい"""
+    震源→観測点直下のスラブ上面（スラブ内: 低減衰）→ 地殻の底（ウェッジ: 前弧側は低減衰・背弧側は高減衰）の
+    2区間で、GMPEに元から含まれる非弾性減衰(-0.002/km)との差を積算する"""
+    q = q or DEEP_Q
     s = float(np.clip((depth - DEEP_ANOM_D0) / (DEEP_ANOM_D1 - DEEP_ANOM_D0), 0.0, 1.0))
     if s <= 0.0:
         return 0.0
-    w = _slab_weight(lat0, lon0)
-    x = np.minimum(x_hypo, 1500.0)
-    return s * x * (VF_FORE_COEF * w * _VF_FORE - VF_OFF_COEF * (1.0 - w))
+    z = _station_slab_depth(_source_chain(lat0, lon0))           # 観測点直下のスラブ上面の深さ
+    dist = hubeny_km(lat0, lon0, ST_LAT, ST_LON)
+    l1 = np.minimum(np.sqrt(dist ** 2 + np.maximum(depth - z, 0.0) ** 2), q["lmax"])   # スラブ内の伝播距離
+    lw = np.maximum(z - q["zcrust"], 0.0)                        # ウェッジを上がる距離
+    hot = 1.0 / (1.0 + np.exp(-(z - q["zvf"]) / q["wvf"]))        # スラブが深い所の上ほど高温ウェッジ
+    c_w = q["c_cold"] + (q["c_hot"] - q["c_cold"]) * hot
+    d = (0.002 - q["c_slab"]) * l1 + (0.002 - c_w) * lw
+    return s * np.clip(d, -3.0, 3.0)
+
+
+def _deff(depth_p):
+    """距離減衰式の深さ項に使う有効な深さ（深発地震で過大にならないよう頭打ち気味にする）"""
+    return np.minimum(depth_p, DEEP_Q["d0"]) + DEEP_Q["slope"] * np.maximum(depth_p - DEEP_Q["d0"], 0.0)
 
 
 def classify_source(mag, depth, lat0, lon0):
