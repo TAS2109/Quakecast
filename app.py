@@ -608,9 +608,9 @@ _EMB_DEEP_Q = {
     "zvf": 157.39229922828187,
     "slope": 0.02875488381911202,
     "d0": 135.7698964353074,
-    "c0": 0.4746462538825597,
+    "c0": 0.844512,
     "g": 0.5546524243048722,
-    "dm": 0.20001036506266157,
+    "dm": 0.30001036506266157,
     "gain": -0.1028519719834091,
 }
 _EMB_STATION_TERMS = (
@@ -1004,14 +1004,23 @@ def _station_slab_depth(chain):
     return z
 
 
-def _source_chain(lat0, lon0):
-    """震源が属する板（最寄りの海溝鎖）"""
+# 各板のスラブが届く深さの上限[km]（これより深い震源は、その板の地震とは考えない）。
+# フィリピン海プレート(南海・琉球・相模)のスラブは深さ200km台までで、それより深い地震は
+# 沈み込んだ太平洋プレートの中で起きている（例: 紀伊半島〜東海沖の深さ350km、日本海下の深さ450〜550km）。
+_SLAB_MAX_DEPTH = {"PAC": 1.0e9, "PSP": 250.0, "SAG": 120.0}
+
+
+def _source_chain(lat0, lon0, depth=None):
+    """震源が属する板。最寄りの海溝鎖のうち、スラブが震源の深さまで届くものを選ぶ
+    （depth省略時は最寄りの海溝鎖。届く板が無ければ太平洋プレート）"""
     best = None
     for name, pts in _SLAB_CHAINS.items():
         d = min(abs(float(_signed_dist_km(pts[i:i + 2], np.array([lon0]), np.array([lat0]))[0])) for i in range(len(pts) - 1))
+        if depth is not None and depth > _SLAB_MAX_DEPTH[name]:
+            continue
         if best is None or d < best[0]:
             best = (d, name)
-    return best[1]
+    return best[1] if best else "PAC"
 
 
 def deep_anomaly_dlog(depth, x_hypo, lat0, lon0, q=None, mw=6.5):
@@ -1022,7 +1031,7 @@ def deep_anomaly_dlog(depth, x_hypo, lat0, lon0, q=None, mw=6.5):
     s_path, s_emp = _deep_ramp(depth)
     if s_path <= 0.0:
         return 0.0
-    z = _station_slab_depth(_source_chain(lat0, lon0))           # 観測点直下のスラブ上面の深さ
+    z = _station_slab_depth(_source_chain(lat0, lon0, depth))           # 観測点直下のスラブ上面の深さ
     dist = hubeny_km(lat0, lon0, ST_LAT, ST_LON)
     l1 = np.minimum(np.sqrt(dist ** 2 + np.maximum(depth - z, 0.0) ** 2), q["lmax"])   # スラブ内の伝播距離
     lw = np.maximum(z - q["zcrust"], 0.0)                        # ウェッジを上がる距離
