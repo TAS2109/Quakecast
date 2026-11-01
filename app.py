@@ -2775,28 +2775,43 @@ def _parse_iso(t):
     return d if d.tzinfo else d.replace(tzinfo=JST)
 
 
+def _coord_ok(lat, lon):
+    """日本周辺として妥当な座標か（震源指定の許容範囲と同じ: 北緯-10〜70度、東経90〜180度）"""
+    return lat is not None and lon is not None and -10.0 <= lat <= 70.0 and 90.0 <= lon <= 180.0
+
+
 def _jma_rows_from_list(items):
-    """list.json の要素群 → 地震1件1行（eidごとに、震源が載っている最新の電文を採用）"""
-    best = {}
+    """list.json の要素群 → 地震1件1行。
+    同じ地震(eid)には電文が複数ある（震度速報・震源に関する情報・震源・震度情報・震源要素更新…）。
+    震源・Mは「震源のある最新の電文」から、最大震度は「最大震度が入っている最新の電文」から別々に採る
+    （後から出た震度の無い電文に、震度が上書きで消されないようにする）。"""
+    cand, mxbest = {}, {}
     for it in items or []:
         if not isinstance(it, dict):
             continue
-        pc = _parse_cod(it.get("cod"))
-        if not pc:
-            continue                                   # 震度速報など、震源の無い電文は対象外
         eid = it.get("eid") or it.get("at")
         rdt = it.get("rdt") or ""
-        if eid in best and best[eid][0] >= rdt:
-            continue
-        best[eid] = (rdt, it, pc)
+        mx = str(it.get("maxi") or "")
+        if mx in _MAXI_RANK and (eid not in mxbest or mxbest[eid][0] <= rdt):
+            mxbest[eid] = (rdt, mx)
+        pc = _parse_cod(it.get("cod"))
+        if not pc or not _coord_ok(pc[0], pc[1]):
+            continue                                   # 震度速報など震源の無い電文、座標が範囲外の電文は震源に使わない
+        cand.setdefault(eid, []).append((rdt, it, pc))
     rows = []
-    for eid, (rdt, it, (lat, lon, dep)) in best.items():
+    for eid, lst in cand.items():
+        rdt, it, (lat, lon, dep) = max(lst, key=lambda x: x[0])
         at = _parse_iso(it.get("at"))
         if at is None:
             continue
-        mx = str(it.get("maxi") or "")
+        mag = _to_float(it.get("mag"))
+        if mag is None:                                # 最新電文にMが無ければ、Mのある最新の電文から補う
+            for r2, it2, _pc in sorted(lst, key=lambda x: x[0], reverse=True):
+                mag = _to_float(it2.get("mag"))
+                if mag is not None:
+                    break
         rows.append({"id": str(eid), "t": at.astimezone(JST), "place": it.get("anm") or "", "lat": lat, "lon": lon,
-                     "depth": dep, "mag": _to_float(it.get("mag")), "maxi": mx if mx in _MAXI_RANK else "", "src": "jma"})
+                     "depth": dep, "mag": mag, "maxi": mxbest.get(eid, ("", ""))[1], "src": "jma"})
     return rows
 
 
@@ -2850,16 +2865,14 @@ def _p2p_time(s, recv=None):
 
 
 def _p2p_rows(items):
-    """P2Pの電文群 → 地震1件1行。震源のある電文だけを、発生時刻ごとに最新のものへ統合（国内のみ。遠地地震情報は除く）"""
-    best = {}
+    """P2Pの電文群 → 地震1件1行。震源のある電文だけを、発生時刻(分)ごとに統合（国内のみ。遠地地震情報は除く）。
+    震源・Mは最新の電文から、最大震度は「震度の入っている最新の電文」から採る（震度の無い電文で消さない）"""
+    best, mxbest = {}, {}
     for it in items or []:
         if not isinstance(it, dict):
             continue
         e = it.get("earthquake") or {}
         h = e.get("hypocenter") or {}
-        lat, lon = _to_float(h.get("latitude")), _to_float(h.get("longitude"))
-        if lat is None or lon is None or lat <= -200 or lon <= -200:
-            continue                                             # 震度速報など、震源の無い電文
         if (it.get("issue") or {}).get("type") == "Foreign":
             continue
         t = _p2p_time(e.get("time"), it.get("time"))
@@ -2867,6 +2880,12 @@ def _p2p_rows(items):
             continue
         key = t.strftime("%Y%m%d%H%M")
         rcv = str(it.get("time") or "")
+        sc = _P2P_SCALE.get(int(_to_float(e.get("maxScale")) or -1), "")
+        if sc and (key not in mxbest or mxbest[key][0] <= rcv):
+            mxbest[key] = (rcv, sc)
+        lat, lon = _to_float(h.get("latitude")), _to_float(h.get("longitude"))
+        if lat is None or lon is None or lat <= -200 or lon <= -200 or not _coord_ok(lat, lon):
+            continue                                             # 震度速報など、震源の無い（または範囲外の）電文
         if key in best and best[key][0] >= rcv:
             continue
         best[key] = (rcv, it, t, lat, lon, h, e)
@@ -2876,7 +2895,7 @@ def _p2p_rows(items):
         rows.append({"id": "p" + str(it.get("id") or key), "t": t, "place": h.get("name") or "", "lat": lat, "lon": lon,
                      "depth": dep if dep is not None and dep >= 0 else None,
                      "mag": mag if mag is not None and mag >= 0 else None,
-                     "maxi": _P2P_SCALE.get(int(_to_float(e.get("maxScale")) or -1), ""), "src": "p2p"})
+                     "maxi": mxbest.get(key, ("", ""))[1], "src": "p2p"})
     return rows
 
 
