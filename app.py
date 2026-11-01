@@ -1549,6 +1549,77 @@ def _eew_tt_payload(nf):
     return out
 
 
+# --- PLUM法（観測された揺れを周囲30km以内へ予測震度として広げる） -----------------------
+#   実測（気象庁の警報発表事例）: 2022年福島県沖の全報は震源要素を持たないPLUM予測で、検知から1.6秒後に
+#   「最大震度3程度以上」→「4程度以上」→「5弱程度以上」…と、観測震度3の段階から予測が出ていた。
+#   そのため起点は震度5弱以上ではなく震度3以上とする。広げる先では地盤増幅度の違い（ARV×(4000-深さ)）を
+#   補正する（観測点より揺れやすい/にくい地点で±0.5まで）。
+PLUM_TRIG = 2.5          # 起点とする観測震度（計測震度）。震度3以上
+PLUM_RADIUS_KM = 30.0
+PLUM_CORR_MAX = 0.5
+_PLUM_CACHE = {}
+
+
+def _plum_edges():
+    """観測点どうしが30km以内の組 (src, dst, 地盤増幅補正) をN_STごとに1回だけ作る"""
+    key = (N_ST, float(ST_LAT.sum()), float(ST_LON.sum()))
+    if key not in _PLUM_CACHE:
+        _PLUM_CACHE.clear()
+        amp = np.maximum(ST_ARV.astype(np.float64) * (4000.0 - ST_DEP.astype(np.float64)), 1e-6)
+        ss, dd_, = [], []
+        for a0 in range(0, N_ST, 256):
+            a1 = min(a0 + 256, N_ST)
+            d = _planar_km(ST_LAT[a0:a1, None], ST_LON[a0:a1, None], ST_LAT[None, :], ST_LON[None, :])
+            i, j = np.nonzero(d <= PLUM_RADIUS_KM)
+            ss.append(i + a0)
+            dd_.append(j)
+        src = np.concatenate(ss).astype(np.int32)
+        dst = np.concatenate(dd_).astype(np.int32)
+        corr = np.clip(1.72 * np.log10(amp[dst] / amp[src]), -PLUM_CORR_MAX, PLUM_CORR_MAX)
+        corr[src == dst] = 0.0
+        _PLUM_CACHE[key] = (src, dst, corr)
+    return _PLUM_CACHE[key]
+
+
+def _plum_predict(ob, thr=PLUM_TRIG):
+    """ob: 各観測点の現在の計測震度。起点（陸上でob>=thr）の周囲30km以内の予測震度（無ければ-9）。起点が無ければNone"""
+    trig = (ob >= thr) & ST_LAND
+    if not trig.any():
+        return None
+    src, dst, corr = _plum_edges()
+    em = trig[src]
+    pl = np.full(N_ST, -9.0)
+    np.maximum.at(pl, dst[em], ob[src[em]] + corr[em])
+    return pl
+
+
+# --- 報数ロジック（気象庁の警報発表事例の実測に基づく） -----------------------------
+#   実測（検知からの経過秒）: 最終報 M4〜5=約55s / M5.9=67s / M6.1(直下)=85s / M6.6=116〜144s /
+#   M6.7(直下)=131s / M7.3〜7.4(沖合)=237〜266s / M7.6=249s。
+#   報数: M4.2〜4.3=10〜11 / M5前後=7〜16 / M6.1=19 / M6.6〜6.7=16〜26 / M7.3〜7.4=63〜70。
+#   構造: 検知直後は更新のたびに1秒前後の連射(バースト)、その後は20秒刻みの定期更新のみ。
+_EEW_FINAL_M = [4.0, 5.0, 6.0, 6.6, 7.0, 7.3, 7.6, 8.0]
+_EEW_FINAL_S = [52.0, 55.0, 70.0, 115.0, 170.0, 235.0, 255.0, 270.0]      # 最終報の目安（最初の検知から）
+_EEW_BURST_M = [5.0, 6.0, 6.6, 7.0, 7.3]
+_EEW_BURST_S = [30.0, 30.0, 35.0, 60.0, 110.0]                            # バーストの長さ（大きい地震ほど長い）
+EEW_LATE_PERIOD = 20.0                                                    # バースト後の定期更新間隔[秒]
+
+
+def _eew_final_rel(mag):
+    return float(np.interp(mag, _EEW_FINAL_M, _EEW_FINAL_S))
+
+
+def _eew_burst_len(mag):
+    return float(np.interp(mag, _EEW_BURST_M, _EEW_BURST_S))
+
+
+def _eew_period(mag, e):
+    """変化がなくても出す定期続報の間隔[秒]。e=最初の報の目安時刻からの経過"""
+    if e >= _eew_burst_len(mag):
+        return EEW_LATE_PERIOD
+    return 4.0 if mag < 5.5 else (3.0 if mag < 6.5 else 2.0)
+
+
 def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
     """緊急地震速報を演算できた順に返すジェネレータ。
     ("upto", T): T秒までの速報は確定 / ("report", 報) / ("final", 報番号) / ("done"|"none", None)"""
@@ -1574,7 +1645,9 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
     m4 = rl >= 3.5
     has4 = m4.any(axis=0)
     t_last = float(np.argmax(m4[:, has4], axis=0).max()) if has4.any() else float(t_peak)
-    T_stop = min(t_end - 1.0, max(t_first + 60.0, t_last + 6.0))
+    T_stop = min(t_end - 1.0, t_first + 330.0, max(t_first + _eew_final_rel(mag), min(t_last + 6.0, t_first + _eew_final_rel(mag) * 1.6)))
+    burst_len = _eew_burst_len(mag)
+    last_sig = None
     max_a = int(ST_AREA.max())
     reports, last, lv_max = [], None, 0
     warned = {}      # 警報対象地域（発表済みは続報でも保持）
@@ -1629,17 +1702,14 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             # --- PLUM法（実際の気象庁EEWでも併用）---
             fr = min(int(math.floor(t_data)), rt.shape[0] - 1)
             ob = np.nan_to_num(rt[fr].astype(np.float64), nan=-9.0, neginf=-9.0, posinf=-9.0)
-            trig = np.where((ob >= 4.5) & ST_LAND)[0]          # 震度5弱以上を観測した点のみ起点
+            pl = _plum_predict(ob)                              # 観測震度3以上の点を起点に周囲30kmへ（地盤増幅を補正）
             plum_used = False
-            if len(trig):
-                dd = _planar_km(ST_LAT[trig][:, None], ST_LON[trig][:, None],
-                                ST_LAT[None, :], ST_LON[None, :])
-                pl = np.max(np.where(dd <= 30.0, ob[trig][:, None], -9.0), axis=0)
+            if pl is not None:
                 upm = pl > m01_p + 0.05
                 if upm.any():
                     m01_p = np.where(upm, pl, m01_p)
                     plum_mask = upm
-                    plum_used = True
+                    plum_used = bool((pl[upm] >= 3.45).any())   # 震度4以上の予測に効いたときだけ「PLUM報」
             # 警報・特別警報の判定と警報対象地域に使う予測震度（深発地震ではPLUM法の予測のみ）
             m01_w = np.where(plum_mask, m01_p, -9.0) if deep_est else m01_p
             # 予想震度の塗りつぶし用: 観測点ごとのばらつき(地盤増幅の差)で地図がまだらにならないよう、
@@ -1667,6 +1737,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             lv = max(lv, lv_max)                      # 警報・特別警報は途中で引き下げない
 
             areas = []
+            sig = None
             if lv >= 2:
                 amx = np.full(max_a + 1, -99.0)
                 np.maximum.at(amx, ST_AREA[ST_LAND], m01_w[ST_LAND])
@@ -1683,6 +1754,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                                   "pref": pf, "region": rg,
                                   "label": lb, "cls": c, "i": int(a),
                                   "ts": round(float(ats[a]), 1) if np.isfinite(ats[a]) else None})
+                sig = hash(tuple(sorted((a_["i"], a_["cls"]) for a_ in areas)))   # 地域ごとの予測震度の組
                 for a_ in areas:                    # 発表済みの対象地域は取り消さない
                     warned[a_["name"]] = a_
                 areas = sorted(warned.values(), key=lambda x: -x["cls"])
@@ -1702,11 +1774,18 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                              or abs(dep_e - last["depth"]) >= 20.0
                              or (cls_e != last["maxCls"] and abs(vmax_e - last["max"]) >= 0.3))
                     area_added = len(areas) > len(last["areas"])   # 警報対象地域の追加は即続報
-                    # 推定に変化がなくても、実際のEEWのように一定間隔で続報（精度の更新）を出す
-                    per = 2.0 if T < T0 + 40 else (4.0 if T < T0 + 120 else 8.0)
-                    changed = ((lv != last["lv"]) or area_added or (moved and T - last["t"] >= (1 if lv >= 2 else 2))
-                               or (T - last["t"] >= per))
-                if (changed and len(reports) < 80) or after_peak:
+                    e_ = T - T0
+                    in_burst = e_ < burst_len
+                    per = _eew_period(mag, e_)
+                    gap = T - last["t"]
+                    # バースト中: 推定の変化・地域ごとの予測震度の変化のたびに続報（1秒間隔まで）。
+                    # バースト後: 定期更新(20秒刻み)と警報地域の追加のみ。
+                    sig_changed = (sig is not None and sig != last_sig)
+                    changed = ((lv != last["lv"]) or area_added
+                               or (in_burst and (moved or sig_changed) and gap >= (1 if lv >= 2 else 2))
+                               or (not in_burst and moved and gap >= EEW_LATE_PERIOD)
+                               or (gap >= per))
+                if (changed and len(reports) < 120) or after_peak:
                     # 震源地名: 推定震源に最も近い観測点の区域名。25km超離れていれば「○○県沖」
                     de_ = np.where(ST_LAND, _planar_km(lat_e, lon_e, ST_LAT, ST_LON), 1e9)   # 地名は陸上観測点基準
                     j_ = int(np.argmin(de_))
@@ -1730,6 +1809,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     reports.append(last)
                     yield ("report", last)
                     lv_max = lv
+                    last_sig = sig
                     if after_peak:
                         break
         T += step
