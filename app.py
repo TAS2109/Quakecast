@@ -1283,6 +1283,7 @@ EEW_DEPTHS = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 120.0, 150.0, 200
 EEW_DEPTHS_COARSE = (10.0, 60.0, 150.0, 300.0, 450.0, 600.0)   # 粗い探索（広域グリッド）で試す深さ
 EEW_DEEP_KM = 150.0      # 推定震源の深さがこれ以上なら深発地震とみなし、推定震源に基づく予想震度（と警報・特別警報）は発表しない（PLUM法のみ）
                          # （震度4以下の予報のみ。警報はPLUM法による予測のみ可）
+EEW_S_MIN_KM = 15.0      # S波振幅から規模を逆算するときに使う観測点の最小震央距離[km]
 EEW_DELAY = 2.0          # 観測点のデータ伝送(1秒)＋処理(1秒)の遅れ[秒]
 _TT_CACHE = {}
 
@@ -1501,7 +1502,10 @@ def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng, 
     # リアルタイム震度のS波側の式: v = s0 + zs*ks,  s0 = min(m01-(1.5+k2/150)-dterm/52, 4.6)
     # 立ち上がり直後は zs≈0 なので v≈s0。s0が上限4.6に張り付いていれば規模の下限しか分からない。
     mw_s = mw_lb = mw_ub = None
-    son = np.where(has_on)[0]
+    # 震源直近（約15km未満）の観測点は、S波の立ち上がりフレームの時点で振幅がすでに最終震度付近まで
+    # 達しており（s0の式が成り立たない）、「s0が上限に張り付き」と誤判定して規模を極端に過大評価する
+    # （福島県沖M7.4でM9.4）。S波の振幅による推定にはそのような近距離点を使わない。
+    son = np.where(has_on & (d_all >= EEW_S_MIN_KM))[0]
     if len(son):
         son = son[np.argsort(d_all[son])[:10]]
         idx, d = avail[son], d_all[son]
@@ -1620,9 +1624,12 @@ def _eew_period(mag, e):
     return 4.0 if mag < 5.5 else (3.0 if mag < 6.5 else 2.0)
 
 
-def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
+def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
     """緊急地震速報を演算できた順に返すジェネレータ。
-    ("upto", T): T秒までの速報は確定 / ("report", 報) / ("final", 報番号) / ("done"|"none", None)"""
+    ("upto", T): T秒までの速報は確定 / ("report", 報) / ("final", 報番号) / ("done"|"none", None)
+    plum_only=True: 震源・規模を推定せず、PLUM法（観測された揺れ→周囲30km）だけで発表する。
+      実際の気象庁も、直前の地震と時間・場所が重なって震源を決められないとき（2022年3月16日の福島県沖M6.1→M7.4）
+      PLUM法のみで発表した。震源要素は「仮定震源要素」で、PLUM法で最初に揺れを検知した観測点の位置・深さ10km・M1.0。"""
     rng = np.random.default_rng(int(abs(lat0) * 1000 + abs(lon0) * 100 + mag * 10 + depth) % (2 ** 31))
     tp_n = tp + rng.normal(0.0, 0.1, N_ST)            # P波ピックの誤差
     amp_noise = rng.normal(0.0, 0.25, N_ST)           # 振幅の観測ノイズ（観測点ごとに固定。続報ごとに引き直すとMが毎回ばらつく）
@@ -1651,6 +1658,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
     max_a = int(ST_AREA.max())
     reports, last, lv_max = [], None, 0
     warned = {}      # 警報対象地域（発表済みは続報でも保持）
+    plum_src = None  # PLUM法のみのとき: 最初に揺れを検知した観測点（仮定震源の位置）
     yield ("upto", T0 - 0.001)
 
     while T <= T_stop:
@@ -1668,31 +1676,43 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             cand = np.where(mask)[0]
             dc = _planar_km(ST_LAT[use[0]], ST_LON[use[0]], ST_LAT[cand], ST_LON[cand])
             unt = cand[np.argsort(dc)[:50]]
-            if n == 1:     # 1点検知: 観測点の直下(深さ10km)と仮定（テリトリー法）
-                lat_e, lon_e, dep_e = float(ST_LAT[avail[0]]), float(ST_LON[avail[0]]), 10.0
-                t0_e, cost_e = float(tp_n[avail[0]]), 1.0
+            if plum_only:
+                # 仮定震源: 最初にP波を検知した陸上観測点の位置・深さ10km・M1.0（最初の検知で固定）
+                if plum_src is None:
+                    lnd = [int(k) for k in order if ST_LAND[k]]
+                    plum_src = lnd[0] if lnd else int(order[0])
+                lat_e, lon_e, dep_e = float(ST_LAT[plum_src]), float(ST_LON[plum_src]), 10.0
+                t0_e, cost_e = float(tp_n[plum_src]), 0.0
+                mag_e, capped = 1.0, False
+                mag_known = bool(ST_LAND[avail].any())          # 陸上観測点がP波を検知するまでは発表しない
             else:
-                lat_e, lon_e, dep_e, t0_e, cost_e = _locate(
-                    tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
-                    t_data, n >= 4, 0.002 if n < 4 else 0.0001)
-            est = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
-                                T - t_first, rng, amp_noise)
-            # 規模がまだ推定できない間（P波検知直後で振幅が得られない）は、仮の固定値を
-            # 発表せず、直前の報の値を引き継ぐ。最初の報は規模が推定できてから発表する。
-            mag_known = (est is not None) or (last is not None)
-            if est is None:
-                mag_e, capped = (last["mag"] if last else 3.0), False
-            else:
-                mag_e, capped = est
-                # 規模が成長中（頭打ち）や大きな変化はそのまま採用し、小さな変動は平滑化する
-                if mag_s is None or capped or abs(mag_e - mag_s) >= 1.0:
-                    mag_s = mag_e
+                if n == 1:     # 1点検知: 観測点の直下(深さ10km)と仮定（テリトリー法）
+                    lat_e, lon_e, dep_e = float(ST_LAT[avail[0]]), float(ST_LON[avail[0]]), 10.0
+                    t0_e, cost_e = float(tp_n[avail[0]]), 1.0
                 else:
-                    mag_s += 0.4 * (mag_e - mag_s)
-                mag_e = mag_s
+                    lat_e, lon_e, dep_e, t0_e, cost_e = _locate(
+                        tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
+                        t_data, n >= 4, 0.002 if n < 4 else 0.0001)
+                est = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
+                                    T - t_first, rng, amp_noise)
+                # 規模がまだ推定できない間（P波検知直後で振幅が得られない）は、仮の固定値を
+                # 発表せず、直前の報の値を引き継ぐ。最初の報は規模が推定できてから発表する。
+                mag_known = (est is not None) or (last is not None)
+                if est is None:
+                    mag_e, capped = (last["mag"] if last else 3.0), False
+                else:
+                    mag_e, capped = est
+                    # 規模が成長中（頭打ち）や大きな変化はそのまま採用し、小さな変動は平滑化する
+                    if mag_s is None or capped or abs(mag_e - mag_s) >= 1.0:
+                        mag_s = mag_e
+                    else:
+                        mag_s += 0.4 * (mag_e - mag_s)
+                    mag_e = mag_s
 
             # 推定震源が観測点直下でも式が発散しないよう、震源距離に下限(10km)を設ける
             m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e, min_x=10.0, anomaly=False)
+            if plum_only:
+                m01_p = np.full(N_ST, -9.0)             # 震源・規模からの予測はしない（PLUM法の予測だけ）
             # 深発地震と推定された場合（気象庁: 深さ150km以上と推定された時点から震度予測を発表しない）:
             # 推定震源・規模からの予想震度は出さない。予想震度を出すのはPLUM法（観測された揺れの周辺30kmへの予測）のみ。
             deep_est = bool(dep_e >= EEW_DEEP_KM)
@@ -1710,6 +1730,8 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                     m01_p = np.where(upm, pl, m01_p)
                     plum_mask = upm
                     plum_used = bool((pl[upm] >= 3.45).any())   # 震度4以上の予測に効いたときだけ「PLUM報」
+            if plum_only:
+                plum_used = True
             # 警報・特別警報の判定と警報対象地域に使う予測震度（深発地震ではPLUM法の予測のみ）
             m01_w = np.where(plum_mask, m01_p, -9.0) if deep_est else m01_p
             # 予想震度の塗りつぶし用: 観測点ごとのばらつき(地盤増幅の差)で地図がまだらにならないよう、
@@ -1719,6 +1741,8 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
             pq_vals = np.where(ST_SEA, -9.0, amx_all[ST_AREA])    # 海域は予想震度の塗りつぶしの対象外
             vmax_e = float(m01_p[ST_LAND].max())
             cls_e, lb_max = shindo_class(vmax_e)
+            if plum_only and vmax_e < 2.5:                    # まだ揺れを観測していない（P波の検知のみ）: 「最大震度3程度以上」
+                cls_e, lb_max, vmax_e = 3, "3", 2.5
             if deep_est and not plum_used:                    # 予想震度なし（M・深さのみ発表）
                 cls_e, lb_max = 0, "－"
             cls_w = shindo_class(float(m01_w[ST_LAND].max()))[0]
@@ -1730,7 +1754,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 lv = 1
             else:
                 lv = 0
-            if n == 1:
+            if n == 1 and not plum_only:
                 lv = min(lv, 1)                       # 1点検知では警報は出さない
             if not mag_known:
                 lv = 0                                # 規模未確定の間は発表しない
@@ -1743,6 +1767,8 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                 np.maximum.at(amx, ST_AREA[ST_LAND], m01_w[ST_LAND])
                 de = hubeny_km(lat_e, lon_e, ST_LAT, ST_LON)
                 ts_all = t0_e + np.interp(de, _tt(dep_e)[1], TG, right=600.0)
+                if plum_only:
+                    ts_all = np.full(N_ST, np.inf)            # PLUM法には震源がないので主要動の到達予想時刻は出さない
                 ats = np.full(max_a + 1, np.inf)
                 np.minimum.at(ats, ST_AREA[ST_LAND], ts_all[ST_LAND])
                 for a in np.argsort(-amx):
@@ -1802,7 +1828,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end):
                             "epiName": epi_name,
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
-                            "maxCls": cls_e, "plum": bool(plum_used), "deepEst": deep_est, "noInt": bool(deep_est and not plum_used), "lv": lv, "areas": areas, "wtxt": _eew_warn_text(areas), "final": after_peak,
+                            "maxCls": cls_e, "plum": bool(plum_used), "plumOnly": bool(plum_only), "deepEst": deep_est, "noInt": bool(deep_est and not plum_used), "lv": lv, "areas": areas, "wtxt": _eew_warn_text(areas), "final": after_peak,
                             # 観測点ごとの予想震度（×10, int8, base64）: 地図の塗りつぶし用
                             "pq": base64.b64encode(np.clip(np.round(np.nan_to_num(pq_vals, nan=-9.0) * 10.0), -127, 127)
                                                    .astype(np.int8).tobytes()).decode("ascii")}
@@ -2479,7 +2505,9 @@ def _tsu_trace(lat0, lon0):
 def _tsu_model(mt, lat0, lon0, depth, sea_f):
     """津波予報区ごとの (予想高さ[m], 到達予想までの秒数, 実効伝播距離km)。
     伝播は海路に沿って計算し、陸を大きく回り込む経路ほど距離（＝減衰）を加算する。"""
-    dfac = 1.0 if depth <= 30.0 else max(0.0, 1.0 - (depth - 30.0) / 70.0)
+    # 深い地震ほど海底の変位が小さく津波は小さい。深さ30km以下は1、100kmで0。
+    # スラブ内地震（深さ50〜60km）の実績（2022年福島県沖M7.4・深さ57kmで石巻31cm）に合わせ、2乗で減らす。
+    dfac = 1.0 if depth <= 30.0 else max(0.0, 1.0 - (depth - 30.0) / 70.0) ** TSU_DEPTH_POW
     tm, path, fb = _tsu_trace(lat0, lon0)
     kx = 111.32 * math.cos(math.radians(lat0))
     straight = np.hypot((_TSU_LON - lon0) * kx, (_TSU_LAT - lat0) * 110.57)
@@ -2493,6 +2521,7 @@ def _tsu_model(mt, lat0, lon0, depth, sea_f):
     return h, t, d_eff
 
 
+TSU_DEPTH_POW = 2.0      # 津波の深さ補正の指数（大きいほど深い地震の津波を小さく見積もる）
 TSU_NEAR_P_S = 90.0      # 日本の観測網（陸上）にP波が届くまでがこれ以内なら近地地震（第1報は約3分）
 
 
@@ -2625,7 +2654,7 @@ def tsunami_for_quake(lat0, lon0, mag, depth, t_p1=0.0, t_eew_end=0.0):
         scale = 2.0 if mag >= 8.0 else 1.0                       # 巨大地震ほど長く続く
         jt = float(np.exp(rng.normal(0, 0.15)))
         while l > 0:
-            t += {1: 7200.0, 2: 21600.0, 3: 21600.0, 4: 28800.0}[l] * scale * jt   # 予報2時間・注意報6時間・警報6時間・大津波警報8時間（M8以上は2倍）
+            t += {1: 7200.0, 2: 14400.0, 3: 21600.0, 4: 28800.0}[l] * scale * jt   # 予報2時間・注意報4時間・警報6時間・大津波警報8時間（M8以上は2倍）
             nl = {4: 3, 3: 2, 2: 0, 1: 0}[l]
             ev.append((t, i, nl))
             l = nl
@@ -2731,6 +2760,27 @@ def api_stations():
 
 
 MAX_QUAKES = 5
+EEW_OVERLAP_S = 180.0      # 直前の地震の発生からこの秒数以内、かつ
+EEW_OVERLAP_KM = 200.0     # 震央がこの距離以内なら、直前の地震の揺れと混ざって震源を決められず、PLUM法のみで発表する
+
+
+def _plum_only_flags(quakes):
+    """各地震のEEWをPLUM法のみで出すか。入力の "plum"（true/false）があればそれに従い、無ければ自動判定。
+    自動判定: 直前（EEW_OVERLAP_S秒以内）に、近く（EEW_OVERLAP_KM以内）で別の地震が起きていればPLUM法のみ
+    （2022年3月16日の福島県沖M6.1の2分後のM7.4は、気象庁もPLUM法のみで発表した）"""
+    out = []
+    for i, q in enumerate(quakes):
+        f = q.get("plum")
+        if f is None:
+            f = False
+            for j, p in enumerate(quakes):
+                gap = q["delay"] - p["delay"]
+                if j != i and 0.0 < gap <= EEW_OVERLAP_S and \
+                        float(hubeny_km(p["lat"], p["lon"], q["lat"], q["lon"])) <= EEW_OVERLAP_KM:
+                    f = True
+                    break
+        out.append(bool(f))
+    return out
 
 
 @app.post("/api/simulate")
@@ -2742,7 +2792,8 @@ def api_simulate():
             raw = [j]                                     # 単発（従来の {lat, lon, mag, depth} 形式）
         quakes = [{"lat": float(r["lat"]), "lon": float(r["lon"]),
                    "mag": float(r["mag"]), "depth": float(r["depth"]),
-                   "delay": float(r.get("delay") or 0.0)} for r in raw]
+                   "delay": float(r.get("delay") or 0.0),
+                   "plum": (None if r.get("plum") is None else bool(r.get("plum")))} for r in raw]
     except Exception:
         return _json_response({"error": "入力が不正です"}, 400)
     if not (1 <= len(quakes) <= MAX_QUAKES):
@@ -2755,13 +2806,14 @@ def api_simulate():
         q["delay"] = float(int(round(min(max(q["delay"], 0.0), 300.0))))   # 発生時刻（秒後）: 整数秒
     gz = bool(j.get("gz"))
     base, cores = sim_multi(quakes, gz=gz)
+    plum_flags = _plum_only_flags(quakes)
 
     def gen():
         def dump(o):
             return (json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         yield dump({"k": "base", "v": base})              # まず震度フレームを返して再生開始
         # 各地震のEEWを交互に1ステップずつ進め、演算できた順に送る（時刻は全体の時間軸へずらす）
-        streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end)
+        streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end, plum_only=plum_flags[i])
                    for i, (q, (tp, rt, t_end)) in enumerate(zip(quakes, cores))}
         while streams:
             for i in list(streams):
