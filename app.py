@@ -3257,11 +3257,13 @@ def search_quakes(date_from=None, date_to=None, min_mag=None, max_mag=None, min_
     if jma_oldest is None or since < jma_oldest:                  # 気象庁の一覧が足りない期間だけ、他の情報源で補う
         if date_from or date_to:
             r0, r1 = (date_from or JMA_DB_START), min(date_to or today, today)
-            b1 = min(r1, today - timedelta(days=JMA_DB_LAG_DAYS))
-            if r0 <= b1:                                         # 気象庁 震度データベース（1919年〜2日前。震源・M・最大震度つき）
-                db, db_err = _jma_db_range(r0, b1, min_mag, min_maxi)
-            db_ok = bool(db) or (r0 <= b1 and db_err is None)
-            p0 = max(r0, today - timedelta(days=JMA_DB_LAG_DAYS + 1)) if db_ok else r0     # 直近の数日、またはデータベースが使えないとき
+            if r0 <= r1:                                         # 気象庁 震度データベース（震源・M・最大震度つき）。更新が遅れることがあるので今日まで問い合わせる
+                db, db_err = _jma_db_range(r0, r1, min_mag, min_maxi)
+            db_ok = bool(db) or (r0 <= r1 and db_err is None)
+            if db_ok and db:                                     # データベースに載っている最新日の翌日以降を、P2Pで補う（更新遅れ対策）
+                p0 = max(r0, min(max(r["t"].date() for r in db), today - timedelta(days=JMA_DB_LAG_DAYS + 1)))
+            else:
+                p0 = r0                                          # データベースが空・使えないときは期間全体をP2Pで
             if r1 >= P2P_START and p0 <= r1:                     # 2015-01-10以降: P2Pの日付範囲検索
                 p2p, p2p_err = _p2p_range(max(p0, P2P_START), r1, min_mag, min_maxi)
             u0 = date_from or (date_to - timedelta(days=365) if date_to and date_to < P2P_START else None)
