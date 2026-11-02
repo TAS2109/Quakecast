@@ -924,9 +924,14 @@ def _event_corr_for(mag, depth, lat0, lon0):
     tot = None
     for e in EVENT_CORR:
         dl = math.hypot((lat0 - e["lat"]) * 110.57, (lon0 - e["lon"]) * 111.32 * math.cos(math.radians(e["lat"])))
-        u = max(dl / 40.0, abs(depth - e["depth"]) / 40.0, abs(mag - e["mag"]) / 0.3)
-        w = min(1.0, 1.5 * (1.0 - u)) if u < 1.0 else 0.0       # u<=1/3（約13km・13km・M0.1）までは全量、そこから0へ
+        # 許容幅は深い地震ほど広げる: 深さ600km級では震央が数十km動いても観測点での揺れの分布はほとんど変わらない
+        # （地図クリックで震源を置くと数十kmずれやすい）。浅い〜中程度の地震は従来どおり水平40km・深さ40km。
+        tol_h = max(40.0, 0.2 * e["depth"])
+        tol_d = max(40.0, 0.1 * e["depth"])
+        u = max(dl / tol_h, abs(depth - e["depth"]) / tol_d, abs(mag - e["mag"]) / 0.3)
+        w = min(1.0, 1.5 * (1.0 - u)) if u < 1.0 else 0.0       # u<=1/3（水平tol_h/3・深さtol_d/3・M0.1）までは全量、そこから0へ
         if w > 0.0:
+            print("[event_corrections] %s の観測補正を適用（重み %.2f）" % (e.get("name", ""), w))
             tot = e["corr"] * w if tot is None else tot + e["corr"] * w
     return tot
 
@@ -4270,7 +4275,7 @@ function buildEewCards(n){
   const box=$('eewcards'); box.innerHTML=''; eewCards=[]; eewCurs=new Array(n).fill(null);
   for(let i=0;i<n;i++){
     const c=document.createElement('div'); c.className='card eewcard lv0'; c.style.display='none'; c._dsp='none';   // 最初のEEW発表まで表示しない
-    c.innerHTML='<div class="eh"><span class="ett r-ett">緊急地震速報'+(n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span>地震'+(i+1):'')+'</span>'
+    c.innerHTML='<div class="eh"><span class="ett r-ett">緊急地震速報</span>'
       +'</div>'
       +'<div class="tiles">'
       +'<div class="tile"><div class="k">予想最大震度</div><div class="v r-max"><span class="chipbig" style="background:#3a4357">-</span></div></div>'
@@ -4289,7 +4294,7 @@ function updateEew(){ sim.quakes.forEach((qk,i)=>updateEewCard(qk,i)); }
 // 見出し: 緊急地震速報(予報/警報/特別警報)　三陸沖で地震　#報数
 function eewTitle(i,cur,lvmax){
   const n=sim?sim.quakes.length:1;
-  const mk=n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span>地震'+(i+1):'';
+  const mk='';                                         // 実際の発表には「地震1・地震2」の区別はないので付けない
   if(!cur) return '緊急地震速報'+mk;
   return '緊急地震速報('+EEW_LBL[lvmax]+')'+(cur.plumOnly?'<span class="plumTag">PLUM法</span>':(cur.plum?'<span class="plumTag sub">PLUM法</span>':'　'))+escH(cur.epiName||'震源付近')+'で地震　#'+cur.no+(cur.final?'(最終)':'')+mk;
 }
@@ -4589,7 +4594,7 @@ function updateTsu(ts,st){
     const r=st.last, many=sim.quakes.length>1;
     // 発令・続報の文面は、全地震を合わせた現在の最高階級に合わせる（地震ごとの文面だと他の地震の警報と食い違うため）
     const txt=((r.kind==='issue'||r.kind==='update')&&top)?TSU_MSG[top]:r.text;
-    h+='<div class="tm">発表 '+clk(r.t)+(many?'　地震'+(r.qi+1):'')+(r.giant?'　※M8以上の巨大地震':'　M'+r.mag.toFixed(1))+'</div>'
+    h+='<div class="tm">発表 '+clk(r.t)+(r.giant?'　※M8以上の巨大地震':'　M'+r.mag.toFixed(1))+'</div>'
       +'<div class="tx">'+txt+'</div>';
   }else h+='<div class="tx" style="color:#93a0b8">地震発生から約3分で第1報を発表します</div>';
   if(st.list.length){
@@ -4824,7 +4829,7 @@ function groupHtml(gi,n,prevN){
   let sub='震源の情報を待っています…';
   if(ms){ const mm=ms.find(m=>m.gst)||ms.reduce((p,q)=>q.mag>p.mag?q:p); sub=escH(mm.epi)+'　'+magTxt(mm)+(ms.length>1?'　ほか'+(ms.length-1)+'件':''); }
   const many=sim.info.groups.length>1;
-  let h='<div class="igc"><div class="igh"><span class="gt">地震'+(many?' '+(gi+1):'')+'</span><span class="gs">発生 '+clk(G.t0)+'頃　'+sub
+  let h='<div class="igc"><div class="igh"><span class="gt">地震</span><span class="gs">発生 '+clk(G.t0)+'頃　'+sub
     +(G.members.length>1?'<br><span class="gm">近接して発生した'+G.members.length+'つの地震を、一つの地震としてまとめて発表しています</span>':'')+'</span>'
     +(last.mx&&last.mx[0]>0?chipHtml(last.mx[0]):'')+'</div>';
   for(let k=rel.length-1;k>=0;k--) h+=relHtml(rel[k],prevN!=null&&k>=prevN,G.t0);
