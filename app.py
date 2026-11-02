@@ -1182,6 +1182,9 @@ def final_intensity(mag, depth, lat0, lon0, min_x=0.0, anomaly=True):
         tt = np.clip(sx * src["ux"] + sy * src["uy"], -src["L"] / 2, src["L"] / 2)
         dfault = np.minimum(dist, np.hypot(sx - tt * src["ux"], sy - tt * src["uy"]))
     x_hypo = np.sqrt(dfault ** 2 + depth_p ** 2)          # 震源距離
+    # 震源の真上付近の観測点では、深さ補正(depth-10)のため震源距離が2km前後まで縮み、M5.5が震度6強・M5.9が震度7に
+    # なってしまう（実際は5強程度）。震源距離は震源の深さの半分より小さくしない（阪神・熊本・能登など実在の地震の最大震度はほぼ不変）。
+    x_hypo = np.maximum(x_hypo, 0.5 * depth)
     if min_x > 0.0:
         x_hypo = np.maximum(x_hypo, min_x)
 
@@ -1460,7 +1463,10 @@ def _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt, tau, rng, 
         jump = (sub[1:] - sub[:-1]) > 0.8
     jump &= np.arange(1, fmax + 1)[:, None] >= (t_ceil + 2)[None, :]   # P波立ち上がり直後は除外
     has_on = jump.any(axis=0)
-    onset = np.where(has_on, jump.argmax(axis=0) + 1, 10 ** 6)          # S波が観測された最初のフレーム
+    if jump.shape[0] == 0:                                              # 検知直後（fmax=0）はフレーム差が取れない → S波の立ち上がりなし
+        onset = np.full(len(avail), 10 ** 6)
+    else:
+        onset = np.where(has_on, jump.argmax(axis=0) + 1, 10 ** 6)      # S波が観測された最初のフレーム
     f = np.minimum(np.minimum(fmax, np.floor(ts_e - 1.5).astype(int)), onset - 1)
     ok = f >= t_ceil + 1
 
@@ -3698,11 +3704,14 @@ function renderQuakes(){
       +'<div class="row" style="align-items:center"><div style="flex:2.2"><input data-f="magr" type="range" min="0" max="9.9" step="0.1"></div>'
       +'<div><input data-f="mag" type="number" min="0" max="15" step="0.1"></div></div>'
       +'<div class="row"><div><label>震源の深さ（km）</label><input data-f="depth" type="number" min="0" max="699" step="5"></div>'
-      +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="300" step="1"></div></div>';
+      +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="300" step="1"></div></div>'
+      +'<label>EEWの方式</label><select data-f="plum"><option value="">自動（直前に近い地震があればPLUM法のみ）</option><option value="0">通常のEEW（震源・規模を推定）</option><option value="1">PLUM法のみ</option></select>';
     const F=f=>b.querySelector('[data-f="'+f+'"]');
     F('lat').value=q.lat.toFixed(2); F('lon').value=q.lon.toFixed(2);
     F('mag').value=q.mag.toFixed(1); F('magr').value=Math.min(q.mag,9.9);
     F('depth').value=q.depth; F('delay').value=q.delay;
+    F('plum').value=(q.plum===true?'1':(q.plum===false?'0':''));
+    F('plum').addEventListener('change',()=>{ const v=F('plum').value; q.plum=(v===''?null:v==='1'); });
     const num=(f,fn)=>F(f).addEventListener('input',()=>{ const v=parseFloat(F(f).value); if(isFinite(v)) fn(v); });
     num('lat',v=>{ q.lat=clampN(v,-10,70); syncMarkers(); });
     num('lon',v=>{ q.lon=clampN(v,90,180); syncMarkers(); });
@@ -3753,7 +3762,7 @@ function slClean(a){                                    // 入力検証（最大
   for(const q of a.slice(0,MAX_Q)){
     const lat=+q.lat, lon=+q.lon, mag=+q.mag, dep=+q.depth, dl=+(q.delay||0);
     if(![lat,lon,mag,dep,dl].every(isFinite)) continue;
-    out.push({lat:clampN(lat,-90,90),lon:clampN(lon,-180,180),mag:clampN(mag,0,15),depth:clampN(dep,0,699),delay:Math.round(clampN(dl,0,300))});
+    out.push({lat:clampN(lat,-90,90),lon:clampN(lon,-180,180),mag:clampN(mag,0,15),depth:clampN(dep,0,699),delay:Math.round(clampN(dl,0,300)),plum:(q.plum===true||q.plum===false)?q.plum:null});
   }
   return out.length?out:null;
 }
@@ -3771,7 +3780,7 @@ $('slSave').onclick=()=>{
   const o=slAll(), cur=$('slSel').value;
   const nm=(prompt('保存名を入力（同じ名前は上書き）',cur||('地震セット'+(Object.keys(o).length+1)))||'').trim();
   if(!nm) return;
-  o[nm]=QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay}));
+  o[nm]=QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay,plum:(q.plum===true||q.plum===false)?q.plum:null}));
   if(slPut(o)){ slRefresh(nm); $('status').textContent='「'+nm+'」を保存しました（'+QS.length+'件）'; }
 };
 $('slLoad').onclick=()=>{
@@ -5220,7 +5229,7 @@ $('runFab').onclick=()=>{ if(!$('run').disabled) $('run').click(); };
 document.addEventListener('keydown',e=>{            // Enterキーでも実行（入力欄の操作中は除く）
   if(e.key==='Enter'&&!e.isComposing&&!/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test((e.target.tagName||''))) $('runFab').click(); });
 $('run').onclick=async()=>{
-  const body={quakes:QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay})),
+  const body={quakes:QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay,plum:(q.plum===true||q.plum===false)?q.plum:null})),
               gz:(typeof DecompressionStream!=='undefined')};
   if(!QS.every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
   if(runCtl) runCtl.abort(); const ctl=runCtl=new AbortController();
