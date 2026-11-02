@@ -2064,14 +2064,18 @@ def _t_p_first(c, q):
     return float(hubeny_km(q["lat"], q["lon"], ST_LAT[ST_LAND], ST_LON[ST_LAND]).min()) / 8.0 + 15.0
 
 
-def sim_multi(quakes, dt=1.0, gz=False):
+def sim_multi(quakes, dt=1.0, gz=False, monitor=True):
     """複数の地震を同時に扱う。quakes: [{lat, lon, mag, depth, delay(秒, 整数)}, ...]
     各地震を独立に計算し、delay秒ずらして重ね合わせる。
     観測点ごとのリアルタイム震度・最終震度は、全地震の最大値を採用する。
+    monitor=False のときは「地震の再現のみ」: 津波・地震情報（震度速報など）の計算を省く。
     戻り値: (基本データdict, [各地震の (tp, rt, t_end)])"""
     cores = [quake_core(q["lat"], q["lon"], q["mag"], q["depth"], dt) for q in quakes]
-    tsus = [_shift_tsu(tsunami_for_quake(q["lat"], q["lon"], q["mag"], q["depth"], t_p1=_t_p_first(c, q), t_eew_end=min(c["t_end"], 540.0)), q["delay"])
-            for q, c in zip(quakes, cores)]
+    if monitor:
+        tsus = [_shift_tsu(tsunami_for_quake(q["lat"], q["lon"], q["mag"], q["depth"], t_p1=_t_p_first(c, q), t_eew_end=min(c["t_end"], 540.0)), q["delay"])
+                for q, c in zip(quakes, cores)]
+    else:
+        tsus = [{"reports": [], "obs": [], "end": 0.0} for _ in quakes]
     t_end = max(q["delay"] + c["t_end"] for q, c in zip(quakes, cores))
     nf = int(t_end / dt) + 1
 
@@ -2090,7 +2094,7 @@ def sim_multi(quakes, dt=1.0, gz=False):
         grp_rt[gid[i]] = sh if grp_rt[gid[i]] is None else np.fmax(grp_rt[gid[i]], sh)
         m01_all = c["m01"] if m01_all is None else np.maximum(m01_all, c["m01"])
 
-    info = build_info(quakes, groups, grp_rt, tsus, dt)   # 津波なし付加文の時刻をここで確定させる（tsuEndより先に）
+    info = build_info(quakes, groups, grp_rt, tsus, dt) if monitor else None   # 津波なし付加文の時刻をここで確定させる（tsuEndより先に）
     qz = np.clip(np.round(rt_all * 10.0), -127, 127).astype(np.int8)
     vmax = float(m01_all.max())
     cls, label = shindo_class(vmax)
@@ -2109,7 +2113,8 @@ def sim_multi(quakes, dt=1.0, gz=False):
         "tsuAreas": [[a[0], a[1], a[2], a[3]] for a in TSU_AREAS],
         "tsuEnd": max([t["end"] for t in tsus] + [0.0]),
         "info": info,
-        "ett": _eew_tt_payload(nf),
+        "ett": _eew_tt_payload(nf) if monitor else None,
+        "mode": "monitor" if monitor else "sim",
         "quakes": [{
             "lat": q["lat"], "lon": q["lon"], "mag": q["mag"], "depth": q["depth"],
             "delay": q["delay"],
@@ -2730,13 +2735,18 @@ def api_simulate():
         q["depth"] = min(max(q["depth"], 0.0), 699.0)
         q["delay"] = float(int(round(min(max(q["delay"], 0.0), 300.0))))   # 発生時刻（秒後）: 整数秒
     gz = bool(j.get("gz"))
-    base, cores = sim_multi(quakes, gz=gz)
-    plum_flags = _plum_only_flags(quakes)
+    monitor = (j.get("mode") != "sim")                    # "sim": 地震の再現のみ（EEW・津波・地震情報なし） / それ以外: 強震モニタ
+    base, cores = sim_multi(quakes, gz=gz, monitor=monitor)
+    plum_flags = _plum_only_flags(quakes) if monitor else [False] * len(quakes)
 
     def gen():
         def dump(o):
             return (json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         yield dump({"k": "base", "v": base})              # まず震度フレームを返して再生開始
+        if not monitor:                                   # 地震の再現のみ: EEWは計算しない
+            for i in range(len(quakes)):
+                yield dump({"k": "none", "q": i, "v": None})
+            return
         # 各地震のEEWを交互に1ステップずつ進め、演算できた順に送る（時刻は全体の時間軸へずらす）
         streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end, plum_only=plum_flags[i])
                    for i, (q, (tp, rt, t_end)) in enumerate(zip(quakes, cores))}
@@ -2794,6 +2804,10 @@ def api_tsunami_geojson():
 # 3b. 実際に起きた地震の検索（震源の自動セット用）
 #   ・直近（気象庁の防災情報JSONが持つ分。足りない期間はP2P地震情報の履歴で補う）: 気象庁 https://www.jma.go.jp/bosai/quake/data/list.json を
 #     サーバー側で取得して検索する（ブラウザから直接は取らない）。同じ地震(eid)の複数の電文は最新の震源情報に統合。
+#   ・日付を指定した検索: まず気象庁「震度データベース検索」（1919年〜2日前。震源・M・最大震度つき）の検索API
+#     https://www.data.jma.go.jp/svd/eqdb/data/shindo/api/api.php を使う（同ページが内部で使っているもの。公式の公開APIではない）。
+#     それが使えない場合・直近2日分は、2015-01-10以降はP2P地震情報の日付範囲検索（since_date/until_date）で直接さかのぼる。
+#     それより前は USGS の地震カタログ（FDSN API）で補う（M4.5以上が目安。最大震度は無い）。
 #   ・過去（数十年）: data/catalog.csv があれば、それも同時に検索する（任意）。
 #       列: time,lat,lon,depth,mag,place,maxi   （time はISO8601。JST以外なら +00:00 などを付ける。maxi は 1,2,3,4,5-,5+,6-,6+,7 または空欄）
 #       気象庁の震源カタログ等から、M・期間を絞って作る。巨大なファイルになる場合は M5以上などに絞ること。
@@ -2998,6 +3012,218 @@ def _p2p_recent(since):
         return _P2P_CACHE["rows"], _P2P_CACHE["err"]
 
 
+# ---- 日付範囲を指定した検索（P2P: 2015-01-10以降 ／ USGS: それ以前）----
+P2P_START = datetime(2015, 1, 10, tzinfo=JST).date()           # P2Pの地震情報が残っている最古の日
+P2P_RANGE_PAGES = 120           # 日付範囲検索でさかのぼる最大ページ数
+_P2P_SCALE_REQ = {"1": 10, "2": 20, "3": 30, "4": 40, "5-": 45, "5+": 50, "6-": 55, "6+": 60, "7": 70}
+_P2P_RANGE_CACHE = {}           # キー: (開始日, 終了日, 最小M, 最小震度) → (取得時刻, 行, エラー文)
+USGS_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
+USGS_DEFAULT_MINMAG = 4.5       # USGSは世界中の小さな地震まで持つ。日本周辺で網羅性が確かな目安（指定が無ければこれ）
+USGS_FLOOR_MINMAG = 4.0         # これより小さいMは取らない（件数が膨らみ、網羅性も落ちるため）
+USGS_LIMIT = 3000
+_USGS_CACHE = {}                # キー: (開始日, 終了日, 最小M) → (取得時刻, 行, エラー文)
+_RANGE_CACHE_MAX = 24
+
+
+def _cache_put(cache, key, val):
+    if len(cache) >= _RANGE_CACHE_MAX:
+        cache.pop(min(cache, key=lambda k: cache[k][0]), None)
+    cache[key] = val
+
+
+def _range_ttl(d1):
+    """終了日が今日に近ければ短く、十分過去なら長くキャッシュする[秒]"""
+    return 300.0 if d1 >= (datetime.now(JST) - timedelta(days=2)).date() else 6 * 3600.0
+
+
+def _p2p_range(d0, d1, min_mag=None, min_maxi=None):
+    """P2Pの日付範囲検索（d0〜d1、JSTの日付）。新しい方から取る。(行, エラー文)"""
+    d0 = max(d0, P2P_START)
+    if d1 < d0:
+        return [], None
+    key = (d0, d1, min_mag, min_maxi)
+    with _P2P_LOCK:
+        hit = _P2P_RANGE_CACHE.get(key)
+        if hit and time.time() - hit[0] < _range_ttl(d1):
+            return hit[1], hit[2]
+    q = "since_date=%s&until_date=%s&order=-1" % (d0.strftime("%Y%m%d"), d1.strftime("%Y%m%d"))
+    if min_mag is not None:
+        q += "&min_magnitude=%s" % min_mag
+    if min_maxi in _P2P_SCALE_REQ:
+        q += "&min_scale=%d" % _P2P_SCALE_REQ[min_maxi]
+    items, offset, err = [], 0, None
+    t_end = time.time() + P2P_DEADLINE_S
+    for _ in range(P2P_RANGE_PAGES):
+        if time.time() > t_end:
+            err = "P2P地震情報の取得が時間切れになりました（新しい側だけ表示。M・震度で絞ると古い側まで届きます）"
+            break
+        try:
+            req = urllib.request.Request("%s?%s&limit=%d&offset=%d" % (P2P_URL, q, P2P_PAGE, offset), headers={"User-Agent": "Quakecast/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                page = json.loads(r.read().decode("utf-8"))
+        except Exception as ex:
+            err = "P2P地震情報を取得できませんでした（%s）" % type(ex).__name__
+            break
+        if not isinstance(page, list) or not page:
+            break
+        items += page
+        offset += len(page)
+        if len(page) < P2P_PAGE:
+            break
+    else:
+        err = "P2P地震情報はここまでしかさかのぼれませんでした（新しい側だけ表示。M・震度で絞ると古い側まで届きます）"
+    rows = _p2p_rows(items)
+    if err is None or rows:
+        with _P2P_LOCK:
+            _cache_put(_P2P_RANGE_CACHE, key, (time.time() if err is None else time.time() - _range_ttl(d1) + 30.0, rows, err))
+    return rows, err
+
+
+# ---- 気象庁 震度データベース検索（1919年〜2日前）----
+JMA_DB_URL = "https://www.data.jma.go.jp/svd/eqdb/data/shindo/api/api.php"
+JMA_DB_START = datetime(1919, 1, 1, tzinfo=JST).date()
+JMA_DB_LAG_DAYS = 2             # データベースは「2日前まで」
+JMA_DB_PAGE = 1000              # 1回の検索で返る上限
+JMA_DB_MAX_PAGES = 6            # 上限に達したとき、古い側へ続けて取る最大回数
+_JMA_DB_INT = {"1": "1", "2": "2", "3": "3", "4": "4", "5-": "A", "5+": "B", "6-": "C", "6+": "D", "7": "7"}   # 検索条件の震度コード
+_JMA_DB_CACHE = {}
+_FW = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def _jma_db_maxi(s):
+    """'震度５弱' → '5-'、'震度１' → '1'（1996年以前の '震度５'・'震度６' は 5弱・6弱 扱い）"""
+    m = re.search(r"(\d)\s*([弱強])?", str(s or "").translate(_FW))
+    if not m:
+        return ""
+    n, k = m.group(1), m.group(2)
+    if n in "1234":
+        return n
+    if n == "7":
+        return "7"
+    if n in "56":
+        return n + ("+" if k == "強" else "-")
+    return ""
+
+
+def _jma_db_rows(res):
+    rows = []
+    for it in res or []:
+        if not isinstance(it, dict):
+            continue
+        m = re.match(r"(\d{4})/(\d{2})/(\d{2})\s+(\d{1,2}):(\d{2})", str(it.get("ot") or ""))
+        lat, lon = _to_float(it.get("lat")), _to_float(it.get("lon"))
+        if not m or not _coord_ok(lat, lon):
+            continue
+        y, mo, d, h, mi = map(int, m.groups())
+        dm = re.search(r"-?\d+(?:\.\d+)?", str(it.get("dep") or ""))
+        dep = float(dm.group(0)) if dm else None
+        mag = _to_float(it.get("mag"))
+        rows.append({"id": "j" + str(it.get("id") or ""), "t": datetime(y, mo, d, h, mi, tzinfo=JST), "place": (it.get("name") or "").strip(),
+                     "lat": lat, "lon": lon, "depth": dep if dep is not None and dep >= 0 else None,
+                     "mag": mag if mag is not None and mag >= 0 else None, "maxi": _jma_db_maxi(it.get("maxI")), "src": "jmadb"})
+    return rows
+
+
+def _jma_db_range(d0, d1, min_mag=None, min_maxi=None):
+    """気象庁 震度データベース検索の日付範囲検索（d0〜d1: JSTの日付）。新しい方から取る。(行, エラー文)"""
+    key = (d0, d1, min_mag, min_maxi)
+    hit = _JMA_DB_CACHE.get(key)
+    if hit and time.time() - hit[0] < _range_ttl(d1):
+        return hit[1], hit[2]
+    rows, seen, err = [], set(), None
+    t_to_d, t_to_t = d1.isoformat(), "23:59"
+    t_end = time.time() + P2P_DEADLINE_S
+    for page in range(JMA_DB_MAX_PAGES):
+        if time.time() > t_end:
+            err = "気象庁の震度データベースの取得が時間切れになりました（新しい側だけ表示。M・震度で絞ると古い側まで届きます）"
+            break
+        q = ("mode=search&dateTimeF[]=%s&dateTimeF[]=00:00&dateTimeT[]=%s&dateTimeT[]=%s&mag[]=%s&mag[]=9.9&dep[]=0&dep[]=999"
+             "&epi[]=99&pref[]=99&city[]=99&station[]=99&obsInt=1&maxInt=%s&additionalC=true&Sort=S0&Comp=C0&seisCount=false&observed=false"
+             ) % (d0.isoformat(), t_to_d, t_to_t, ("%g" % min_mag) if min_mag is not None else "0", _JMA_DB_INT.get(min_maxi or "", "1"))
+        try:
+            req = urllib.request.Request(JMA_DB_URL + "?" + q, headers={"User-Agent": "Quakecast/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except Exception as ex:
+            err = "気象庁の震度データベースを取得できませんでした（%s）" % type(ex).__name__
+            break
+        res = data.get("res") if isinstance(data, dict) else None
+        if not isinstance(res, list):
+            err = "気象庁の震度データベースの応答を解釈できませんでした"
+            break
+        got = _jma_db_rows(res)
+        new = [r for r in got if r["id"] not in seen]
+        seen.update(r["id"] for r in new)
+        rows += new
+        if len(res) < JMA_DB_PAGE:
+            break
+        oldest = min(r["t"] for r in got) if got else None
+        if oldest is None or (not new and page > 0) or oldest.date() < d0:
+            break
+        t_to_d, t_to_t = oldest.date().isoformat(), oldest.strftime("%H:%M")      # 古い側へ続ける（同じ分の地震は重複を除く）
+        if page == JMA_DB_MAX_PAGES - 1:
+            err = "震度データベースの結果が多いため新しい側%d件だけ取得しました（M・震度で絞ると古い側まで届きます）" % len(rows)
+    if rows or err is None:
+        _cache_put(_JMA_DB_CACHE, key, (time.time() if err is None else time.time() - _range_ttl(d1) + 30.0, rows, err))
+    return rows, err
+
+
+_USGS_NAME = {}
+
+
+def _usgs_name(lat, lon):
+    k = (round(lat, 1), round(lon, 1))
+    if k not in _USGS_NAME:
+        if len(_USGS_NAME) > 20000:
+            _USGS_NAME.clear()
+        _USGS_NAME[k] = _epi_name(lat, lon)
+    return _USGS_NAME[k]
+
+
+def _usgs_range(d0, d1, min_mag=None):
+    """USGSの地震カタログ（日本周辺）。最大震度は無い。震央地名は震源の位置から日本語で付ける。(行, エラー文)"""
+    mm = USGS_DEFAULT_MINMAG if min_mag is None else max(float(min_mag), USGS_FLOOR_MINMAG)
+    key = (d0, d1, mm)
+    hit = _USGS_CACHE.get(key)
+    if hit and time.time() - hit[0] < _range_ttl(d1):
+        return hit[1], hit[2]
+    # JSTの日付範囲 → UTC（前後1日余裕を見て、あとでJSTで絞り直す）
+    st, en = d0 - timedelta(days=1), d1 + timedelta(days=1)
+    url = ("%s?format=geojson&orderby=time&limit=%d&minmagnitude=%s&minlatitude=20&maxlatitude=47&minlongitude=122&maxlongitude=148"
+           "&starttime=%s&endtime=%s") % (USGS_URL, USGS_LIMIT, mm, st.isoformat(), en.isoformat())
+    rows, err = [], None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Quakecast/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        feats = data.get("features") or []
+        for f in feats:
+            pr, co = f.get("properties") or {}, (f.get("geometry") or {}).get("coordinates") or []
+            if len(co) < 2 or pr.get("time") is None:
+                continue
+            lon, lat = _to_float(co[0]), _to_float(co[1])
+            if not _coord_ok(lat, lon):
+                continue
+            t = datetime.fromtimestamp(float(pr["time"]) / 1000.0, tz=timezone.utc).astimezone(JST)
+            if not (d0 <= t.date() <= d1):
+                continue
+            name = _usgs_name(lat, lon)
+            if name == "日本の遠方" or any(w in name for w in ("台湾", "朝鮮", "中国", "ロシア", "サハリン", "フィリピン")):
+                continue                                              # 日本から遠い、または国外の震央地名（台湾・朝鮮半島・ロシアなど）
+            dep = _to_float(co[2]) if len(co) > 2 else None
+            rows.append({"id": "u" + str(f.get("id") or int(pr["time"])), "t": t, "place": name, "lat": lat, "lon": lon,
+                         "depth": dep if dep is not None and dep >= 0 else None, "mag": _to_float(pr.get("mag")),
+                         "maxi": "", "src": "usgs"})
+        if len(feats) >= USGS_LIMIT:
+            err = "USGSの結果が多いため新しい側%d件だけ取得しました（Mで絞ると古い側まで届きます）" % USGS_LIMIT
+    except Exception as ex:
+        err = "USGSの地震カタログを取得できませんでした（%s）" % type(ex).__name__
+    if rows or err is None:
+        _cache_put(_USGS_CACHE, key, (time.time() if err is None else time.time() - _range_ttl(d1) + 30.0, rows, err))
+    return rows, err
+
+
+
 def _catalog_rows():
     p = DATA_DIR / "catalog.csv"
     if not p.exists():
@@ -3026,16 +3252,32 @@ def search_quakes(date_from=None, date_to=None, min_mag=None, max_mag=None, min_
     recent, err = _jma_recent()
     jma_oldest = min([r["t"] for r in recent], default=None)
     since = datetime.combine(date_from, datetime.min.time(), JST) if date_from else datetime.now(JST) - timedelta(days=P2P_DEFAULT_DAYS)
-    p2p, p2p_err = [], None
-    if jma_oldest is None or since < jma_oldest:                  # 気象庁の一覧が足りない期間だけ、P2Pで補う
-        p2p, p2p_err = _p2p_recent(since)
-    err = "；".join(x for x in (err, p2p_err) if x) or None
+    p2p, p2p_err, usgs, usgs_err, db, db_err = [], None, [], None, [], None
+    today = datetime.now(JST).date()
+    if jma_oldest is None or since < jma_oldest:                  # 気象庁の一覧が足りない期間だけ、他の情報源で補う
+        if date_from or date_to:
+            r0, r1 = (date_from or JMA_DB_START), min(date_to or today, today)
+            b1 = min(r1, today - timedelta(days=JMA_DB_LAG_DAYS))
+            if r0 <= b1:                                         # 気象庁 震度データベース（1919年〜2日前。震源・M・最大震度つき）
+                db, db_err = _jma_db_range(r0, b1, min_mag, min_maxi)
+            db_ok = bool(db) or (r0 <= b1 and db_err is None)
+            p0 = max(r0, today - timedelta(days=JMA_DB_LAG_DAYS + 1)) if db_ok else r0     # 直近の数日、またはデータベースが使えないとき
+            if r1 >= P2P_START and p0 <= r1:                     # 2015-01-10以降: P2Pの日付範囲検索
+                p2p, p2p_err = _p2p_range(max(p0, P2P_START), r1, min_mag, min_maxi)
+            u0 = date_from or (date_to - timedelta(days=365) if date_to and date_to < P2P_START else None)
+            if not db_ok and u0 and u0 < P2P_START:              # データベースが使えないときだけ、それ以前をUSGSで補う（最大震度なし）
+                usgs, usgs_err = _usgs_range(u0, min(r1, P2P_START - timedelta(days=1)), min_mag)
+            if db_ok and db_err is None and not p2p:
+                p2p_err = None                                   # 直近数日の補完が取れなくても、データベース分が取れていれば警告しない
+        else:
+            p2p, p2p_err = _p2p_recent(since)
+    err = "；".join(x for x in (err, db_err, p2p_err, usgs_err) if x) or None
 
     def _k(r):
         return (r["t"].strftime("%Y%m%d%H%M"), round(r["lat"], 1), round(r["lon"], 1))
     seen = {_k(r) for r in recent}
     extra = []
-    for r in p2p + _catalog_rows():                               # 重複は 気象庁 → P2P → カタログ の順に優先
+    for r in db + p2p + usgs + _catalog_rows():                   # 重複は 気象庁(一覧) → 震度データベース → P2P → USGS → カタログ の順に優先
         if _k(r) not in seen:
             seen.add(_k(r)); extra.append(r)
     rows = list(recent) + extra
@@ -3067,7 +3309,7 @@ def search_quakes(date_from=None, date_to=None, min_mag=None, max_mag=None, min_
     elif sort == "int":
         out.sort(key=lambda r: -_MAXI_RANK.get(r["maxi"], 0))
     rng = ""
-    ts = [r["t"] for r in recent + p2p]
+    ts = [r["t"] for r in recent + db + p2p + usgs]
     if ts:
         rng = "%s 〜 %s" % (min(ts).strftime("%Y-%m-%d"), max(ts).strftime("%Y-%m-%d"))
     return out[:limit], len(out), rng, err
@@ -3094,7 +3336,8 @@ def api_quake_search():
               "lon": round(r["lon"], 3), "depth": None if r["depth"] is None else round(r["depth"], 1),
               "mag": r["mag"], "maxi": _MAXI_LABEL.get(r["maxi"], ""), "src": r["src"]} for r in res]
     return _json_response({"items": items, "total": total, "recentRange": rng, "error": err,
-                           "catalog": (DATA_DIR / "catalog.csv").exists()})
+                           "catalog": (DATA_DIR / "catalog.csv").exists(),
+                           "usgs": any(r["src"] == "usgs" for r in res), "jmadb": any(r["src"] == "jmadb" for r in res), "p2pStart": P2P_START.isoformat()})
 
 
 @app.get("/healthz")
@@ -3285,6 +3528,7 @@ INDEX_HTML = r"""<!doctype html>
   #tabbar button.on{background:var(--acc);color:#04101f}
   #tabbar .badge{position:absolute;top:-5px;right:-3px;min-width:18px;height:18px;line-height:18px;border-radius:9px;
     background:#ff4d4d;color:#fff;font-size:11px;padding:0 5px;display:none;text-align:center}
+  body.modeSim #eewcards,body.modeSim #tsucard,body.modeSim #tabbar,body.modeSim #infoView{display:none !important}
   #infoView{display:none;position:fixed;inset:0;z-index:2000;background:var(--bg);flex-direction:column}
   #infoHead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 280px 10px 16px;border-bottom:1px solid var(--line)}
   #infoHead .it{font-size:16px;font-weight:800;margin-right:6px}
@@ -3392,6 +3636,8 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <div class="hint">選択中の地震の震源は、地図をクリックして設定できます（北緯-10〜70°・東経90〜180°）。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
 
+  <label style="display:flex;align-items:center;gap:6px;margin-top:10px">表示モード <select id="appMode" style="width:auto;flex:1"><option value="monitor" selected>強震モニタ（EEW・津波・地震情報）</option><option value="sim">地震の再現のみ（揺れだけ）</option></select></label>
+  <div class="hint" id="appModeHint" style="display:none">モードを変えたら、もう一度シミュレーションを実行してください。</div>
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px">地図の塗りつぶし <select id="fillMode" style="width:auto;flex:1"><option value="both" selected>警報対象＋予想震度</option><option value="pred">予想震度</option><option value="warn">警報対象範囲</option><option value="off">塗りつぶさない</option></select></label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" style="width:auto"> その時点で観測された最大震度を表示（各観測点の最大値を保持）</label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="muOn" type="checkbox" style="width:auto"> 震度計が未入電となる可能性（計測震度5.5以上の観測点が、震度が大きいほど高い確率で「未入電(5弱以上)」になる。確率は低め：6.5で約1割）</label>
@@ -3411,10 +3657,10 @@ INDEX_HTML = r"""<!doctype html>
   <h2>②' 実際の地震を検索</h2>
   <div id="qsBox">
     <div class="qsRow" id="qsPeriod">
-      <button class="qsChip" data-d="1">今日</button><button class="qsChip" data-d="3">3日</button><button class="qsChip" data-d="7">1週間</button><button class="qsChip on" data-d="0">全期間</button><button class="qsChip" data-d="-1">日付指定</button>
+      <button class="qsChip" data-d="1">今日</button><button class="qsChip" data-d="3">3日</button><button class="qsChip" data-d="7">1週間</button><button class="qsChip" data-d="30">1か月</button><button class="qsChip" data-d="365">1年</button><button class="qsChip on" data-d="0">全期間</button><button class="qsChip" data-d="-1">日付指定</button>
     </div>
     <div class="qsRow" id="qsDates" style="display:none">
-      <input id="qsFrom" type="date" class="qsIn"><span style="align-self:center">〜</span><input id="qsTo" type="date" class="qsIn">
+      <input id="qsFrom" type="date" class="qsIn" min="1900-01-01"><span style="align-self:center">〜</span><input id="qsTo" type="date" class="qsIn" min="1900-01-01">
     </div>
     <div class="qsRow" id="qsQuick">
       <button class="qsChip" data-k="int3">震度3以上</button><button class="qsChip" data-k="int5">震度5弱以上</button><button class="qsChip" data-k="m5">M5以上</button><button class="qsChip" data-k="m6">M6以上</button><button class="qsChip" data-k="deep">深発(100km〜)</button>
@@ -3770,7 +4016,8 @@ async function qsSearch(){
     qsItems=j.items||[]; qsLast=-1; box.innerHTML='';
     let m=j.total+'件'+(j.total>qsItems.length?'（先頭'+qsItems.length+'件を表示。条件を絞ってください）':'');
     if(j.recentRange) m+=' ／ 取得範囲: '+j.recentRange;
-    if(!j.catalog) m+=' ／ 長期データ(data/catalog.csv)なし';
+    if(j.jmadb) m+=' ／ 気象庁 震度データベース（震度1以上を観測した地震）を含む';
+    if(j.usgs) m+=' ／ USGSのデータを含む（最大震度なし。M4.5以上が目安）';
     if(j.error) m+=' ／ ⚠ '+j.error;
     msg.textContent=m;
     if(!qsItems.length) box.innerHTML='<div class="hint">該当する地震がありません。条件をゆるめてください。</div>';
@@ -5138,13 +5385,29 @@ $('play').onclick=()=>{
 $('restart').onclick=()=>{ if(!sim) return; aSilence(); tcur=0; $('seek').value=0; $('tlabel').textContent='0.0 s'; };
 $('seek').addEventListener('input',()=>{ if(!sim) return; tcur=Math.min(sToT(parseInt($('seek').value)),limT()); $('seek').value=tToS(tcur); $('tlabel').textContent=fmtT(tcur); });
 
+/* ---------- 表示モード（強震モニタ／地震の再現のみ） ---------- */
+let appMode='monitor';
+try{ if(localStorage.getItem('appMode')==='sim') appMode='sim'; }catch(_){}
+function applyMode(){
+  $('appMode').value=appMode;
+  document.body.classList.toggle('modeSim',appMode==='sim');
+  if(appMode==='sim'&&curTab==='info') showTab('mon',false);
+}
+$('appMode').addEventListener('change',()=>{
+  appMode=$('appMode').value==='sim'?'sim':'monitor';
+  try{ localStorage.setItem('appMode',appMode); }catch(_){}
+  applyMode();
+  $('appModeHint').style.display=(sim&&sim.mode!==appMode)?'block':'none';
+});
+applyMode();
+
 /* ---------- 実行 ---------- */
 $('runFab').onclick=()=>{ if(!$('run').disabled) $('run').click(); };
 document.addEventListener('keydown',e=>{            // Enterキーでも実行（入力欄の操作中は除く）
   if(e.key==='Enter'&&!e.isComposing&&!/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test((e.target.tagName||''))) $('runFab').click(); });
 $('run').onclick=async()=>{
   const body={quakes:QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay,plum:(q.plum===true||q.plum===false)?q.plum:null})),
-              gz:(typeof DecompressionStream!=='undefined')};
+              gz:(typeof DecompressionStream!=='undefined'), mode:appMode};
   if(!QS.every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
   if(runCtl) runCtl.abort(); const ctl=runCtl=new AbortController();
   $('run').disabled=$('runFab').disabled=true; $('runFab').textContent='計算中…'; $('status').textContent='計算中…'; playing=false; waitFlag=false;
@@ -5173,6 +5436,7 @@ $('run').onclick=async()=>{
       muInfoPatch(v);
       PEAK=null; peakF=-1;
       v.quakes.forEach(q=>{ q.eew={reports:[]}; q.eewUpto=0; q.eewDone=false; });
+      $('appModeHint').style.display='none';
       // 地震動の計算範囲(tSeis)の後ろに、津波・地震情報の発表が終わるまで時間軸を延長する
       v.tSeis=v.tEnd; v.hasTsu=(v.tsuEnd||0)>v.tEnd+1;
       { const ext=Math.max(v.tsuEnd||0,(v.info&&v.info.end)||0); v.tsuExt=ext>v.tEnd+1; if(v.tsuExt) v.tEnd=ext; }
@@ -5181,7 +5445,7 @@ $('run').onclick=async()=>{
       sim=v; tcur=0; audioReset(); buildEewCards(v.quakes.length);
       $('seek').disabled=false; $('seek').max=v.tsuExt?2000:Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
       showResult(v);
-      $('status').textContent='再生中（EEW演算中）';
+      $('status').textContent=v.mode==='sim'?'再生中':'再生中（EEW演算中）';
       playing=true; $('play').textContent='❚❚'; $('run').disabled=$('runFab').disabled=false;
       $('runFab').classList.remove('idle'); $('runFab').textContent='↻ もう一度実行';
       if(window.innerWidth<=700) $('panel').classList.remove('open');
