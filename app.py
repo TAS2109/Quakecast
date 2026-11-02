@@ -3301,9 +3301,12 @@ INDEX_HTML = r"""<!doctype html>
   .eewcard .warn{margin-top:5px;padding:4px 8px;border-radius:6px;background:#000b;border-left:5px solid #ffd23b;color:#fff3b0;font-size:14.5px;font-weight:800;line-height:1.4;white-space:normal}
   .eewcard .warn:empty{display:none}
   .eewcard .pos{margin-top:4px}
+  .eewcard.plumonly .tiles{grid-template-columns:1fr}
+  .eewcard.plumonly .tile.t-mag,.eewcard.plumonly .tile.t-dep{display:none}
   .eewcard .pos:empty{display:none}
   .eewcard .pos.noint{color:#ffd23b;font-weight:700}
   .eewcard .plumTag{display:inline-block;margin:0 6px;padding:0 7px;border-radius:6px;background:#ffd23b;color:#111;font-size:.95em;font-weight:900;letter-spacing:.06em;text-shadow:none;box-shadow:0 0 6px #ffd23b99;vertical-align:baseline}
+  .eewcard .plumTag.sub{background:transparent;color:#ffd23b;border:1px solid #ffd23b99;box-shadow:none;font-size:.7em;font-weight:700;padding:0 5px;letter-spacing:.04em}
   .eewcard details.histbox{margin-top:2px}
   .eewcard details.histbox>summary{cursor:pointer;font-size:10.5px;color:#cfd8ea;font-weight:600;user-select:none}
   .eewcard table.hist{margin-top:0}
@@ -4266,13 +4269,13 @@ function updateObs(m,i,mu){
 function buildEewCards(n){
   const box=$('eewcards'); box.innerHTML=''; eewCards=[]; eewCurs=new Array(n).fill(null);
   for(let i=0;i<n;i++){
-    const c=document.createElement('div'); c.className='card eewcard lv0';
+    const c=document.createElement('div'); c.className='card eewcard lv0'; c.style.display='none'; c._dsp='none';   // 最初のEEW発表まで表示しない
     c.innerHTML='<div class="eh"><span class="ett r-ett">緊急地震速報'+(n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span>地震'+(i+1):'')+'</span>'
       +'</div>'
       +'<div class="tiles">'
       +'<div class="tile"><div class="k">予想最大震度</div><div class="v r-max"><span class="chipbig" style="background:#3a4357">-</span></div></div>'
-      +'<div class="tile"><div class="k">マグニチュード</div><div class="v r-mag">-</div></div>'
-      +'<div class="tile"><div class="k">深さ</div><div class="v eewDep r-dep">-</div></div></div>'
+      +'<div class="tile t-mag"><div class="k">マグニチュード</div><div class="v r-mag">-</div></div>'
+      +'<div class="tile t-dep"><div class="k">深さ</div><div class="v eewDep r-dep">-</div></div></div>'
       +'<div class="pos r-pos">シミュレーション実行後に表示</div>'
       +'<div class="warn r-warn"></div>'
       +'<details class="histbox"><summary>報の履歴</summary><table class="hist r-hist"></table></details>';
@@ -4288,7 +4291,7 @@ function eewTitle(i,cur,lvmax){
   const n=sim?sim.quakes.length:1;
   const mk=n>1?'　<span style="color:'+QCOL[i%QCOL.length]+'">●</span>地震'+(i+1):'';
   if(!cur) return '緊急地震速報'+mk;
-  return '緊急地震速報('+EEW_LBL[lvmax]+')'+(cur.plum?'<span class="plumTag">PLUM報</span>':'　')+escH(cur.epiName||'震源付近')+'で地震　#'+cur.no+(cur.final?'(最終)':'')+mk;
+  return '緊急地震速報('+EEW_LBL[lvmax]+')'+(cur.plumOnly?'<span class="plumTag">PLUM法</span>':(cur.plum?'<span class="plumTag sub">PLUM法</span>':'　'))+escH(cur.epiName||'震源付近')+'で地震　#'+cur.no+(cur.final?'(最終)':'')+mk;
 }
 function updateEewCard(qk,i){
   const C=eewCards[i]; if(!C) return;
@@ -4296,6 +4299,8 @@ function updateEewCard(qk,i){
   let cur=null, lvmax=0;
   if(e){ for(let k=0;k<e.reports.length;k++){ const r=e.reports[k]; if(r.t>tcur) break; cur=r; if(r.lv>lvmax) lvmax=r.lv; } }
   eewCurs[i]=cur;
+  const shown=!!cur;                                       // 最初の報が発表されるまでカードを出さない（発表に伴って増える）
+  if(card._dsp!==(shown?'':'none')){ card._dsp=shown?'':'none'; card.style.display=card._dsp; }
   if(!cur){
     card.className='card eewcard lv0';
     eewSet(R('ett'),eewTitle(i,null,0));
@@ -4305,12 +4310,12 @@ function updateEewCard(qk,i){
     eewTxt(R('warn'),''); eewSet(R('hist'),'');
     return;
   }
-  card.className='card eewcard lv'+lvmax;
+  card.className='card eewcard lv'+lvmax+(cur.plumOnly?' plumonly':'');
   eewSet(R('ett'),eewTitle(i,cur,lvmax));
   const tc=(cur.maxCls===2||cur.maxCls===3)?'#111':'#fff';
   eewSet(R('max'),'<span class="chipbig" style="background:'+clsColor(cur.maxCls)+';color:'+tc+'">'+cur.maxLabel+'</span>');
-  eewSet(R('mag'),'M'+cur.mag.toFixed(1));
-  eewSet(R('dep'),cur.depth+'<small>km</small>');
+  if(cur.plumOnly){ eewSet(R('mag'),'-'); eewSet(R('dep'),'-'); }       // PLUM法（仮定震源）はM・深さを表示しない
+  else{ eewSet(R('mag'),'M'+cur.mag.toFixed(1)); eewSet(R('dep'),cur.depth+'<small>km</small>'); }
   R('pos').classList.toggle('noint',!!cur.noInt);        // 震源名・座標の行は出さない（発表前後の状態表示と、深発地震の注記のみ）
   eewTxt(R('pos'),cur.noInt?'深発地震のため予想震度不明':'');
   // 警報対象は地名だけを1行で表示（区域別の予想震度は表示しない）。範囲が広ければ地域区分でまとめる
@@ -4325,7 +4330,7 @@ function updateEewCard(qk,i){
   eewTxt(R('warn'),w);
   const hist=e.reports.filter(r=>r.t<=tcur).slice(-4).reverse();
   eewSet(R('hist'),'<tr><td>報</td><td>経過</td><td>M</td><td>深さ</td><td>最大</td></tr>'
-    +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+r.mag.toFixed(1)+'</td><td>'+r.depth+'km</td><td>'+r.maxLabel+'</td></tr>').join(''));
+    +hist.map(r=>'<tr><td>'+r.no+'</td><td>'+r.t+'秒</td><td>'+(r.plumOnly?'PLUM法':r.mag.toFixed(1))+'</td><td>'+(r.plumOnly?'-':r.depth+'km')+'</td><td>'+r.maxLabel+'</td></tr>').join(''));
 }
 
 /* ---------- 津波警報・注意報・津波情報 ---------- */
@@ -5084,7 +5089,7 @@ function audioCollect(t0,t1){
       else if(k===0){ if(inW) ev.push({s:'eewFcst',p:70,k:true,x:'緊急地震速報。'+epi+'で地震。'}); spC=r.maxCls; spM=r.mag; spT=r.t; }
       else if(r.maxCls!==spC||Math.abs(r.mag-spM)>=0.3||r.t-spT>=10){
         // 予想最大震度が変わった／予想Mが0.3以上変わった／10秒以上読み上げていない → 現在の推定を読み上げる
-        if(inW) ev.push({s:'eewUpd',p:50,x:(r.maxCls>=1?'推定最大震度'+aSh(r.maxCls)+'、':'')+'マグニチュード'+r.mag.toFixed(1)+'。'});
+        if(inW) ev.push({s:'eewUpd',p:50,x:(r.maxCls>=1?'推定最大震度'+aSh(r.maxCls)+(r.plumOnly?'。':'、'):'')+(r.plumOnly?'':'マグニチュード'+r.mag.toFixed(1)+'。')});
         spC=r.maxCls; spM=r.mag; spT=r.t;
       }
       if(r.lv>lvm) lvm=r.lv; if(r.maxCls>cls) cls=r.maxCls;
