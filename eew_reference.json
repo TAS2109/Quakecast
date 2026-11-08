@@ -1,0 +1,86 @@
+{
+  "_readme": "気象庁の実際のEEWとの比較用データ。値が null の項目は比較しない。eew の値は『気象庁の発表記録』で確認できたものだけを入れてください（推測で埋めない）。first/final = 第1報/最終報。max_pred は予想最大震度（1,2,3,4,5-,5+,6-,6+,7）。final_after_first_s = 第1報から最終報までの秒数。lat/lon/mag/depth は気象庁が確定した震源（シミュレーションの入力）。",
+  "envelope": {
+    "_note": "既存コード(app.py)のコメントにある『気象庁の警報発表事例の実測』から転記。final_rel = 最初のP波検知から最終報までの秒、n_reports = 報数。マグニチュード帯ごとの許容範囲で、サンプル数が少ないため単一の事例は±20%程度の幅を持たせている。",
+    "bands": [
+      {"mag": [4.0, 5.2], "final_rel": [50, 60], "n_reports": [7, 16], "src": "M4〜5: 最終報約55s / 報数 M4.2〜4.3=10〜11, M5前後=7〜16"},
+      {"mag": [5.7, 6.3], "final_rel": [60, 90], "n_reports": [15, 23], "src": "M5.9=67s, M6.1=85s / M6.1=19報"},
+      {"mag": [6.5, 6.8], "final_rel": [116, 144], "n_reports": [16, 26], "src": "M6.6=116〜144s, M6.7=131s / 16〜26報"},
+      {"mag": [7.2, 7.5], "final_rel": [237, 266], "n_reports": [63, 70], "src": "M7.3〜7.4(沖合)=237〜266s / 63〜70報"},
+      {"mag": [7.55, 7.7], "final_rel": [240, 260], "n_reports": null, "src": "M7.6=249s"}
+    ]
+  },
+  "cases": [
+    {
+      "id": "noto2024",
+      "name": "能登半島地震(2024-01-01)",
+      "lat": 37.49, "lon": 137.27, "mag": 7.6, "depth": 15,
+      "observed_max": "7",
+      "plum_only": false,
+      "eew": {"warning_issued": true, "special_warning_issued": null,
+              "first": null, "final": null, "n_reports": null, "final_after_first_s": null},
+      "note": "震源は既存プリセットの値（概略）。"
+    },
+    {
+      "id": "kumamoto2016",
+      "name": "熊本地震 本震(2016-04-16)",
+      "lat": 32.74, "lon": 130.76, "mag": 7.3, "depth": 12,
+      "observed_max": "7",
+      "plum_only": false,
+      "eew": {"warning_issued": true, "special_warning_issued": null,
+              "first": null, "final": null, "n_reports": null, "final_after_first_s": null}
+    },
+    {
+      "id": "tohoku2011",
+      "name": "東北地方太平洋沖地震(2011-03-11)",
+      "lat": 38.10, "lon": 142.86, "mag": 9.0, "depth": 24,
+      "observed_max": "7",
+      "plum_only": false,
+      "eew": {"warning_issued": true, "special_warning_issued": null,
+              "first": null,
+              "final": {"mag": 8.1},
+              "n_reports": null, "final_after_first_s": null},
+      "note": "EEW最終報のMは8.1（実際のEEWは巨大地震のMを過小評価した）。要確認。第1報などは未入力。"
+    },
+    {
+      "id": "fukushima2022",
+      "name": "福島県沖の地震(2022-03-16 23:36)",
+      "lat": 37.70, "lon": 141.60, "mag": 7.4, "depth": 57,
+      "observed_max": "6+",
+      "plum_only": true,
+      "eew": {"warning_issued": true, "special_warning_issued": null,
+              "first": null, "final": null, "n_reports": null, "final_after_first_s": null},
+      "note": "直前のM6.1と重なり、気象庁はPLUM法のみで発表（app.pyのコメントに基づく）。"
+    },
+    {
+      "id": "fukushima2021",
+      "name": "福島県沖の地震(2021-02-13)",
+      "lat": 37.73, "lon": 141.70, "mag": 7.3, "depth": 55,
+      "observed_max": "6+",
+      "plum_only": false,
+      "eew": {"warning_issued": true, "special_warning_issued": null,
+              "first": null, "final": null, "n_reports": null, "final_after_first_s": null},
+      "note": "震源・Mは概略。要確認。"
+    },
+    {
+      "id": "iburi2018",
+      "name": "北海道胆振東部地震(2018-09-06)",
+      "lat": 42.69, "lon": 142.00, "mag": 6.7, "depth": 37,
+      "observed_max": "7",
+      "plum_only": false,
+      "eew": {"warning_issued": true, "special_warning_issued": null,
+              "first": null, "final": null, "n_reports": null, "final_after_first_s": null},
+      "note": "震源直下に近く、警報が間に合わない領域が大きい事例。"
+    },
+    {
+      "id": "ogasawara2015",
+      "name": "小笠原諸島西方沖(2015-05-30・深発)",
+      "lat": 27.9, "lon": 140.7, "mag": 8.1, "depth": 682,
+      "observed_max": "5+",
+      "plum_only": false,
+      "eew": {"warning_issued": null, "special_warning_issued": null,
+              "first": null, "final": null, "n_reports": null, "final_after_first_s": null},
+      "note": "深発地震の判定（EEW_DEEP_KM）の確認用。EEWの実発表は未入力。"
+    }
+  ]
+}
