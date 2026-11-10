@@ -29,8 +29,10 @@ Webアプリ（震度計算ロジックはPythonへ移植）。
        gunicorn app:app     (本番 / Render)
 """
 import base64
+import copy
 import csv
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -1787,7 +1789,7 @@ def build_eew(mag, depth, lat0, lon0, tp, rt, t_end):
     return {"reports": reports} if reports else None
 
 
-def quake_core(lat0, lon0, mag, depth, dt=1.0):
+def quake_core(lat0, lon0, mag, depth, dt=1.0, lite=False):
     """1つの地震の計算（最終震度・P/S波の到達距離曲線・リアルタイム震度フレーム）。
     震源の発生時刻を0秒とした「その地震だけのローカル時間」で返す。"""
     m01, dist, dep_p, src = final_intensity(mag, depth, lat0, lon0)
@@ -1811,8 +1813,37 @@ def quake_core(lat0, lon0, mag, depth, dt=1.0):
     # さらに「全観測点が震度1未満（計測震度0.5未満）に戻る」までは強震モニタを表示し続ける
     finite = tatsu[np.isfinite(tatsu)]
     t_far = float(finite.max()) if len(finite) else t_valid
-    t_end0 = float(np.clip(t_far + 90.0, 60.0, min(540.0, t_valid)))
+    t_end0_old = float(np.clip(t_far + 90.0, 60.0, min(540.0, t_valid)))     # 従来の式（津波側の時刻計算の基準に使う）
+    # 地震動フェーズの長さ: 「実際に揺れる陸上観測点（計測震度0.5以上）」にS波が届くまで＋60秒を基本にする。
+    #   ・弱い地震: 揺れない遠くの観測点まで波が進むのを待たない（何も起きない時間を作らない）
+    #   ・遠地・広域: 従来の上限540秒で波の到達前に打ち切られないよう、走時表の範囲(600秒)まで延ばす
+    #   ・EEWが出る地震: 最終報（最初のP波検知＋最終報の目安）までは続ける
+    rel_land = (m01 >= 0.5) & ST_LAND
+    t_need = 60.0
+    fin_rel = tatsu[rel_land & np.isfinite(tatsu)]
+    if len(fin_rel):
+        t_need = max(t_need, float(fin_rel.max()) + 60.0)
+    elif rel_land.any():
+        t_need = t_valid                                  # 揺れるはずだが走時表の範囲では届かない（遠地）
+    tpl = tp[ST_LAND]
+    tpl = tpl[np.isfinite(tpl)]
+    tsl = tatsu[ST_LAND]
+    tsl = tsl[np.isfinite(tsl)]
+    if not len(tpl):
+        t_need = t_valid                                  # 遠地: 走時表の範囲内ではまだ波が日本に届かない。範囲いっぱいまで波の進行を見せる
+    else:
+        t_need = max(t_need, float(tpl.min()) + 60.0)     # 遠地: 最初のP波が日本の陸上観測点に届いて60秒後までは続ける（揺れが無くても到達は見せる）
+        if len(tsl):
+            t_need = max(t_need, float(tsl.min()) + 30.0)
+    if float(m01[ST_LAND].max()) >= 3.5 and len(tpl):     # 震度4以上: EEWの発表が続く間は終わらない
+        t_need = max(t_need, float(tpl.min()) + min(330.0, 1.6 * _eew_final_rel(mag)) + 5.0)
+    t_end0 = float(np.clip(t_need, 60.0, min(600.0, t_valid)))
     nf_cap = int(CLEAR_CAP_S / dt) + 1
+    if lite:
+        # 余震などの小さな地震: 揺れの尾を待つ上限(tail)が決まっているので、その先のフレームは計算しない（結果は同じで計算だけ軽い）
+        peak0 = float(m01[ST_LAND].max())
+        if peak0 < 4.5:
+            nf_cap = min(nf_cap, int((t_end0 + (90.0 if peak0 < 3.5 else 240.0)) / dt) + 2)
     tf = np.arange(nf_cap) * dt
     p_curve = np.interp(tf, tg, p_curve_f)
     s_curve = np.interp(tf, tg, s_curve_f)
@@ -1827,11 +1858,19 @@ def quake_core(lat0, lon0, mag, depth, dt=1.0):
     reach = np.isfinite(tatsu)                            # S波が届かない観測点は判定から除く
     act = np.where((rt[:, reach] >= 0.5).any(axis=1))[0] if reach.any() else []
     t_clear = float(tf[act[-1]] + dt) if len(act) else 0.0
-    t_end = float(max(t_end0, min(t_clear + 5.0, CLEAR_CAP_S - dt)))
+    # 全観測点が震度1未満に戻るまで待つが、弱い地震は減衰の尾を長く待たない（波が通過した後の待ちに上限）
+    peak_land = float(m01[ST_LAND].max())
+    tail = 90.0 if peak_land < 3.5 else (240.0 if peak_land < 4.5 else None)
+    t_clear_eff = t_clear + 5.0 if tail is None else min(t_clear + 5.0, t_end0 + tail)
+    t_end = float(max(t_end0, min(t_clear_eff, CLEAR_CAP_S - dt)))
+    t_ref = float(max(t_end0_old, min(t_clear + 5.0, CLEAR_CAP_S - dt)))     # 従来の終了時刻（津波の発表時刻の計算用）
     nf = int(t_end / dt) + 1
     tf, p_curve, s_curve, rt = tf[:nf], p_curve[:nf], s_curve[:nf], rt[:nf]
+    if t_clear + 5.0 > t_end + 1e-6 and nf > 24:          # 減衰の途中で打ち切った: 最後の20秒で揺れなしの状態へなだらかに戻す（色が残り続けないように）
+        w = np.linspace(0.0, 1.0, 20, dtype=np.float32)[:, None]
+        rt[-20:] = (1.0 - w) * rt[-20:] + w * rt[0][None, :]
     return {"m01": m01, "src": src, "p_curve": p_curve, "s_curve": s_curve,
-            "tp": tp, "rt": rt, "t_end": t_end, "nf": nf}
+            "tp": tp, "rt": rt, "t_end": t_end, "t_ref": t_ref, "nf": nf}
 
 
 def _area_list(m01):
@@ -1874,6 +1913,14 @@ INFO_GROUP_GAP = 60.0
 INFO_GROUP_DIST = 200.0
 
 
+def _quake_seed(q, salt=""):
+    """地震1件ごとの乱数シード。値は (緯度・経度・M・深さ・発生時刻) と用途(salt)だけで決まり、
+    ほかの地震が増減しても変わらない（プロセスをまたいでも同じ値になるよう、hash()ではなくblake2bを使う）"""
+    key = "%.4f,%.4f,%.2f,%.1f,%d|%s" % (float(q["lat"]), float(q["lon"]), float(q["mag"]), float(q["depth"]),
+                                          int(round(float(q.get("delay") or 0.0))), salt)
+    return int.from_bytes(hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest(), "big") % (2 ** 31)
+
+
 def group_quakes(quakes):
     """quakes のインデックスを、同じ地震として扱うグループに分ける（各グループは発生順）"""
     order = sorted(range(len(quakes)), key=lambda i: quakes[i]["delay"])
@@ -1910,8 +1957,7 @@ def _epi_name(lat, lon):
 
 def build_info(quakes, groups, grp_rt, tsus, dt):
     """グループごとの情報発表タイムライン（全地震を通した時間軸[秒]）。
-    grp_rt[k]: グループkの全観測点のリアルタイム震度フレーム（グループ内の地震の最大値）"""
-    rng = np.random.default_rng(int(abs(sum(q["lat"] * 1000 + q["lon"] * 100 + q["mag"] * 10 for q in quakes))) % (2 ** 31))
+    grp_rt[k]: グループkの (開始フレーム, 全観測点のリアルタイム震度フレーム[窓のみ])（グループ内の地震の最大値）"""
     la = ST_AREA[ST_LAND]
     nA = int(ST_AREA.max()) + 1
 
@@ -1935,11 +1981,13 @@ def build_info(quakes, groups, grp_rt, tsus, dt):
 
     out, end, end0 = [], 0.0, 0.0
     for k, g in enumerate(groups):
-        cm = np.maximum.accumulate(grp_rt[k][:, ST_LAND].astype(np.float32), axis=0)   # 各観測点の「その時点までの最大」
+        f0, arr = grp_rt[k]                               # 窓つきフレーム: (開始フレーム, 配列)。窓の前は先頭・後ろは最終フレームを保つ
+        cm = arr[:, ST_LAND].astype(np.float32)           # 各観測点の「その時点までの最大」（コピーを in-place で累積。長い時間軸でメモリを節約）
+        np.maximum.accumulate(cm, axis=0, out=cm)
         nf = cm.shape[0]
 
         def row_at(t):
-            return cm[min(max(int(round(t / dt)), 0), nf - 1)]
+            return cm[min(max(int(round(t / dt)) - f0, 0), nf - 1)]
 
         peak = float(cm[-1].max())
         if peak < 0.5:
@@ -1950,6 +1998,7 @@ def build_info(quakes, groups, grp_rt, tsus, dt):
         members = []
         for i in srcs:
             q = quakes[i]
+            rng = np.random.default_rng(_quake_seed(q, "info"))     # 地震ごとの乱数: 他の地震を足しても、この地震の発表内容は変わらない
             m1 = round(min(max(q["mag"] + float(rng.normal(0, 0.3)), q["mag"] - 0.5), q["mag"] + 0.5), 1)   # 速報値
             members.append({"epi": _epi_name(q["lat"], q["lon"]), "lat": round(q["lat"], 2), "lon": round(q["lon"], 2),
                             "depth": int(round(q["depth"])), "depth1": int(round(q["depth"] / 10.0)) * 10,
@@ -1996,12 +2045,14 @@ def build_info(quakes, groups, grp_rt, tsus, dt):
         def add(t, kind, upd, **kw):
             rels.append(dict(t=round(float(t), 1), k=kind, upd=bool(upd), mx=mx_of(t), **kw))
 
-        def jit(a=-8, b=9):
-            return float(rng.integers(a, b))
+        jit_key = quakes[srcs[0]]                         # 発表時刻のゆらぎは、グループの最初の地震と発表の種類ごとに固定する
+
+        def jit(label, a=-8, b=9):
+            return float(np.random.default_rng(_quake_seed(jit_key, "jit:" + label)).integers(a, b))
 
         if peak_cls >= 3:
-            first3 = float(np.argmax(cm.max(axis=1) >= 2.5)) * dt     # 最初に震度3以上を観測した時刻
-            t_sok = max(t0g + 90.0, first3 + 30.0) + jit(-5, 6)
+            first3 = (float(np.argmax(cm.max(axis=1) >= 2.5)) + f0) * dt     # 最初に震度3以上を観測した時刻
+            t_sok = max(t0g + 90.0, first3 + 30.0) + jit("sok", -5, 6)
             add(t_sok, "sokuho", False, areas=areas_ge(row_at(t_sok), 3))
             seen = {(a[0], a[1]) for a in rels[-1]["areas"]}
             for du in (60.0, 120.0, 180.0):               # 直後に区域・階級が増えたら震度速報を更新
@@ -2012,14 +2063,14 @@ def build_info(quakes, groups, grp_rt, tsus, dt):
                     seen = s_
             tg = t_sok
             for j, m in enumerate(members):
-                tg = max(m["delay"] + 150.0 + jit(-10, 11), (t_sok + 30.0) if j == 0 else (tg + 20.0))
+                tg = max(m["delay"] + 150.0 + jit("gen%d" % j, -10, 11), (t_sok + 30.0) if j == 0 else (tg + 20.0))
                 add(tg, "gensen", j > 0, mem=mem_at(tg, j), tsu=tsu_at(tg))
         else:
             tg = t0g + 240.0
         minc = 3 if peak_cls >= 3 else 1
         ts_ = tg
         for j, m in enumerate(members):
-            ts_ = max(m["delay"] + 300.0 + jit(-10, 11), ts_ + 60.0)
+            ts_ = max(m["delay"] + 300.0 + jit("gs%d" % j, -10, 11), ts_ + 60.0)
             add(ts_, "gs", j > 0, mem=mem_at(ts_, j), areas=areas_ge(row_at(ts_), minc), tsu=tsu_at(ts_), minc=minc)
         tk = max(tlast + 360.0, ts_ + 30.0)
         for n_, tt in enumerate((tk, tk + 240.0)):        # 各地の震度に関する情報（初報と更新）
@@ -2034,22 +2085,16 @@ def build_info(quakes, groups, grp_rt, tsus, dt):
                 old = [((-1 if stage == 1 else m["mag2"]) if m["giant"] else m["mag"]) for m in members]
                 add(tgs, "genkou", False, mem=mem_at(tgs, len(members) - 1), old=old, tsu=tsu_at(tgs))
         elif peak_cls >= 5:                               # 震度5弱以上: 約25〜30分後に震源要素を精査して更新
-            tgk = max(tlast + 1500.0 + jit(-60, 61), tk + 600.0)
+            tgk = max(tlast + 1500.0 + jit("tgk", -60, 61), tk + 600.0)
             add(tgk, "genkou", False, mem=mem_at(tgk, len(members) - 1), old=[m["mag1"] for m in members],
                 tsu=tsu_at(tgk))
         # 計測震度（小数第1位）は震度階級より大幅に遅れて発表する: 最後の地震の約2時間後の「各地の震度に関する情報」で初めて載せる
-        tkm = max(tlast + 7200.0 + jit(-300, 301), tk + 3600.0)
+        tkm = max(tlast + 7200.0 + jit("tkm", -300, 301), tk + 3600.0)
         add(tkm, "kakuchi", True, mem=mem_at(tkm, len(members) - 1), areas=areas_ge(row_at(tkm), 1, True), dtl=True)
         rels.sort(key=lambda r: r["t"])
         # 「この地震による津波の心配はありません」は、Mが初めて発表される情報（震源に関する情報／震源・震度に関する情報）に
         # 付く付加文なので、その発表時刻に合わせる（遠地は従来の遅い時刻を下回らない）
-        t_mag = min([r["t"] for r in rels if r["k"] in ("gensen", "gs")] or [None])
-        if t_mag is not None:
-            for i in g:
-                for r_ in tsus[i]["reports"]:
-                    if r_.get("kind") == "none":
-                        r_["t"] = round(float(t_mag if r_.get("near") else max(r_["t"], t_mag)), 1)
-                        tsus[i]["end"] = max(tsus[i]["end"], round(r_["t"] + 450.0, 1))
+        tsunami_align_none(tsus, g, rels)
         end = max(end, rels[-1]["t"])
         end0 = max(end0, max([r_["t"] for r_ in rels if r_["k"] != "genkou" and not r_.get("dtl")] or [0.0]))
         out.append({"t0": t0g, "members": mem_at(1e9, len(members) - 1), "releases": rels})
@@ -2065,68 +2110,241 @@ def _t_p_first(c, q):
     return float(hubeny_km(q["lat"], q["lon"], ST_LAT[ST_LAND], ST_LON[ST_LAND]).min()) / 8.0 + 15.0
 
 
-def sim_multi(quakes, dt=1.0, gz=False, monitor=True):
-    """複数の地震を同時に扱う。quakes: [{lat, lon, mag, depth, delay(秒, 整数)}, ...]
-    各地震を独立に計算し、delay秒ずらして重ね合わせる。
-    観測点ごとのリアルタイム震度・最終震度は、全地震の最大値を採用する。
-    monitor=False のときは「地震の再現のみ」: 津波・地震情報（震度速報など）の計算を省く。
-    戻り値: (基本データdict, [各地震の (tp, rt, t_end)])"""
-    cores = [quake_core(q["lat"], q["lon"], q["mag"], q["depth"], dt) for q in quakes]
-    if monitor:
-        tsus = [_shift_tsu(tsunami_for_quake(q["lat"], q["lon"], q["mag"], q["depth"], t_p1=_t_p_first(c, q), t_eew_end=min(c["t_end"], 540.0)), q["delay"])
-                for q, c in zip(quakes, cores)]
-    else:
-        tsus = [{"reports": [], "obs": [], "end": 0.0} for _ in quakes]
-    t_end = max(q["delay"] + c["t_end"] for q, c in zip(quakes, cores))
-    nf = int(t_end / dt) + 1
+# ---------------------------------------------------------------------
+# 地震1件ぶんの結果（他の地震に依存しない）と、それを「1件ずつ足していく」重ね合わせ
+# ---------------------------------------------------------------------
+MAX_DELAY_S = float(os.environ.get("QC_MAX_DELAY_S", 3600.0))      # 地震の発生時刻（開始からの秒数）の上限。余震対応のため300秒から拡張
+MAX_FRAME_BYTES = float(os.environ.get("QC_MAX_FRAME_MB", 200.0)) * 1e6   # 震度フレームの配列に使うメモリの目安（超えるときは400で断る。Renderの無料枠512MBを想定した既定値）
 
-    groups = group_quakes(quakes)                         # 震度速報・地震情報は、近い地震をまとめて1つとして発表
-    gid = {i: k for k, g in enumerate(groups) for i in g}
-    grp_rt = [None] * len(groups)
-    rt_all, m01_all = None, None
-    for i, (q, c) in enumerate(zip(quakes, cores)):
-        d = int(round(q["delay"] / dt))
-        rt = c["rt"]
-        sh = np.empty((nf, N_ST), dtype=np.float32)
-        sh[:d] = rt[0]                                    # 発生前: 揺れなし（観測点ごとの下限値）
-        sh[d:d + len(rt)] = rt
-        sh[d + len(rt):] = rt[-1]                         # 計算範囲の終了後は最終フレームを保持
-        rt_all = sh if rt_all is None else np.fmax(rt_all, sh)
-        grp_rt[gid[i]] = sh if grp_rt[gid[i]] is None else np.fmax(grp_rt[gid[i]], sh)
-        m01_all = c["m01"] if m01_all is None else np.maximum(m01_all, c["m01"])
 
-    info = build_info(quakes, groups, grp_rt, tsus, dt) if monitor else None   # 津波なし付加文の時刻をここで確定させる（tsuEndより先に）
-    qz = np.clip(np.round(rt_all * 10.0), -127, 127).astype(np.int8)
-    vmax = float(m01_all.max())
-    cls, label = shindo_class(vmax)
-    out = {
-        "dt": dt,
-        "nf": nf,
-        "ns": N_ST,
-        "q": base64.b64encode(gzip.compress(qz.tobytes(), compresslevel=6) if gz else qz.tobytes()).decode("ascii"),
-        "gz": bool(gz),
-        "final": _clean(m01_all, 2),
-        "max": _t1(vmax),
-        "maxCls": cls,
-        "maxLabel": label,
-        "areas": _area_list(m01_all),
-        "tEnd": t_end,
-        "tsuAreas": [[a[0], a[1], a[2], a[3]] for a in TSU_AREAS],
-        "tsuEnd": max([t["end"] for t in tsus] + [0.0]),
-        "info": info,
-        "ett": _eew_tt_payload(nf) if monitor else None,
-        "mode": "monitor" if monitor else "sim",
-        "quakes": [{
+def tsunami_unit(q, core):
+    """地震1件の津波警報等・津波観測を、全体の時間軸（delay秒ずらし）で返す。地震動の重ね合わせとは独立"""
+    return _shift_tsu(tsunami_for_quake(q["lat"], q["lon"], q["mag"], q["depth"],
+                                        t_p1=_t_p_first(core, q), t_eew_end=min(core["t_ref"], 540.0)), q["delay"])
+
+
+def tsunami_align_none(tsus, g, rels):
+    """「この地震による津波の心配はありません」は、Mが初めて発表される情報（震源に関する情報／震源・震度に関する情報）に
+    付く付加文なので、その発表時刻に合わせる（遠地は従来の遅い時刻を下回らない）。tsus[i] を直接書き換える
+    g: グループ内の地震インデックス / rels: そのグループの情報発表リスト"""
+    t_mag = min([r["t"] for r in rels if r["k"] in ("gensen", "gs")] or [None])
+    if t_mag is None:
+        return
+    for i in g:
+        for r_ in tsus[i]["reports"]:
+            if r_.get("kind") == "none":
+                r_["t"] = round(float(t_mag if r_.get("near") else max(r_["t"], t_mag)), 1)
+                tsus[i]["end"] = max(tsus[i]["end"], round(r_["t"] + 450.0, 1))
+
+
+def tsunami_phase(tsus):
+    """津波フェーズの時間枠（全体の時間軸[秒]）。t0: 最初の津波警報・注意報・津波情報の発表時刻（無ければNone）、
+    end: 津波に関する表示が終わる時刻。津波タブの分離・フェーズ切替の判断に使う（地震動の計算結果は見ない）"""
+    ts = [r["t"] for t in tsus for r in t["reports"] if r.get("kind") != "none"]
+    return {"t0": (round(min(ts), 1) if ts else None), "end": max([t["end"] for t in tsus] + [0.0])}
+
+
+def quake_unit(q, dt=1.0, monitor=True):
+    """地震1件ぶんの結果（震度フレーム・P/S波・津波）をまとめて返す。ほかの地震の有無で値は変わらない。
+    EEWは演算に時間がかかるため、ここでは含めず、eew_stream(...) を地震ごとに別途ストリームで回す"""
+    lite = bool(q.get("aft")) and q["mag"] < AFT_LITE_MAG        # 余震のうち小さいものは軽量に計算（津波も出ない規模）
+    core = quake_core(q["lat"], q["lon"], q["mag"], q["depth"], dt, lite=lite)
+    tsu = tsunami_unit(q, core) if (monitor and not lite) else {"reports": [], "obs": [], "end": 0.0}
+    return {"q": q, "core": core, "tsu": tsu}
+
+
+def _win_merge(a, b):
+    """窓つき震度フレーム (開始フレーム, 配列[F, N_ST]) を2つ重ねて最大を取る。
+    窓の外は、前は先頭フレーム・後ろは最終フレームを保つものとして扱う（Overlay と同じ規約）"""
+    (fa, A), (fb, B) = a, b
+    f0 = min(fa, fb)
+    f1 = max(fa + len(A), fb + len(B))
+    out = np.empty((f1 - f0, N_ST), dtype=np.float32)
+    for k, (f, X) in enumerate(((fa, A), (fb, B))):
+        s = f - f0
+        e = s + len(X)
+        if k == 0:
+            out[:s] = X[0]
+            out[s:e] = X
+            out[e:] = X[-1]
+        else:
+            np.fmax(out[:s], X[0], out=out[:s])
+            np.fmax(out[s:e], X, out=out[s:e])
+            np.fmax(out[e:], X[-1], out=out[e:])
+    return f0, out
+
+
+class Overlay:
+    """複数の地震を「1件ずつ足して」重ね合わせる。
+    観測点ごとのリアルタイム震度（全地震の最大）・最終震度・情報グループごとの震度は、add() のたびに更新する。
+    再生中の地震の追加や自動余震は、同じ Overlay に add() するだけで済む。"""
+
+    def __init__(self, dt=1.0, monitor=True):
+        self.dt = dt
+        self.monitor = monitor
+        self.units = []
+        self.nf = 0
+        self.t_end = 0.0
+        self.rt_all = None                                # 全観測点・全地震の最大のリアルタイム震度 [nf, N_ST]
+        self.m01_all = None                               # 最終震度
+        self.groups = []                                  # 情報グループ（地震インデックスのリスト）
+        self.grp_rt = []                                  # グループごとの震度フレーム
+
+    @property
+    def quakes(self):
+        return [u["q"] for u in self.units]
+
+    @staticmethod
+    def _pad(arr, nf):
+        """全体の時間軸が延びたとき、最終フレームを保持して延長する（どの地震も終了後は最終フレームを保つため、これで正しい）"""
+        if arr is None or arr.shape[0] >= nf:
+            return arr
+        return np.concatenate([arr, np.repeat(arr[-1:], nf - arr.shape[0], axis=0)], axis=0)
+
+    def _unit_win(self, j):
+        """地震jの窓つきフレーム (開始フレーム, 配列)。配列はコピーしない"""
+        u = self.units[j]
+        return int(round(u["q"]["delay"] / self.dt)), u["core"]["rt"]
+
+    def _info_member(self, j):
+        """地震情報の対象にするか。余震のうち陸上で震度1未満しか揺れないものは情報が出ないので、グループに入れない"""
+        u = self.units[j]
+        return (not u["q"].get("aft")) or float(u["core"]["m01"][ST_LAND].max()) >= AFT_INFO_MIN_M01
+
+    def add(self, q):
+        """地震を1件足す。戻り値: その地震のインデックス。既存の地震の結果（EEW・津波・震度）は変わらない"""
+        u = quake_unit(q, self.dt, self.monitor)
+        rt = u["core"]["rt"]
+        d = int(round(q["delay"] / self.dt))
+        nf = max(self.nf, d + len(rt))
+        used = sum(len(x["core"]["rt"]) for x in self.units) + len(rt)
+        if (nf * 3.0 + used * 1.2) * N_ST * 4.0 > MAX_FRAME_BYTES:
+            raise ValueError("計算する時間が長すぎます（発生時刻を小さくするか、地震の数を減らしてください）")
+        self.t_end = max(self.t_end, q["delay"] + u["core"]["t_end"])
+        i = len(self.units)
+        self.units.append(u)
+        # 全地震の最大のリアルタイム震度: 発生前は揺れなし（観測点ごとの下限値）、計算範囲の終了後は最終フレームを保持
+        if self.rt_all is None:
+            a = np.empty((nf, N_ST), dtype=np.float32)
+            a[:d] = rt[0]
+            a[d:d + len(rt)] = rt
+            self.rt_all = a
+        else:
+            a = self.rt_all = self._pad(self.rt_all, nf)
+            np.fmax(a[:d], rt[0], out=a[:d])
+            np.fmax(a[d:d + len(rt)], rt, out=a[d:d + len(rt)])
+            np.fmax(a[d + len(rt):], rt[-1], out=a[d + len(rt):])
+        self.nf = nf
+        m01 = u["core"]["m01"]
+        self.m01_all = m01 if self.m01_all is None else np.maximum(self.m01_all, m01)
+        self._regroup(i)
+        return i
+
+    def _regroup(self, i):
+        """情報グループを組み直す。グルーピングの判定は group_quakes と同じ（全地震の座標・時刻だけを見る軽い処理）。
+        震度フレームは「窓」（そのグループの地震が揺れている区間だけ）で持つので、時間軸が長くても、グループが多くてもメモリは小さい。
+        変わらないグループは使い回し、地震が1件増えただけのグループは1件ぶんだけ重ね、それ以外は作り直す"""
+        old = {frozenset(g): w for g, w in zip(self.groups, self.grp_rt)}
+        qs = self.quakes
+        idx = [j for j in range(len(qs)) if self._info_member(j)]
+        sub = [qs[j] for j in idx]
+        groups = [[idx[k] for k in g] for g in group_quakes(sub)] if sub else []
+        wins = []
+        for g in groups:
+            gs = frozenset(g)
+            w = old.get(gs)
+            if w is None:
+                rest = gs - {i}
+                if i in gs and rest and rest in old:
+                    w = _win_merge(old[rest], self._unit_win(i))
+                else:                                     # 複数のグループがつながった等: 構成する地震から作り直す
+                    for j in g:
+                        uw = self._unit_win(j)
+                        w = uw if w is None else _win_merge(w, uw)
+            wins.append(w)
+        self.groups, self.grp_rt = groups, wins
+
+    def cores(self):
+        """EEWのストリームに渡す (tp, rt, t_end) のリスト"""
+        return [(u["core"]["tp"], u["core"]["rt"], u["core"]["t_end"]) for u in self.units]
+
+    @staticmethod
+    def _qpay(q, c, ts):
+        """地震1件ぶんの送信データ（base と、ストリームの add で共通）"""
+        return {
             "lat": q["lat"], "lon": q["lon"], "mag": q["mag"], "depth": q["depth"],
-            "delay": q["delay"],
+            "delay": q["delay"], "aft": bool(q.get("aft")), "par": q.get("parent"),
             "P": _clean(c["p_curve"], 2),                 # その地震のローカル時間でのP波到達距離
             "S": _clean(c["s_curve"], 2),
             "tEnd": c["t_end"],
             "src": {"type": c["src"]["type"], "name": c["src"]["name"], "L": round(c["src"]["L"])},
             "tsu": ts,
-        } for q, c, ts in zip(quakes, cores, tsus)],
-    }
-    return out, [(c["tp"], c["rt"], c["t_end"]) for c in cores]
+        }
+
+    def qpay(self, i):
+        u = self.units[i]
+        return self._qpay(u["q"], u["core"], copy.deepcopy(u["tsu"]))
+
+    def window(self, i, gz=False):
+        """地震iの震度フレームだけ（開始フレームd・長さn・int8）。受け取った側が最大値で重ね合わせる"""
+        d, rt = self._unit_win(i)
+        raw = np.clip(np.round(rt * 10.0), -127, 127).astype(np.int8).tobytes()
+        return {"d": d, "n": int(len(rt)), "gz": bool(gz),
+                "b": base64.b64encode(gzip.compress(raw, compresslevel=3) if gz else raw).decode("ascii")}
+
+    def agg(self):
+        """地震が増えるたびに変わる集計値（震度フレーム・各地震のP/S曲線は含まない）"""
+        tsus = copy.deepcopy([u["tsu"] for u in self.units])
+        info = build_info(self.quakes, self.groups, self.grp_rt, tsus, self.dt) if self.monitor else None
+        vmax = float(self.m01_all.max())
+        cls, label = shindo_class(vmax)
+        return {"final": _clean(self.m01_all, 2), "max": _t1(vmax), "maxCls": cls, "maxLabel": label,
+                "areas": _area_list(self.m01_all), "tEnd": self.t_end,
+                "tsuEnd": max([t["end"] for t in tsus] + [0.0]), "tsuPhase": tsunami_phase(tsus), "info": info,
+                "ett": _eew_tt_payload(self.nf) if self.monitor else None,
+                "tsus": {str(i): ts for i, ts in enumerate(tsus) if ts.get("reports")}}
+
+    def base(self, gz=False):
+        """再生に必要な基本データ（従来の sim_multi の戻り値の第1要素と同じ形式）"""
+        quakes, cores = self.quakes, [u["core"] for u in self.units]
+        tsus = copy.deepcopy([u["tsu"] for u in self.units])    # 津波なし付加文の時刻調整は、保存している結果を書き換えないようコピーに対して行う
+        info = build_info(quakes, self.groups, self.grp_rt, tsus, self.dt) if self.monitor else None   # 津波なし付加文の時刻をここで確定させる（tsuEndより先に）
+        qz = np.empty(self.rt_all.shape, dtype=np.int8)
+        for a_ in range(0, self.nf, 256):                       # 一時配列を小さく保つため、256フレームずつ量子化する
+            qz[a_:a_ + 256] = np.clip(np.round(self.rt_all[a_:a_ + 256] * 10.0), -127, 127).astype(np.int8)
+        vmax = float(self.m01_all.max())
+        cls, label = shindo_class(vmax)
+        return {
+            "dt": self.dt,
+            "nf": self.nf,
+            "ns": N_ST,
+            "q": base64.b64encode(gzip.compress(qz.tobytes(), compresslevel=6) if gz else qz.tobytes()).decode("ascii"),
+            "gz": bool(gz),
+            "final": _clean(self.m01_all, 2),
+            "max": _t1(vmax),
+            "maxCls": cls,
+            "maxLabel": label,
+            "areas": _area_list(self.m01_all),
+            "tEnd": self.t_end,
+            "tsuAreas": [[a[0], a[1], a[2], a[3]] for a in TSU_AREAS],
+            "tsuEnd": max([t["end"] for t in tsus] + [0.0]),
+            "tsuPhase": tsunami_phase(tsus),
+            "info": info,
+            "ett": _eew_tt_payload(self.nf) if self.monitor else None,
+            "mode": "monitor" if self.monitor else "sim",
+            "quakes": [self._qpay(q, c, ts) for q, c, ts in zip(quakes, cores, tsus)],
+        }
+
+
+def sim_multi(quakes, dt=1.0, gz=False, monitor=True):
+    """複数の地震を同時に扱う（Overlay に1件ずつ足して、基本データを作る）。quakes: [{lat, lon, mag, depth, delay(秒, 整数)}, ...]
+    観測点ごとのリアルタイム震度・最終震度は、全地震の最大値を採用する。
+    monitor=False のときは「地震の再現のみ」: 津波・地震情報（震度速報など）の計算を省く。
+    戻り値: (基本データdict, [各地震の (tp, rt, t_end)])"""
+    ov = Overlay(dt, monitor)
+    for q in quakes:
+        ov.add(q)
+    return ov.base(gz), ov.cores()
 
 
 # =====================================================================
@@ -2661,6 +2879,102 @@ def _shift_report(r, delay):
 
 
 # =====================================================================
+# 2f. 余震（本震から経験則で余震列を作る）
+#   ・規模: グーテンベルク・リヒター則（b値）。最大余震が本震より ΔM（既定1.2）ほど小さくなるよう件数を決める（Båthの法則）
+#   ・時間: 大森・宇津則  n(t) = K / (t + c)^p  （発生直後ほど多く、時間とともに減る）
+#   ・場所: 本震の断層面（Wells & Coppersmith 1994 の式）の広がりに沿った正規分布。走向は乱数で決める
+#   ・深さ: 本震の深さの近く
+#   乱数はシードで固定する（同じシードなら同じ余震列）。件数が多すぎるときは、GR則どおりに最小Mを上げて AFT_MAX 以内に収める
+#   ここで作るのは「地震のリスト」だけ。揺れ・EEW・地震情報の計算は、ふつうの地震と同じ経路（Overlay.add）で行う
+# =====================================================================
+AFT_MAX = int(os.environ.get("QC_AFT_MAX", 40))      # 余震の最大件数（本震の MAX_QUAKES とは別枠。メモリに余裕があれば環境変数で増やせる）
+AFT_LITE_MAG = 5.5          # 余震のうちこの規模未満は軽量に計算する（津波は出ない規模。揺れの計算を打ち切る・津波計算を省く）
+AFT_INFO_MIN_M01 = 0.5      # 余震のうち、陸上の最大の計測震度がこれ未満のものは地震情報に載せない（震度1未満。上げると情報の件数が減る）
+AFT_EEW_MIN_M01 = 2.5       # 余震のうち、陸上の最大の計測震度がこれ未満（震度3未満）のものはEEWを計算しない
+AFT_REF_DAYS = 365.0        # Båthの法則で「最大余震が本震-ΔM」となる余震列の長さ[日]
+
+
+def fault_dims_km(mag):
+    """断層の長さ・幅[km]（Wells & Coppersmith 1994, 全タイプ平均）"""
+    return 10.0 ** (-2.44 + 0.59 * mag), 10.0 ** (-1.01 + 0.32 * mag)
+
+
+def _omori_int(t1, t2, c, p):
+    """大森・宇津則の積分 ∫(t+c)^-p dt（t1→t2。単位は c と同じ）"""
+    if abs(p - 1.0) < 1e-6:
+        return math.log((t2 + c) / (t1 + c))
+    return ((t2 + c) ** (1.0 - p) - (t1 + c) ** (1.0 - p)) / (1.0 - p)
+
+
+def _omori_inv(u, t1, t2, c, p):
+    """区間 [t1, t2] で大森・宇津則に従う時刻の逆累積分布（u: 0〜1の乱数、配列可）"""
+    if abs(p - 1.0) < 1e-6:
+        return (t1 + c) * ((t2 + c) / (t1 + c)) ** u - c
+    a, b = (t1 + c) ** (1.0 - p), (t2 + c) ** (1.0 - p)
+    return (a + u * (b - a)) ** (1.0 / (1.0 - p)) - c
+
+
+def aftershock_sequence(parent, dM=1.2, mmin=3.0, minutes=60.0, p=1.0, c_min=5.0, b=1.0,
+                        max_n=None, seed=0, t_min_s=5.0):
+    """本震 parent({lat, lon, mag, depth, delay}) の余震列を作る。戻り値: (余震のリスト, 情報dict)
+    余震は {lat, lon, mag, depth, delay(秒・整数), aft: True} の辞書で、発生の早い順。
+    dM: 最大余震は本震よりこれだけ小さい（Båth） / mmin: 最小M / minutes: 本震から何分間 / p, c_min: 大森・宇津則 / b: GR則のb値"""
+    max_n = AFT_MAX if max_n is None else int(max_n)
+    mm = float(parent["mag"])
+    d0 = float(parent.get("delay") or 0.0)
+    mcap = round(mm - 0.1, 1)                            # 余震は本震より小さい
+    p = min(max(float(p), 0.3), 2.0)
+    b = min(max(float(b), 0.3), 2.0)
+    c = max(float(c_min), 0.05) * 60.0
+    T = min(max(float(minutes), 0.0) * 60.0, MAX_DELAY_S - d0)
+    info = {"expected": 0.0, "mmin": float(mmin), "n": 0, "L": 0.0, "W": 0.0}
+    L, W = fault_dims_km(mm)
+    info["L"], info["W"] = round(L, 1), round(W, 1)
+    mmin = round(max(float(mmin), 0.0), 1)
+    if mcap <= mmin or T <= t_min_s or max_n <= 0:
+        return [], info
+    frac = _omori_int(0.0, T, c, p) / _omori_int(0.0, AFT_REF_DAYS * 86400.0, c, p)   # 全期間のうち、この区間に起きる割合
+
+    def n_exp(m0):
+        return 10.0 ** (b * (mm - float(dM) - m0)) * frac    # M>=m0 の期待件数（M>=本震-ΔM が全期間で1件）
+
+    while n_exp(mmin) > max_n and mmin < mcap:                # 多すぎるときは、GR則どおり小さい余震から省く
+        mmin = round(mmin + 0.1, 1)
+    info["mmin"] = mmin
+    info["expected"] = round(n_exp(mmin), 2)
+    rng = np.random.default_rng(int(seed) % (2 ** 31))
+    n = int(rng.poisson(n_exp(mmin)))
+    if n <= 0 or mcap <= mmin:
+        return [], info
+    # 時刻（大森・宇津則）・規模（打ち切りGR則）
+    tt = np.sort(_omori_inv(rng.random(n), 0.0, T, c, p))
+    span = 1.0 - 10.0 ** (-b * (mcap - mmin))
+    mags = mmin - np.log10(1.0 - rng.random(n) * span) / b
+    # 位置: 断層の長さ方向（走向）に沿って広く、幅方向に狭い正規分布
+    strike = float(rng.uniform(0.0, math.pi))
+    sa, sc = max(L / 4.0, 1.0), max(W / 4.0, 1.0)
+    ua = np.clip(rng.normal(0.0, sa, n), -0.75 * L, 0.75 * L)
+    uc = np.clip(rng.normal(0.0, sc, n), -0.75 * W, 0.75 * W)
+    dx = ua * math.sin(strike) + uc * math.cos(strike)        # 東向き[km]
+    dy = ua * math.cos(strike) - uc * math.sin(strike)        # 北向き[km]
+    lat0, lon0, dep0 = float(parent["lat"]), float(parent["lon"]), float(parent["depth"])
+    lats = lat0 + dy / 111.2
+    lons = lon0 + dx / (111.2 * max(math.cos(math.radians(lat0)), 0.2))
+    deps = np.clip(dep0 + rng.normal(0.0, 2.0 + 0.04 * dep0, n), 1.0, 699.0)
+    out = []
+    for k in range(n):
+        dl = int(round(d0 + max(float(tt[k]), t_min_s)))
+        if dl > MAX_DELAY_S:
+            continue
+        out.append({"lat": round(min(max(float(lats[k]), -10.0), 70.0), 3), "lon": round(min(max(float(lons[k]), 90.0), 180.0), 3),
+                    "mag": min(round(float(mags[k]), 1), mcap), "depth": int(round(float(deps[k]))), "delay": dl, "aft": True})
+    if len(out) > max_n:                                       # ポアソン揺らぎで超えたときは、大きいものを残す
+        out = sorted(sorted(out, key=lambda x: -x["mag"])[:max_n], key=lambda x: x["delay"])
+    info["n"] = len(out)
+    return out, info
+
+
+# =====================================================================
 # 3. API
 # =====================================================================
 def _json_response(obj, status=200):
@@ -2695,23 +3009,123 @@ EEW_OVERLAP_S = 180.0      # 直前の地震の発生からこの秒数以内、
 EEW_OVERLAP_KM = 200.0     # 震央がこの距離以内なら、直前の地震の揺れと混ざって震源を決められず、PLUM法のみで発表する
 
 
-def _plum_only_flags(quakes):
-    """各地震のEEWをPLUM法のみで出すか。入力の "plum"（true/false）があればそれに従い、無ければ自動判定。
+def _plum_only_flag(q, quakes, i):
+    """quakes[i]（=q）のEEWをPLUM法のみで出すか。入力の "plum"（true/false）があればそれに従い、無ければ自動判定。
     自動判定: 直前（EEW_OVERLAP_S秒以内）に、近く（EEW_OVERLAP_KM以内）で別の地震が起きていればPLUM法のみ
-    （2022年3月16日の福島県沖M6.1の2分後のM7.4は、気象庁もPLUM法のみで発表した）"""
-    out = []
-    for i, q in enumerate(quakes):
-        f = q.get("plum")
-        if f is None:
-            f = False
-            for j, p in enumerate(quakes):
-                gap = q["delay"] - p["delay"]
-                if j != i and 0.0 < gap <= EEW_OVERLAP_S and \
-                        float(hubeny_km(p["lat"], p["lon"], q["lat"], q["lon"])) <= EEW_OVERLAP_KM:
-                    f = True
-                    break
-        out.append(bool(f))
-    return out
+    （2022年3月16日の福島県沖M6.1の2分後のM7.4は、気象庁もPLUM法のみで発表した）。
+    直前の地震だけを見るので、後から地震を足しても、それより前の地震の判定は変わらない"""
+    f = q.get("plum")
+    if f is None:
+        f = False
+        for j, p in enumerate(quakes):
+            gap = q["delay"] - p["delay"]
+            if j != i and 0.0 < gap <= EEW_OVERLAP_S and \
+                    float(hubeny_km(p["lat"], p["lon"], q["lat"], q["lon"])) <= EEW_OVERLAP_KM:
+                f = True
+                break
+    return bool(f)
+
+
+def _plum_only_flags(quakes):
+    return [_plum_only_flag(q, quakes, i) for i, q in enumerate(quakes)]
+
+
+def _num(j, key, default, lo, hi):
+    v = j.get(key)
+    v = default if v is None or v == "" else float(v)
+    return min(max(v, lo), hi)
+
+
+@app.post("/api/aftershocks")
+def api_aftershocks():
+    """本震から余震列を作る（①事前の余震設定。③自動余震モードも同じ生成関数を使う）"""
+    try:
+        j = request.get_json(force=True, silent=False) or {}
+        pj = j.get("parent") or {}
+        parent = {"lat": float(pj["lat"]), "lon": float(pj["lon"]), "mag": float(pj["mag"]),
+                  "depth": float(pj["depth"]), "delay": float(pj.get("delay") or 0.0)}
+        par = dict(dM=_num(j, "dM", 1.2, 0.0, 4.0), mmin=_num(j, "mmin", 3.0, 0.0, 9.0),
+                   minutes=_num(j, "minutes", 60.0, 1.0, MAX_DELAY_S / 60.0), p=_num(j, "p", 1.0, 0.3, 2.0),
+                   c_min=_num(j, "c", 5.0, 0.05, 120.0), b=_num(j, "b", 1.0, 0.3, 2.0),
+                   max_n=int(_num(j, "max", AFT_MAX, 0, AFT_MAX)))
+        seed = int(j.get("seed") if j.get("seed") is not None else _quake_seed(parent, "aft"))
+    except Exception:
+        return _json_response({"error": "入力が不正です"}, 400)
+    if not (-10.0 <= parent["lat"] <= 70.0 and 90.0 <= parent["lon"] <= 180.0):
+        return _json_response({"error": "震源は北緯-10〜70度、東経90〜180度の範囲で指定してください"}, 400)
+    parent["mag"] = min(max(parent["mag"], 0.0), 15.0)
+    parent["depth"] = min(max(parent["depth"], 0.0), 699.0)
+    parent["delay"] = float(int(round(min(max(parent["delay"], 0.0), MAX_DELAY_S))))
+    aft, info = aftershock_sequence(parent, seed=seed, **par)
+    info["seed"] = seed
+    return _json_response({"aftershocks": aft, "info": info})
+
+
+def _simulate_stream(quakes, gz, monitor):
+    """再生しながら計算する方式（ステートレス）。地震を1件ずつ Overlay に足し、足すたびに送る。
+    base（最初の1件ぶんの震度フレーム）→ add（以降の地震の震度フレームだけ・集計値は間引いて同送）→ EEWの各報。
+    クライアントは再生しながら重ね合わせる。まだ足されていない地震の発生時刻までしか再生しない。
+    サーバーは状態を持たない（②実行中の追加も、地震リストを送り直すだけ）。"""
+    plum_flags = _plum_only_flags(quakes) if monitor else [False] * len(quakes)
+
+    def gen():
+        def dump(o):
+            return (json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        ov = Overlay(1.0, monitor)
+        n = len(quakes)
+        streams = {}
+
+        def pump():
+            out = []
+            for i in list(streams):                       # 演算中のEEWを1ステップずつ進める
+                try:
+                    kind, v = next(streams[i])
+                except StopIteration:
+                    del streams[i]
+                    continue
+                except Exception as e:
+                    del streams[i]
+                    out.append(dump({"k": "error", "q": i, "v": str(e)}))
+                    continue
+                d = quakes[i]["delay"]
+                if kind == "upto":
+                    v = v + d
+                elif kind == "report":
+                    v = _shift_report(v, d)
+                out.append(dump({"k": kind, "q": i, "v": v}))
+            return out
+
+        t_agg = 0.0
+        for i, q in enumerate(quakes):
+            try:
+                ov.add(q)
+            except ValueError as e:
+                yield dump({"k": "fatal", "v": str(e)})
+                return
+            if i == 0:
+                yield dump({"k": "base", "v": ov.base(gz)})
+            else:
+                m = {"k": "add", "i": i, "w": ov.window(i, gz), "qm": ov.qpay(i)}
+                now = time.time()
+                if i == n - 1 or now - t_agg >= 1.5:     # 集計値（情報・津波・最終震度）は重いので間引く。最後の1件では必ず付ける
+                    m["agg"] = ov.agg()
+                    t_agg = now
+                yield dump(m)
+            u = ov.units[i]
+            if monitor and not (q.get("aft") and float(u["core"]["m01"][ST_LAND].max()) < AFT_EEW_MIN_M01):
+                c = u["core"]
+                streams[i] = eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], c["tp"], c["rt"], c["t_end"],
+                                        plum_only=plum_flags[i])
+            else:
+                yield dump({"k": "none", "q": i, "v": None})
+            for b in pump():                              # 次の地震を計算する合間に、EEWも少し進める
+                yield b
+        while streams:
+            for b in pump():
+                yield b
+
+    return Response(gen(), mimetype="application/x-ndjson",
+                    headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/simulate")
@@ -2724,20 +3138,33 @@ def api_simulate():
         quakes = [{"lat": float(r["lat"]), "lon": float(r["lon"]),
                    "mag": float(r["mag"]), "depth": float(r["depth"]),
                    "delay": float(r.get("delay") or 0.0),
-                   "plum": (None if r.get("plum") is None else bool(r.get("plum")))} for r in raw]
+                   "plum": (None if r.get("plum") is None else bool(r.get("plum"))),
+                   "aft": bool(r.get("aft")),                    # 余震（本震とは別枠で数え、小さいものは軽量に計算する）
+                   "parent": (int(r["parent"]) if r.get("aft") and r.get("parent") is not None else None)} for r in raw]
     except Exception:
         return _json_response({"error": "入力が不正です"}, 400)
-    if not (1 <= len(quakes) <= MAX_QUAKES):
-        return _json_response({"error": "地震は1〜%d個まで指定できます" % MAX_QUAKES}, 400)
+    n_main = sum(1 for q in quakes if not q["aft"])
+    if not (1 <= n_main <= MAX_QUAKES):
+        return _json_response({"error": "地震（本震）は1〜%d個まで指定できます" % MAX_QUAKES}, 400)
+    if len(quakes) - n_main > AFT_MAX:
+        return _json_response({"error": "余震は最大%d件まで指定できます" % AFT_MAX}, 400)
     for q in quakes:
         if not (-10.0 <= q["lat"] <= 70.0 and 90.0 <= q["lon"] <= 180.0):
             return _json_response({"error": "震源は北緯-10〜70度（負は南緯）、東経90〜180度の範囲で指定してください"}, 400)
         q["mag"] = min(max(q["mag"], 0.0), 15.0)
         q["depth"] = min(max(q["depth"], 0.0), 699.0)
-        q["delay"] = float(int(round(min(max(q["delay"], 0.0), 300.0))))   # 発生時刻（秒後）: 整数秒
+        q["delay"] = float(int(round(min(max(q["delay"], 0.0), MAX_DELAY_S))))   # 発生時刻（秒後）: 整数秒
     gz = bool(j.get("gz"))
     monitor = (j.get("mode") != "sim")                    # "sim": 地震の再現のみ（EEW・津波・地震情報なし） / それ以外: 強震モニタ
-    base, cores = sim_multi(quakes, gz=gz, monitor=monitor)
+    if j.get("stream"):                                   # 再生しながら計算する方式（クライアントが stream:true で要求）
+        return _simulate_stream(quakes, gz, monitor)
+    try:
+        ov = Overlay(1.0, monitor)
+        for q in quakes:
+            ov.add(q)                                     # 地震を1件ずつ足して重ね合わせる
+        base, cores = ov.base(gz), ov.cores()
+    except ValueError as e:
+        return _json_response({"error": str(e)}, 400)
     plum_flags = _plum_only_flags(quakes) if monitor else [False] * len(quakes)
 
     def gen():
@@ -2748,9 +3175,14 @@ def api_simulate():
             for i in range(len(quakes)):
                 yield dump({"k": "none", "q": i, "v": None})
             return
+        # 余震のうち陸上で震度3未満しか揺れないものは、EEWの対象にならないので演算しない（件数が多い余震の計算を軽くする）
+        skip = [i for i, q in enumerate(quakes)
+                if q.get("aft") and float(ov.units[i]["core"]["m01"][ST_LAND].max()) < AFT_EEW_MIN_M01]
+        for i in skip:
+            yield dump({"k": "none", "q": i, "v": None})
         # 各地震のEEWを交互に1ステップずつ進め、演算できた順に送る（時刻は全体の時間軸へずらす）
         streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end, plum_only=plum_flags[i])
-                   for i, (q, (tp, rt, t_end)) in enumerate(zip(quakes, cores))}
+                   for i, (q, (tp, rt, t_end)) in enumerate(zip(quakes, cores)) if i not in skip}
         while streams:
             for i in list(streams):
                 try:
@@ -3483,7 +3915,8 @@ def healthz():
 
 @app.get("/")
 def index():
-    return Response(INDEX_HTML, mimetype="text/html")
+    return Response(INDEX_HTML.replace("__MAX_DELAY_S__", str(int(MAX_DELAY_S))).replace("__AFT_MAX__", str(int(AFT_MAX))),
+                    mimetype="text/html")
 
 
 # =====================================================================
@@ -3666,6 +4099,22 @@ INDEX_HTML = r"""<!doctype html>
   .qh{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:13px}
   .qh .qd{flex:1;font-size:10.5px;color:var(--sub)}
   .qh .qx{padding:1px 7px;font-size:12px}
+  .aft{margin-top:8px;border:1px solid var(--line);border-radius:8px;padding:2px 8px 8px;background:#0e131c55}
+  .aft>summary{cursor:pointer;font-size:13px;margin-top:6px;font-weight:600}
+  .aft .ar{display:flex;gap:6px;align-items:flex-end;margin-top:2px}
+  .aft .ar>div{flex:1;min-width:0}
+  .aft .ar label{margin:6px 0 2px;font-size:11px}
+  .aft input[type=number],.aft select{padding:5px 6px;font-size:13px}
+  .aft .abtn{display:flex;gap:6px;margin-top:8px}
+  .aft .abtn button{flex:1;margin:0;padding:6px 6px;font-size:12px}
+  #aftList{max-height:200px;overflow:auto;margin-top:8px;border:1px solid var(--line);border-radius:6px;display:none}
+  #aftList table{width:100%;border-collapse:collapse;font-size:11.5px}
+  #aftList td{padding:2px 4px;border-bottom:1px solid #ffffff12;white-space:nowrap}
+  #aftList td.n{width:18px;text-align:center}
+  #aftList tr[data-k]{cursor:pointer}
+  #aftList tr[data-k]:hover{background:#26324a55}
+  #aftList input[type=number]{width:62px;padding:2px 4px;font-size:11.5px}
+  #aftList button{padding:0 6px;font-size:11px;margin:0}
   button.sec{width:100%;margin-top:2px;font-size:13px;padding:7px 10px}
   button.sec:disabled{opacity:.45;cursor:not-allowed}
   /* 画面切替タブ（強震モニタ / 地震情報） */
@@ -3676,22 +4125,26 @@ INDEX_HTML = r"""<!doctype html>
   #tabbar button.on{background:var(--acc);color:#04101f}
   #tabbar .badge{position:absolute;top:-5px;right:-3px;min-width:18px;height:18px;line-height:18px;border-radius:9px;
     background:#ff4d4d;color:#fff;font-size:11px;padding:0 5px;display:none;text-align:center}
-  body.modeSim #eewcards,body.modeSim #tsucard,body.modeSim #tabbar,body.modeSim #infoView{display:none !important}
-  #infoView{display:none;position:fixed;inset:0;z-index:2000;background:var(--bg);flex-direction:column}
-  #infoHead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 280px 10px 16px;border-bottom:1px solid var(--line)}
-  #infoHead .it{font-size:16px;font-weight:800;margin-right:6px}
-  #infoHead label{font-size:12px;color:var(--sub);display:flex;align-items:center;gap:5px}
-  #infoHead input{width:auto}
-  #iTime{font-size:13px;font-variant-numeric:tabular-nums;color:var(--sub);min-width:150px}
-  #infoMain{flex:1;min-height:0;display:flex}
-  #infoMapCol{flex:1 1 55%;min-width:0;position:relative;border-right:1px solid var(--line)}
-  #imap{position:absolute;inset:0;background:#0b1220}
-  #imLegend{position:absolute;z-index:1000;left:10px;bottom:10px;display:flex;gap:3px;align-items:center;padding:5px 7px;
+  #tsuBody .tsucard{max-width:860px;margin:0 auto;padding:10px 14px}
+  #tsuBody .tsucard .tt{font-size:15px}
+  #tsuBody .tsucard .tx,#tsuBody .tsucard td,#tsuBody .tsucard .tm{font-size:13px}
+  #tsuBody .tsucard .tw{max-height:none}
+  body.modeSim #eewcards,body.modeSim #tsucard,body.modeSim #tabbar,body.modeSim #infoView,body.modeSim #tsuView{display:none !important}
+  #infoView,#tsuView{display:none;position:fixed;inset:0;z-index:2000;background:var(--bg);flex-direction:column}
+  #infoHead,#tsuHead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 280px 10px 16px;border-bottom:1px solid var(--line)}
+  #infoHead .it,#tsuHead .it{font-size:16px;font-weight:800;margin-right:6px}
+  #infoHead label,#tsuHead label{font-size:12px;color:var(--sub);display:flex;align-items:center;gap:5px}
+  #infoHead input,#tsuHead input{width:auto}
+  #iTime,#tTime{font-size:13px;font-variant-numeric:tabular-nums;color:var(--sub);min-width:150px}
+  #infoMain,#tsuMain{flex:1;min-height:0;display:flex}
+  #infoMapCol,#tsuMapCol{flex:1 1 55%;min-width:0;position:relative;border-right:1px solid var(--line)}
+  #imap,#tmap{position:absolute;inset:0;background:#0b1220}
+  #imLegend,#tmLegend{position:absolute;z-index:1000;left:10px;bottom:10px;display:flex;gap:3px;align-items:center;padding:5px 7px;
     background:var(--panel);border:1px solid var(--line);border-radius:8px;font-size:11px;color:var(--sub)}
-  #imLegend .chip{min-width:0;padding:1px 5px;font-size:11px}
+  #imLegend .chip,#tmLegend .chip{min-width:0;padding:1px 5px;font-size:11px}
   .imk{display:flex;align-items:center;justify-content:center;width:100%;height:100%;border:1px solid #0b1220;border-radius:6px;
     font-size:11px;font-weight:800;line-height:1;box-shadow:0 0 0 1px #0008}
-  #infoBody{flex:1 1 45%;min-width:0;overflow:auto;padding:14px 16px 40px}
+  #infoBody,#tsuBody{flex:1 1 45%;min-width:0;overflow:auto;padding:14px 16px 40px}
   .itw{max-height:340px;overflow:auto}
   .itbl{width:100%;border-collapse:collapse;font-size:12.5px}
   .itbl th,.itbl td{padding:5px 12px;border-bottom:1px solid #222b3b;text-align:left}
@@ -3742,16 +4195,16 @@ INDEX_HTML = r"""<!doctype html>
     #tabbar{top:10px;left:74px;right:auto}
     #tabbar button{padding:6px 10px;font-size:12px}
     #mxIco{right:auto;left:10px;bottom:calc(240px + env(safe-area-inset-bottom,0px))}
-    #infoView{padding-top:54px}
+    #infoView,#tsuView{padding-top:54px}
     #simClk{right:auto;left:10px;bottom:calc(172px + env(safe-area-inset-bottom,0px))}
     #simClk #clkT{font-size:15px}
     #runFab{left:auto;right:10px;transform:none;bottom:calc(172px + env(safe-area-inset-bottom,0px));padding:9px 16px;font-size:14px}
     .pclose{display:inline-block}
     #rcToggle{display:block}
-    #infoHead{padding-right:16px}
-    #infoMain{flex-direction:column}
-    #infoMapCol{flex:none;height:42%;border-right:none;border-bottom:1px solid var(--line)}
-    #infoBody{flex:1 1 auto}
+    #infoHead,#tsuHead{padding-right:16px}
+    #infoMain,#tsuMain{flex-direction:column}
+    #infoMapCol,#tsuMapCol{flex:none;height:42%;border-right:none;border-bottom:1px solid var(--line)}
+    #infoBody,#tsuBody{flex:1 1 auto}
     #panel{width:calc(100% - 20px);max-height:62%;top:92px;display:none}
     #panel.open{display:block}
     #toggle{display:block}
@@ -3784,6 +4237,32 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <div class="hint">選択中の地震の震源は、地図をクリックして設定できます（北緯-10〜70°・東経90〜180°）。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
 
+  <details id="aftBox" class="aft">
+    <summary>余震（事前設定）<span id="aftCnt" style="font-weight:400;color:var(--sub);margin-left:6px"></span></summary>
+    <label>余震を作る本震</label>
+    <select id="aftParent"></select>
+    <div class="ar">
+      <div><label title="Båthの法則: 最大余震は、本震よりおよそこの値だけ小さい（1年間の余震列での値。この期間に起きる分だけを作るので、実際の最大はもう少し小さくなります）">最大余震の目安（本震との差ΔM）</label><input id="aftDM" type="number" min="0" max="4" step="0.1" value="1.2"></div>
+      <div><label>最小M</label><input id="aftMmin" type="number" min="0" max="9" step="0.1" value="3.0"></div>
+    </div>
+    <div class="ar">
+      <div><label>期間（本震から○分）</label><input id="aftMin" type="number" min="1" step="1" value="60"></div>
+      <div><label>上限（件）</label><input id="aftMax" type="number" min="1" max="__AFT_MAX__" step="1" value="__AFT_MAX__"></div>
+    </div>
+    <details style="margin-top:6px"><summary style="font-size:11.5px;color:var(--sub);font-weight:400;cursor:pointer">詳細（大森・宇津則 p・c／GR則 b／乱数）</summary>
+      <div class="ar">
+        <div><label title="大森・宇津則 n(t)=K/(t+c)^p の p（大きいほど早く減る）">p</label><input id="aftP" type="number" min="0.3" max="2" step="0.05" value="1.0"></div>
+        <div><label title="大森・宇津則の c（分）。小さいほど直後に集中する">c（分）</label><input id="aftC" type="number" min="0.05" max="120" step="0.5" value="5"></div>
+        <div><label title="グーテンベルク・リヒター則の b値（大きいほど小さな余震が多い）">b</label><input id="aftB" type="number" min="0.3" max="2" step="0.05" value="1.0"></div>
+        <div><label>乱数シード</label><input id="aftSeed" type="number" step="1" value="1"></div>
+      </div>
+    </details>
+    <div class="abtn"><button id="aftGen" class="sec" type="button">余震を生成</button><button id="aftRoll" class="sec" type="button">別の乱数で生成</button></div>
+    <div class="abtn"><button id="aftAdd" class="sec" type="button" title="地図の中心に、選んだ本震の余震を1件足します">＋ 1件追加（地図の中心）</button><button id="aftClr" class="sec" type="button">全削除</button></div>
+    <div id="aftList"></div>
+    <div class="hint">本震ごとに生成します（同じ本震の余震は置き換え）。余震は最大__AFT_MAX__件で、多いほど計算に時間がかかります。生成後は、発生時刻とMを表で直せます（行をクリックで地図が移動）。陸上で震度3未満の余震はEEWを出さず、震度1未満の余震は地震情報にも載せません。</div>
+  </details>
+
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px">表示モード <select id="appMode" style="width:auto;flex:1"><option value="monitor" selected>強震モニタ（EEW・津波・地震情報）</option><option value="sim">地震の再現のみ（揺れだけ）</option></select></label>
   <div class="hint" id="appModeHint" style="display:none">モードを変えたら、もう一度シミュレーションを実行してください。</div>
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px">地図の塗りつぶし <select id="fillMode" style="width:auto;flex:1"><option value="both" selected>警報対象＋予想震度</option><option value="pred">予想震度</option><option value="warn">警報対象範囲</option><option value="off">塗りつぶさない</option></select></label>
@@ -3799,10 +4278,7 @@ INDEX_HTML = r"""<!doctype html>
     <select id="seaMode" style="width:auto"><option value="thin" selected>薄く表示（数字なし）</option><option value="off">非表示</option><option value="normal">通常表示</option></select></label>
   <div class="hint">黄色の○＋＝EEW推定震源／✕＝設定した震源（番号は地震番号）／地図の塗り＝予想震度／赤＝警報対象範囲（上の設定で切替）</div>
 
-  <h2>② プリセット（選択中の地震に適用）</h2>
-  <div class="presets" id="presets"></div>
-
-  <h2>②' 実際の地震を検索</h2>
+  <h2>② 有名な地震・実際の地震を検索</h2>
   <div id="qsBox">
     <div class="qsLab">期間</div>
     <div class="qsRow" id="qsPeriod">
@@ -3814,8 +4290,10 @@ INDEX_HTML = r"""<!doctype html>
     <div class="qsRow" style="align-items:center">
       <input id="qsYear" type="number" class="qsIn" min="1919" step="1" inputmode="numeric" placeholder="年だけで指定（例: 2011）" style="flex:1">
     </div>
-    <div class="qsLab">有名な地震<small>タップで期間と条件をセットして検索</small></div>
+    <div class="qsLab">有名な地震<small>タップで期間と条件をセットして検索 → 結果から選ぶ</small></div>
     <div class="qsRow" id="qsFamous"></div>
+    <div class="qsLab">連続発生・広域の地震<small>複数の震源をまとめてセット（複数震源の使い方の例）</small></div>
+    <div class="qsRow" id="qsMulti"></div>
     <div class="qsGrid">
       <label>最大震度<select id="qsInt" class="qsIn"><option value="">指定なし</option><option value="1">震度1以上</option><option value="2">震度2以上</option><option value="3">震度3以上</option><option value="4">震度4以上</option><option value="5-">震度5弱以上</option><option value="5+">震度5強以上</option><option value="6-">震度6弱以上</option><option value="6+">震度6強以上</option><option value="7">震度7</option></select></label>
       <label>マグニチュード<select id="qsMag" class="qsIn"><option value="">指定なし</option><option value="3">M3以上</option><option value="4">M4以上</option><option value="5">M5以上</option><option value="6">M6以上</option><option value="7">M7以上</option><option value="8">M8以上</option></select></label>
@@ -3871,6 +4349,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="audioHint" style="display:none;position:fixed;z-index:4000;top:96px;left:50%;transform:translateX(-50%);background:#2f7cf6;color:#fff;font-size:13px;font-weight:700;padding:8px 14px;border-radius:20px;box-shadow:0 4px 14px rgba(0,0,0,.45);cursor:pointer;max-width:90%;text-align:center">効果音がオフです。ここをタップして有効にする</div>
 <div id="tabbar">
   <button id="tabMon" class="on">強震モニタ</button>
+  <button id="tabTsu">津波</button>
   <button id="tabInfo">地震情報<span class="badge" id="tabBadge">0</span></button>
 </div>
 
@@ -3889,6 +4368,23 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
+<div id="tsuView">
+  <div id="tsuHead">
+    <span class="it">津波警報・注意報・津波情報</span>
+    <button id="tRun" class="sec" style="width:auto;margin:0;padding:6px 12px">► シミュレーション実行</button>
+    <button id="tRestart" title="最初に戻る（リセット）" style="white-space:nowrap">↺ 最初から</button>
+    <button id="tPlay" title="再生/一時停止">►</button>
+    <span id="tTime">—</span>
+  </div>
+  <div id="tsuMain">
+    <div id="tsuMapCol"><div id="tmap"></div><div id="tmLegend"></div></div>
+    <div id="tsuBody">
+      <div id="tsuEmpty" class="iempty"></div>
+      <div id="tsucard" class="card tsucard tl0" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
 <div id="hud">
   <span><span class="lbl">経過</span><b id="hT">0.0</b> 秒</span>
   <span><span class="lbl">P波</span><b id="hP">-</b> km</span>
@@ -3900,7 +4396,6 @@ INDEX_HTML = r"""<!doctype html>
 <div id="rightcol">
   <div id="obs" class="card"><span class="ok">観測最大震度</span><span class="ov" id="obsV"></span><span class="oa" id="obsA"></span></div>
   <div id="eewcards"></div>
-  <div id="tsucard" class="card tsucard tl0" style="display:none"></div>
   <div id="rank" class="card">
     <h3>リアルタイム震度ランキング（区域別）</h3>
     <table id="rankTbl"><tr><td style="color:var(--sub)">シミュレーション実行後に表示</td></tr></table>
@@ -3989,7 +4484,7 @@ dark.addTo(map);
 L.control.layers({'ダーク（Esri）':dark,'ライト（Esri）':light,'衛星写真（Esri）':imagery},null,{position:'topright'}).addTo(map);
 
 /* ---------- 震源（複数地震） ---------- */
-const MAX_Q=5;
+const MAX_Q=5, MAX_DELAY=__MAX_DELAY_S__;   // 発生（秒後）の上限はサーバー設定(QC_MAX_DELAY_S)に合わせる
 const QCOL=['#ff4d4d','#ffb020','#4dd2ff','#b07bff','#5fe08a'];     // 地震ごとの識別色
 let QS=[{lat:35.68,lon:139.77,mag:7.0,depth:20,delay:0}], selQ=0;
 const epiMarkers=[];
@@ -4021,7 +4516,7 @@ function renderQuakes(){
       +'<div class="row" style="align-items:center"><div style="flex:2.2"><input data-f="magr" type="range" min="0" max="9.9" step="0.1"></div>'
       +'<div><input data-f="mag" type="number" min="0" max="15" step="0.1"></div></div>'
       +'<div class="row"><div><label>震源の深さ（km）</label><input data-f="depth" type="number" min="0" max="699" step="5"></div>'
-      +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="300" step="1"></div></div>'
+      +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="'+MAX_DELAY+'" step="1"></div></div>'
       +'<label>EEWの方式</label><select data-f="plum"><option value="">自動（直前に近い地震があればPLUM法のみ）</option><option value="0">通常のEEW（震源・規模を推定）</option><option value="1">PLUM法のみ</option></select>';
     const F=f=>b.querySelector('[data-f="'+f+'"]');
     F('lat').value=q.lat.toFixed(2); F('lon').value=q.lon.toFixed(2);
@@ -4036,14 +4531,14 @@ function renderQuakes(){
     F('lon').addEventListener('change',()=>{ F('lon').value=q.lon.toFixed(2); });
     num('mag',v=>{ q.mag=clampN(v,0,15); F('magr').value=Math.min(q.mag,9.9); });
     num('depth',v=>{ q.depth=clampN(v,0,699); });
-    num('delay',v=>{ q.delay=Math.round(clampN(v,0,300)); });
+    num('delay',v=>{ q.delay=Math.round(clampN(v,0,MAX_DELAY)); });
     F('magr').addEventListener('input',()=>{ q.mag=parseFloat(F('magr').value); F('mag').value=q.mag.toFixed(1); });
     F('mag').addEventListener('change',()=>{ F('mag').value=q.mag.toFixed(1); });
     b.addEventListener('focusin',()=>{ if(selQ!==i) selectQ(i); });
     b.addEventListener('click',()=>{ if(selQ!==i) selectQ(i); });
     const x=b.querySelector('.qx');
     if(x) x.onclick=ev=>{
-      ev.stopPropagation(); QS.splice(i,1);
+      ev.stopPropagation(); QS.splice(i,1); aftOnMainRemoved(i);
       if(i<selQ) selQ--; else if(i===selQ) selQ=Math.min(selQ,QS.length-1);
       renderQuakes(); syncMarkers();
     };
@@ -4051,6 +4546,7 @@ function renderQuakes(){
   });
   $('qadd').disabled=QS.length>=MAX_Q;
   $('qadd').textContent=QS.length>=MAX_Q?'地震は最大'+MAX_Q+'個までです':'＋ 地震を追加';
+  renderAftParents();
 }
 function setEpi(lat,lon,pan){
   lat=Math.round(clampN(lat,-10,70)*100)/100; lon=Math.round(clampN(lon,90,180)*100)/100;
@@ -4067,6 +4563,86 @@ $('qadd').onclick=()=>{
   QS.push({lat:Math.round(c.lat*100)/100,lon:Math.round(c.lng*100)/100,mag:6.0,depth:10,delay:0});
   selQ=QS.length-1; renderQuakes(); syncMarkers();
 };
+/* ---------- 余震（①事前設定）: 本震とは別のリスト AS（件数が多いので、本震の入力欄とは分けて表で扱う） ---------- */
+const MAX_AFT=__AFT_MAX__;
+let AS=[];                                              // {lat,lon,mag,depth,delay,par}  par: 親の本震（QS）の番号
+const aftLayer=L.layerGroup().addTo(map);
+const quakeBody=q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay});
+function allQuakes(){                                   // サーバーへ送る形（本震→余震の順。余震は aft:true と親の番号 par を持つ）
+  return QS.map(q=>({...quakeBody(q),plum:(q.plum===true||q.plum===false)?q.plum:null}))
+    .concat(AS.map(a=>({...quakeBody(a),aft:true,par:a.par})));
+}
+const aftNum=(id,d)=>{ const v=parseFloat($(id).value); return isFinite(v)?v:d; };
+function renderAftParents(){
+  const sel=$('aftParent'), cur=sel.value;
+  sel.innerHTML=QS.map((q,i)=>'<option value="'+i+'">地震'+(i+1)+'（M'+q.mag.toFixed(1)+'・深さ'+Math.round(q.depth)+'km・'+q.delay+'秒後）</option>').join('');
+  sel.value=(cur!==''&&+cur<QS.length)?cur:'0';
+}
+function renderAftList(){
+  const box=$('aftList');
+  if(!AS.length){ box.style.display='none'; box.innerHTML=''; return; }
+  box.style.display='block';
+  const mmss=s=>Math.floor(s/60)+':'+('0'+(s%60)).slice(-2);
+  box.innerHTML='<table><tr style="color:#93a0b8"><td></td><td>発生（秒後）</td><td>M</td><td>深さ</td><td></td></tr>'
+    +AS.map((a,k)=>'<tr data-k="'+k+'"><td class="n" style="color:'+QCOL[a.par%QCOL.length]+'">●</td>'
+      +'<td><input data-f="delay" type="number" min="0" max="'+MAX_DELAY+'" step="1" value="'+a.delay+'"> <span style="color:#93a0b8">'+mmss(a.delay)+'</span></td>'
+      +'<td><input data-f="mag" type="number" min="0" max="15" step="0.1" value="'+a.mag.toFixed(1)+'"></td>'
+      +'<td>'+Math.round(a.depth)+'km</td><td><button class="qx" data-act="del" type="button" title="この余震を削除">✕</button></td></tr>').join('')+'</table>';
+}
+function syncAft(){                                     // 地図の印（小さな丸。本震と同じ色）・件数・表を更新
+  aftLayer.clearLayers();
+  AS.forEach(a=>{ const col=QCOL[a.par%QCOL.length];
+    L.circleMarker([a.lat,a.lon],{radius:Math.max(2.5,Math.min(14,(a.mag-1.5)*2.2)),color:col,weight:1.2,fillColor:col,fillOpacity:.25,interactive:false}).addTo(aftLayer); });
+  $('aftCnt').textContent=AS.length?'（'+AS.length+'件）':'';
+  renderAftParents(); renderAftList();
+}
+function aftOnMainRemoved(i){                           // 本震を消したら、その余震も消し、後ろの本震の番号を詰める
+  AS=AS.filter(a=>a.par!==i).map(a=>a.par>i?{...a,par:a.par-1}:a); syncAft();
+}
+$('aftList').addEventListener('change',e=>{
+  const tr=e.target.closest('tr[data-k]'); if(!tr) return;
+  const a=AS[+tr.dataset.k], f=e.target.dataset.f, v=parseFloat(e.target.value);
+  if(!a||!isFinite(v)) return;
+  if(f==='delay') a.delay=Math.round(clampN(v,0,MAX_DELAY)); else if(f==='mag') a.mag=clampN(Math.round(v*10)/10,0,15);
+  AS.sort((x,y)=>x.delay-y.delay); syncAft();
+});
+$('aftList').addEventListener('click',e=>{
+  const tr=e.target.closest('tr[data-k]'); if(!tr) return;
+  const k=+tr.dataset.k;
+  if(e.target.dataset.act==='del'){ AS.splice(k,1); syncAft(); }
+  else if(!e.target.matches('input')){ const a=AS[k]; if(a) map.panTo([a.lat,a.lon]); }
+});
+async function aftGenerate(roll){
+  const pi=parseInt($('aftParent').value), p=QS[pi]; if(!p) return;
+  if(roll) $('aftSeed').value=Math.floor(Math.random()*1e6);
+  const room=MAX_AFT-AS.filter(a=>a.par!==pi).length;
+  if(room<=0){ $('status').textContent='余震は最大'+MAX_AFT+'件までです。ほかの本震の余震を減らしてください'; return; }
+  const body={parent:quakeBody(p),dM:aftNum('aftDM',1.2),mmin:aftNum('aftMmin',3),minutes:aftNum('aftMin',60),p:aftNum('aftP',1),
+    c:aftNum('aftC',5),b:aftNum('aftB',1),max:Math.min(aftNum('aftMax',MAX_AFT),room),seed:Math.round(aftNum('aftSeed',1))};
+  $('status').textContent='余震を生成中…';
+  try{
+    const r=await fetch('/api/aftershocks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok){ $('status').textContent=j.error||'余震の生成に失敗しました'; return; }
+    AS=AS.filter(a=>a.par!==pi).concat(j.aftershocks.map(a=>({lat:a.lat,lon:a.lon,mag:a.mag,depth:a.depth,delay:a.delay,par:pi}))).sort((x,y)=>x.delay-y.delay);
+    syncAft();
+    const mx=j.aftershocks.reduce((m,a)=>Math.max(m,a.mag),0);
+    $('status').textContent=j.aftershocks.length
+      ?'余震を'+j.aftershocks.length+'件生成しました（M'+j.info.mmin.toFixed(1)+'以上・最大M'+mx.toFixed(1)+'）。実行すると再現します'
+      :'この条件では余震が出ませんでした（最小Mを下げるか、期間を延ばしてください）';
+  }catch(e){ $('status').textContent='通信エラー: '+e; }
+}
+$('aftGen').onclick=()=>aftGenerate(false);
+$('aftRoll').onclick=()=>aftGenerate(true);
+$('aftAdd').onclick=()=>{
+  const k=parseInt($('aftParent').value), p=QS[k]; if(!p) return;
+  if(AS.length>=MAX_AFT){ $('status').textContent='余震は最大'+MAX_AFT+'件までです'; return; }
+  const c=map.getCenter();
+  AS.push({lat:Math.round(c.lat*1000)/1000,lon:Math.round(c.lng*1000)/1000,mag:Math.max(1,Math.round((p.mag-1.5)*10)/10),depth:p.depth,delay:Math.min(MAX_DELAY,p.delay+60),par:k});
+  AS.sort((x,y)=>x.delay-y.delay); syncAft();
+};
+$('aftClr').onclick=()=>{ AS=[]; syncAft(); };
+['focus','mousedown'].forEach(ev=>$('aftParent').addEventListener(ev,renderAftParents));
 renderQuakes(); syncMarkers();
 
 /* ---------- 地震セットの保存・読込（localStorage＋JSONファイル） ---------- */
@@ -4075,35 +4651,41 @@ function slAll(){ try{ const o=JSON.parse(localStorage.getItem(SL_KEY)||'{}'); r
 function slPut(o){ try{ localStorage.setItem(SL_KEY,JSON.stringify(o)); return true; }catch(_){ $('status').textContent='保存できませんでした（ブラウザの保存が無効）'; return false; } }
 function slClean(a){                                    // 入力検証（最大5件・範囲に丸める）
   if(!Array.isArray(a)) return null;
-  const out=[];
-  for(const q of a.slice(0,MAX_Q)){
+  const out=[], afts=[];
+  for(const q of a){
     const lat=+q.lat, lon=+q.lon, mag=+q.mag, dep=+q.depth, dl=+(q.delay||0);
     if(![lat,lon,mag,dep,dl].every(isFinite)) continue;
-    out.push({lat:clampN(lat,-90,90),lon:clampN(lon,-180,180),mag:clampN(mag,0,15),depth:clampN(dep,0,699),delay:Math.round(clampN(dl,0,300)),plum:(q.plum===true||q.plum===false)?q.plum:null});
+    const o={lat:clampN(lat,-90,90),lon:clampN(lon,-180,180),mag:clampN(mag,0,15),depth:clampN(dep,0,699),delay:Math.round(clampN(dl,0,MAX_DELAY))};
+    if(q.aft===true){ if(afts.length<MAX_AFT) afts.push({...o,par:Math.max(0,parseInt(q.par)||0)}); }
+    else if(out.length<MAX_Q) out.push({...o,plum:(q.plum===true||q.plum===false)?q.plum:null});
   }
-  return out.length?out:null;
+  if(!out.length) return null;
+  afts.forEach(x=>{ if(x.par>=out.length) x.par=0; });
+  out.afts=afts;                                        // 余震は配列の付加プロパティで返す（呼び出し側は slApply に渡すだけ）
+  return out;
 }
 function slRefresh(sel){
   const o=slAll(), names=Object.keys(o), box=$('slSel'); box.innerHTML='';
   if(!names.length){ const op=document.createElement('option'); op.value=''; op.textContent='（保存なし）'; box.appendChild(op); return; }
-  names.forEach(n=>{ const op=document.createElement('option'); op.value=n; op.textContent=n+'（'+o[n].length+'件）'; box.appendChild(op); });
+  names.forEach(n=>{ const na=o[n].filter(x=>x&&x.aft).length; const op=document.createElement('option'); op.value=n; op.textContent=n+'（'+(o[n].length-na)+'件'+(na?'＋余震'+na:'')+'）'; box.appendChild(op); });
   if(sel&&o[sel]) box.value=sel;
 }
 function slApply(list){
   QS=list.map(q=>({...q})); selQ=0; renderQuakes(); syncMarkers();
+  AS=(list.afts||[]).map(a=>({...a})); syncAft();
   const q=QS[0]; if(q) map.panTo([q.lat,q.lon]);
 }
 $('slSave').onclick=()=>{
   const o=slAll(), cur=$('slSel').value;
   const nm=(prompt('保存名を入力（同じ名前は上書き）',cur||('地震セット'+(Object.keys(o).length+1)))||'').trim();
   if(!nm) return;
-  o[nm]=QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay,plum:(q.plum===true||q.plum===false)?q.plum:null}));
-  if(slPut(o)){ slRefresh(nm); $('status').textContent='「'+nm+'」を保存しました（'+QS.length+'件）'; }
+  o[nm]=allQuakes();
+  if(slPut(o)){ slRefresh(nm); $('status').textContent='「'+nm+'」を保存しました（'+QS.length+'件'+(AS.length?'＋余震'+AS.length+'件':'')+'）'; }
 };
 $('slLoad').onclick=()=>{
   const o=slAll(), nm=$('slSel').value, l=slClean(o[nm]);
   if(!l){ $('status').textContent='読み込める保存データがありません'; return; }
-  slApply(l); $('status').textContent='「'+nm+'」を読み込みました（'+l.length+'件）';
+  slApply(l); $('status').textContent='「'+nm+'」を読み込みました（'+l.length+'件'+(l.afts.length?'＋余震'+l.afts.length+'件':'')+'）';
 };
 $('slDel').onclick=()=>{
   const o=slAll(), nm=$('slSel').value; if(!nm||!o[nm]) return;
@@ -4111,7 +4693,7 @@ $('slDel').onclick=()=>{
   delete o[nm]; if(slPut(o)) slRefresh();
 };
 $('slExp').onclick=()=>{
-  const blob=new Blob([JSON.stringify({version:1,quakes:QS},null,1)],{type:'application/json'});
+  const blob=new Blob([JSON.stringify({version:2,quakes:allQuakes()},null,1)],{type:'application/json'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='quakes.json'; a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href),2000);
 };
@@ -4121,48 +4703,35 @@ $('slFile').addEventListener('change',async()=>{
   try{
     const j=JSON.parse(await f.text()), l=slClean(Array.isArray(j)?j:j.quakes);
     if(!l) throw new Error('形式が不正です');
-    slApply(l); $('status').textContent='ファイルから '+l.length+'件を読み込みました';
+    slApply(l); $('status').textContent='ファイルから '+l.length+'件'+(l.afts.length?'（＋余震'+l.afts.length+'件）':'')+'を読み込みました';
   }catch(e){ $('status').textContent='読込エラー: '+e.message; }
 });
 slRefresh();
 
-const PRESETS=[
-  {n:'阪神・淡路(1995)',lat:34.60,lon:135.04,m:7.3,d:16},
-  {n:'東北沖(2011)',lat:38.10,lon:142.86,m:9.0,d:24},
-  {n:'熊本(2016)',lat:32.74,lon:130.76,m:7.3,d:12},
-  {n:'能登半島(2024)',lat:37.49,lon:137.27,m:7.6,d:15},
-  {n:'南海トラフ(想定)',lat:33.00,lon:136.50,m:9.0,d:20},
-  {n:'首都直下(想定)',lat:35.68,lon:139.77,m:7.3,d:30},
-  {n:'小笠原諸島西方沖地震(2015・深発)',lat:27.9,lon:140.7,m:8.1,d:682}
-];
-PRESETS.forEach(p=>{
-  const b=document.createElement('button'); b.textContent=p.n;
-  b.onclick=()=>{
-    const q=QS[selQ]; q.lat=p.lat; q.lon=p.lon; q.mag=p.m; q.depth=p.d;     // 発生時刻（秒後）は据え置き
-    renderQuakes(); syncMarkers(); map.panTo([p.lat,p.lon]);
-  };
-  $('presets').appendChild(b);
-});
-{ const b=document.createElement('button'); b.textContent='複数地震の例(南海トラフ+首都直下)';
-  b.onclick=()=>{
-    QS=[{lat:33.00,lon:136.50,mag:9.0,depth:20,delay:0},{lat:35.68,lon:139.77,mag:7.3,depth:30,delay:20}];
-    selQ=0; renderQuakes(); syncMarkers(); map.setView([34.6,138.0],6);
-  };
-  $('presets').appendChild(b); }
 /* ---------- 実際の地震の検索 → 震源を自動セット ---------- */
 const qsEsc=t=>String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const QS_CLS={'1':1,'2':2,'3':3,'4':4,'5弱':5,'5強':6,'6弱':7,'6強':8,'7':9};
 let qsLimit=60, qsSig='', qsItems=[], qsLast=-1, qsSeq=0, qsAbort=null;
 const qsJst=off=>new Date(Date.now()+9*3600e3-off*86400e3).toISOString().slice(0,10);   // JSTの日付(YYYY-MM-DD)
 const QS_FAMOUS=[
-  ['東日本大震災 2011','2011-03-11','2011-03-11',{mag:'7'}],
-  ['熊本地震 2016','2016-04-14','2016-04-16',{int:'6-'}],
-  ['能登半島地震 2024','2024-01-01','2024-01-01',{mag:'6'}],
+  ['東北沖 2011','2011-03-11','2011-03-11',{mag:'7'}],
+  ['熊本 2016','2016-04-14','2016-04-16',{int:'6-'}],
+  ['能登半島 2024','2024-01-01','2024-01-01',{mag:'6'}],
   ['北海道胆振東部 2018','2018-09-06','2018-09-06',{int:'6-'}],
   ['新潟県中越 2004','2004-10-23','2004-10-23',{int:'6-'}],
   ['十勝沖 2003','2003-09-26','2003-09-26',{mag:'7'}],
   ['阪神・淡路 1995','1995-01-17','1995-01-17',{mag:'6'}],
-  ['関東大震災 1923','1923-09-01','1923-09-01',{mag:'7'}]
+  ['関東大震災 1923','1923-09-01','1923-09-01',{mag:'7'}],
+  ['小笠原西方沖 2015（深発）','2015-05-30','2015-05-30',{mag:'7'}]
+];
+/* 複数震源の例。発生時刻は「秒後」（最大300秒）に収まる実在の連続地震と、広域破壊の近似配置 */
+const QS_MULTI=[
+  {n:'能登 2024（前震→本震）', note:'16:06頃のM5.5の約4分後に、16:10のM7.6が発生（時刻・値は概数）',
+   q:[{lat:37.50,lon:137.30,mag:5.5,depth:12,delay:0},{lat:37.49,lon:137.27,mag:7.6,depth:15,delay:240}]},
+  {n:'福島県沖 2022（前震→本震）', note:'23:34のM6.1の約2分後に、23:36のM7.4が発生。EEWが短時間に2回続いた例（値は概数）',
+   q:[{lat:37.60,lon:141.60,mag:6.1,depth:57,delay:0},{lat:37.70,lon:141.60,mag:7.4,depth:57,delay:120}]},
+  {n:'東北沖 2011（広域破壊の近似）', note:'震源域が岩手沖〜茨城沖の南北500km規模に広がったM9.0を、3つの震源に分けた近似の配置です（Mと時刻は目安）',
+   q:[{lat:38.10,lon:142.86,mag:9.0,depth:24,delay:0},{lat:39.30,lon:143.10,mag:8.0,depth:20,delay:50},{lat:36.30,lon:141.40,mag:8.0,depth:30,delay:110}]}
 ];
 const QS_INT={'1':'震度1','2':'震度2','3':'震度3','4':'震度4','5-':'震度5弱','5+':'震度5強','6-':'震度6弱','6+':'震度6強','7':'震度7'};
 const QS_DEP={'-30':'浅い(〜30km)','30-100':'中間(30〜100km)','100-':'深発(100km〜)'};
@@ -4272,6 +4841,17 @@ QS_FAMOUS.forEach(([label,f,t,c])=>{
   b.onclick=()=>{ qsSetDates(f,t); $('qsInt').value=c.int||''; $('qsMag').value=c.mag||''; $('qsDep').value=''; $('qsText').value=''; $('qsSort').value='mag'; qsSyncUI(); qsSearch(); };
   $('qsFamous').appendChild(b);
 });
+QS_MULTI.forEach(p=>{
+  const b=document.createElement('button'); b.type='button'; b.className='qsChip'; b.textContent=p.n;
+  b.onclick=()=>{
+    QS=p.q.slice(0,MAX_Q).map(x=>({lat:x.lat,lon:x.lon,mag:x.mag,depth:x.depth,delay:x.delay}));
+    selQ=0; renderQuakes(); syncMarkers(); AS=[]; syncAft();
+    try{ map.fitBounds(QS.map(x=>[x.lat,x.lon]),{maxZoom:7,padding:[40,40]}); }catch(e){}
+    $('status').textContent='「'+p.n+'」を'+QS.length+'個の震源としてセットしました。'+p.note;
+    if($('qsAutoRun').checked) $('run').click();
+  };
+  $('qsMulti').appendChild(b);
+});
 $('qsReset').onclick=()=>{
   qsSetDates('',''); $('qsInt').value=''; $('qsMag').value=''; $('qsDep').value=''; $('qsSort').value='time'; $('qsText').value='';
   qsSyncUI(); qsSearch();
@@ -4347,7 +4927,7 @@ const MU_PMAX=0.2;   // 未入電確率の上限係数（計測震度5.5で0、6
 const muOn=()=>{ const e=document.getElementById('muOn'); return !!(e&&e.checked); };
 let sim=null, Q=null, tcur=0, playing=false, lastTs=0, runCtl=null, waitFlag=false;
 // EEWの演算が追いついていない地震があれば、その地震の確定済み時刻までしか再生しない
-const limT=()=>{ if(!sim) return 0; let lim=sim.tEnd; for(const q of sim.quakes) if(!q.eewDone) lim=Math.min(lim,q.eewUpto||0); return lim; };
+const limT=()=>{ if(!sim) return 0; let lim=sim.tEnd; for(const q of sim.quakes) if(!q.eewDone) lim=Math.min(lim,q.eewUpto||0); if(sim.pend>0) lim=Math.min(lim,sim.pendT); return lim; };
 
 function valuesAt(t){
   const nf=sim.nf; let f=t/sim.dt; if(f<0)f=0; if(f>nf-1)f=nf-1;
@@ -4567,9 +5147,9 @@ function draw(ts){
   if(!clr) updateRank(ts);
   if(sim){
     if(!clr) updateEew();
-    { const tsuS=tsuState(tcur); drawTsuCoast(tsuS,z); drawTsuBars(tsuS,z); updateTsu(ts,tsuS); }
+    
     if(!clr) sim.quakes.forEach(q=>{                    // 各地震の実際のP波・S波（発生後のみ）
-      const tl=tcur-q.delay; if(tl<0) return;
+      const tl=tcur-q.delay; if(tl<0||(q.aft&&tl>q.tEnd)) return;      // 余震は、波が日本を通り過ぎたら描かない（多数の円で重くならないように）
       drawCircle(q.lat,q.lon,interp(q.P,tl),'rgba(90,200,255,.95)',1.6);
       drawCircle(q.lat,q.lon,interp(q.S,tl),'rgba(255,95,95,.98)',2.2);
     });
@@ -4587,7 +5167,10 @@ function draw(ts){
       ctx.moveTo(p.x-14,p.y); ctx.lineTo(p.x+14,p.y); ctx.moveTo(p.x,p.y-14); ctx.lineTo(p.x,p.y+14); ctx.stroke();
     });
     $('hT').textContent=tcur.toFixed(1);
-    const hv=f=>sim.quakes.map(q=>{ const tl=tcur-q.delay; return tl<0?'-':interp(q[f],tl).toFixed(0); }).join('／');
+    const hv=f=>{                                       // 本震は常に、余震は揺れている間だけ表示（最大4件まで）
+      const act=sim.quakes.filter(q=>!q.aft||(tcur-q.delay>=0&&tcur-q.delay<=q.tEnd));
+      const s=act.slice(0,4).map(q=>{ const tl=tcur-q.delay; return tl<0?'-':interp(q[f],tl).toFixed(0); }).join('／');
+      return act.length>4?s+'／…':s; };
     $('hP').textContent=clr?'—':hv('P');
     $('hS').textContent=clr?'—':hv('S');
     const hm=$('hM'); const m=Math.max(vmax,-3);
@@ -5002,9 +5585,11 @@ function renderBadge(){ const b=$('tabBadge'); b.textContent=infoUnread; b.style
 function showTab(t,auto){
   if(!auto){ clearTimeout(autoTimer); autoRet=null; }   // 手動で切り替えたら、自動で戻さない
   curTab=t;
-  $('infoView').style.display=t==='info'?'flex':'none';
+  $('infoView').style.display=t==='info'?'flex':'none'; $('tsuView').style.display=t==='tsu'?'flex':'none';
+  $('tabTsu').classList.toggle('on',t==='tsu');
   $('tabMon').classList.toggle('on',t==='mon'); $('tabInfo').classList.toggle('on',t==='info');
   if(t==='info'){ infoUnread=0; ensureInfoMap(); }
+  if(t==='tsu') ensureTsuMap();
   renderBadge();
 }
 /* ---------- 地震情報タブの地図 ---------- */
@@ -5089,14 +5674,86 @@ function drawInfoMap(){
 }
 $('tabMon').onclick=()=>showTab('mon',false);
 $('tabInfo').onclick=()=>showTab('info',false);
+$('tabTsu').onclick=()=>showTab('tsu',false);
 // 情報が更新されたら、強震モニタ表示中なら数秒だけ地震情報タブへ切り替えて元に戻す
 function autoSwitch(){
   if(!$('infoAuto').checked) return;
+  if(curTab==='tsu') return;                            // 津波タブを見ているときは切り替えない
   if(curTab==='info' && autoRet==null) return;          // 手動で情報タブを見ているときは切り替えない
   if(curTab==='mon'){ autoRet='mon'; showTab('info',true); }
   clearTimeout(autoTimer);                              // 続けて更新があれば、戻るのを延ばす
   autoTimer=setTimeout(()=>{ if(autoRet){ const r=autoRet; autoRet=null; showTab(r,true); } },5000);
 }
+/* ---------- 津波タブ（強震モニタ・地震情報とは独立した画面）----------
+   津波警報・注意報・津波情報の表と、予報区の海岸線の色分け・観測した津波の高さを、専用の地図に表示する。
+   シミュレーションの時刻(tcur)に合わせて、発表済みの情報だけを表示する。 */
+let tmap=null, tmLayer=null, tsuSig='', tsuFitted=false, lastTsuTab=-1e9;
+function ensureTsuMap(){
+  if(!tmap){
+    tmap=L.map('tmap',{zoomSnap:0.25,minZoom:4,maxZoom:11,worldCopyJump:false,zoomAnimation:false,markerZoomAnimation:false,fadeAnimation:false}).setView([36.3,137.6],5.5);
+    L.layerGroup([esri('Canvas/World_Dark_Gray_Base',ATTR_BASE),esri('Canvas/World_Dark_Gray_Reference','')]).addTo(tmap);
+    tmLayer=L.layerGroup().addTo(tmap);
+    let lg='<span>津波</span>'; for(let k=1;k<=4;k++) lg+='<span class="chip" style="background:'+TSU_COL[k]+';color:'+(k===2?'#111':'#fff')+'">'+TSU_LV[k].replace('津波','')+'</span>';
+    $('tmLegend').innerHTML=lg;
+  }
+  setTimeout(()=>{ tmap.invalidateSize(); tsuSig=''; lastTsu=-1e9; tsuTabUpdate(performance.now(),true); },0);
+}
+window.addEventListener('resize',()=>{ if(tmap&&curTab==='tsu') tmap.invalidateSize(); });
+function drawTsuMap(st){
+  if(!tmap) return;
+  tmLayer.clearLayers();
+  if(!st||(!st.list.length&&!st.obs.size)) return;
+  if(TSUGEO_RAW&&!TSUGEO) buildTsuGeo();
+  const bb=L.latLngBounds([]);
+  for(const e of st.list){
+    const a=sim.tsuAreas[e.i], o=st.obs.get(e.i);
+    const tip=escH(a[0])+'　'+TSU_LV[e.lv]+'（'+escH(String(e.hl))+'）'+(o&&o.mx>0?'　観測'+o.mx.toFixed(1)+'m':'');
+    const lines=TSUGEO&&TSUGEO[e.i];
+    if(lines&&lines.length){
+      for(const ln of lines){
+        const ll=ln.map(p=>[p[1],p[0]]);
+        L.polyline(ll,{color:'#000',weight:8,opacity:.75,interactive:false}).addTo(tmLayer);
+        L.polyline(ll,{color:TSU_COL[e.lv],weight:5,opacity:1}).bindTooltip(tip,{sticky:true}).addTo(tmLayer);
+        ll.forEach(p=>bb.extend(p));
+      }
+    }else{
+      L.circleMarker([a[1],a[2]],{radius:7,color:'#000',weight:2,fillColor:TSU_COL[e.lv],fillOpacity:1}).bindTooltip(tip).addTo(tmLayer);
+      bb.extend([a[1],a[2]]);
+    }
+  }
+  for(const [i,o] of st.obs){
+    if(!(o.mx>0)||!o.segs||!o.segs.length) continue;
+    const p=tsuAnchor(i), h=Math.round(tsuBarPx(o.mx));
+    const ic=L.divIcon({className:'',iconSize:[0,0],iconAnchor:[0,0],
+      html:'<div style="position:absolute;left:-5px;bottom:0;width:10px;height:'+h+'px;background:'+tsuBarColor(o.mx)+';border:1px solid #000"></div>'
+        +'<div style="position:absolute;left:-30px;width:70px;text-align:center;bottom:'+(h+2)+'px;font:bold 11px sans-serif;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000">'+o.mx.toFixed(1)+'m</div>'});
+    L.marker(p,{icon:ic,keyboard:false,interactive:false}).addTo(tmLayer);
+    bb.extend(p);
+  }
+  if(!tsuFitted&&bb.isValid()){ tsuFitted=true; tmap.fitBounds(bb.pad(0.2),{maxZoom:8,animate:false}); }
+}
+function tsuTabUpdate(ts,force){
+  if(curTab!=='tsu') return;
+  $('tPlay').textContent=playing?'❚❚':'►';
+  $('tTime').textContent=sim?clk(tcur)+'（経過 '+fmtT(tcur)+'）':'—';
+  if(!force&&(ts||0)-lastTsuTab<200) return; lastTsuTab=ts||0;
+  const empty=$('tsuEmpty');
+  if(!sim){
+    empty.textContent='強震モニタ画面でシミュレーションを実行すると、ここに津波警報・注意報・津波情報が表示されます。（実行ボタンはこの画面の上にもあります）';
+    empty.style.display='block'; $('tsucard').style.display='none';
+    if(tsuSig!=='empty'){ tsuSig='empty'; drawTsuMap(null); }
+    return;
+  }
+  const st=tsuState(tcur);
+  empty.textContent=sim.mode==='sim'?'「地震の再現のみ」モードでは津波は計算しません。':'現在、発表中の津波警報・注意報・津波情報はありません。';
+  empty.style.display=st.any?'none':'block';
+  updateTsu(ts,st);
+  const sig=st.list.map(e=>e.i+':'+e.lv).join(',')+'|'+Array.from(st.obs.entries()).map(r=>r[0]+':'+(r[1].mx>0?r[1].mx.toFixed(1):0)+':'+(r[1].segs?r[1].segs.length:0)).join(',');
+  if(sig!==tsuSig){ tsuSig=sig; drawTsuMap(st); }
+}
+$('tRun').onclick=()=>$('runFab').click();
+$('tPlay').onclick=()=>$('play').click();
+$('tRestart').onclick=()=>$('restart').click();
 $('iRun').onclick=()=>$('runFab').click();
 $('iPlay').onclick=()=>$('play').click();
 $('iRestart').onclick=()=>$('restart').click();
@@ -5544,6 +6201,25 @@ function audioStep(ts){
 }
 $('sndTest').onclick=()=>{ audioUnlock(); audioPlay('infoNew',100); audioSpeak('音声のテストです。震度速報。最大震度ごじゃくを観測しました。',100); };
 
+/* 津波の警報・注意報が出ない地震（弱い地震など）は、地震動の後に「次の情報発表まで何も起きない時間」が長く続く
+   （震度速報→震源情報→各地の震度…、最後は約2時間後の計測震度の情報）。発表の間は自動で飛ばし、発表の直前・直後は選んだ速度で進める。 */
+function evTimes(){
+  const a=[];
+  if(sim.info) sim.info.groups.forEach(g=>g.releases.forEach(r=>a.push(r.t)));
+  sim.quakes.forEach(q=>{ if(q.tsu) q.tsu.reports.forEach(r=>a.push(r.t)); });
+  return a.sort((p,q)=>p-q);
+}
+function idleSkipSpeed(base,selSp){
+  if(sim.hasTsuWarn===undefined) sim.hasTsuWarn=sim.quakes.some(q=>q.tsu&&q.tsu.reports.some(r=>r.kind!=='none'));
+  if(sim.hasTsuWarn) return base;                   // 津波の警報等がある地震は、従来どおり津波フェーズの速度
+  const ev=evTimes(); let nx=Infinity, pv=-Infinity;
+  for(const e of ev){ if(e>tcur){ nx=e; break; } pv=e; }
+  if(tcur-pv<=15) return selSp;                     // 発表の直後は等倍（内容を読める）
+  if(!isFinite(nx)) return Math.max(selSp,10);     // もう発表は無い: 終了まで少し急ぐ
+  const gap=nx-tcur;
+  if(gap<=20) return selSp;                         // 次の発表が近い: 等倍
+  return Math.max(selSp,(gap-10)/3);                // 発表の約10秒前に着くよう、約3秒で飛ばす
+}
 function tick(ts){
   if(sim && playing){
     const d=Math.min((ts-lastTs)/1000,0.1);
@@ -5551,7 +6227,9 @@ function tick(ts){
     const lim=limT();                                  // EEWの演算が確定している時刻（これ以降は再生できない）
     const selSp=parseFloat($('speed').value);
     const inInfo=inTsu && sim.info && tcur<(sim.info.end0||sim.info.end);     // 震度速報・地震情報の発表が続く間は、津波フェーズでも速度を上げすぎない
-    const speed=inInfo?Math.max(10,selSp*5):(inTsu?parseFloat($('tsuSpeed').value):selSp), done=lim>=sim.tEnd-0.01;
+    let speed=inInfo?Math.max(10,selSp*5):(inTsu?parseFloat($('tsuSpeed').value):selSp);
+    const done=!sim.pend&&lim>=sim.tEnd-0.01;
+    if(inTsu) speed=idleSkipSpeed(speed,selSp);       // 津波の警報等が無い地震: 次の発表までの「何も起きない時間」は飛ばし、発表の前後は等倍で進める
     if(waitFlag){
       // 演算待ちで止まっている間は、先読みが少し貯まる（または演算完了）まで再開しない。
       // 1フレームごとに止まったり進んだりを繰り返さず、まとめて待ってから滑らかに再生する。
@@ -5567,7 +6245,7 @@ function tick(ts){
         if(!done){ waitFlag=true; $('status').textContent='EEW演算待ち…（先読みを確保中）'; }
       }
     }
-    if(tcur>=sim.tEnd){ tcur=sim.tEnd; playing=false; $('play').textContent='►'; }
+    if(!sim.pend&&tcur>=sim.tEnd){ tcur=sim.tEnd; playing=false; $('play').textContent='►'; }
     $('seek').value=tToS(tcur); $('tlabel').textContent=fmtT(tcur);
   }
   lastTs=ts;
@@ -5577,7 +6255,7 @@ function tick(ts){
   if(playing||FX.length||viewDirty||uiDirty||tcur!==lastDrawT||mk!==lastMapKey||ts-lastDrawTs>=(sim?250:160)){
     draw(ts); lastDrawTs=ts; lastDrawT=tcur; lastMapKey=mk; uiDirty=false;
   }
-  updateInfo(ts); audioStep(ts); requestAnimationFrame(tick);
+  updateInfo(ts); tsuTabUpdate(ts,false); audioStep(ts); requestAnimationFrame(tick);
 }
 let lastDrawTs=0, lastDrawT=-1, lastMapKey='', uiDirty=true;
 ['input','change','click','keyup','pointerup'].forEach(e=>document.addEventListener(e,()=>{ uiDirty=true; },true));
@@ -5598,7 +6276,7 @@ try{ if(localStorage.getItem('appMode')==='sim') appMode='sim'; }catch(_){}
 function applyMode(){
   $('appMode').value=appMode;
   document.body.classList.toggle('modeSim',appMode==='sim');
-  if(appMode==='sim'&&curTab==='info') showTab('mon',false);
+  if(appMode==='sim'&&(curTab==='info'||curTab==='tsu')) showTab('mon',false);
 }
 $('appMode').addEventListener('change',()=>{
   appMode=$('appMode').value==='sim'?'sim':'monitor';
@@ -5612,26 +6290,18 @@ applyMode();
 $('runFab').onclick=()=>{ if(!$('run').disabled) $('run').click(); };
 document.addEventListener('keydown',e=>{            // Enterキーでも実行（入力欄の操作中は除く）
   if(e.key==='Enter'&&!e.isComposing&&!/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test((e.target.tagName||''))) $('runFab').click(); });
-$('run').onclick=async()=>{
-  const body={quakes:QS.map(q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay,plum:(q.plum===true||q.plum===false)?q.plum:null})),
-              gz:(typeof DecompressionStream!=='undefined'), mode:appMode};
-  if(!QS.every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
-  if(runCtl) runCtl.abort(); const ctl=runCtl=new AbortController();
-  $('run').disabled=$('runFab').disabled=true; $('runFab').textContent='計算中…'; $('status').textContent='計算中…'; playing=false; waitFlag=false;
-  const handle=async(m)=>{
-    if(ctl!==runCtl) return;
-    const k=m.k, v=m.v;
-    if(k==='base'){                                    // 震度フレーム到着 → すぐ再生開始
-      const bin=atob(v.q); let u=new Uint8Array(bin.length);
-      for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
-      if(v.gz) u=new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
-      Q=new Int8Array(u.buffer,u.byteOffset,u.length);
-      { const nf=v.nf; CUMV=new Int16Array(nf); CUMI=new Int32Array(nf); CUMV2=new Int16Array(nf); CUMI2=new Int32Array(nf);
-        MUF=new Int32Array(N).fill(-1); MUEND=new Int32Array(N); MUFIRST=1e9; MUI=-1;
+let MUDEC=null, rebuildTimer=null;
+const STREAM_FRAMES=true;     // true: 再生しながら計算する（地震を1件ずつ受け取って重ねる） / false: 従来どおり全計算してから再生
+function cumBuild(v,keep){
+  const nf=v.nf; CUMV=new Int16Array(nf); CUMI=new Int32Array(nf); CUMV2=new Int16Array(nf); CUMI2=new Int32Array(nf);
+  const oF=keep?MUF:null, oE=keep?MUEND:null, oD=keep?MUDEC:null;     // 再構築では、抽選済みの観測点の結果を引き継ぐ
+  MUF=new Int32Array(N).fill(-1); MUEND=new Int32Array(N); MUDEC=new Uint8Array(N); MUFIRST=1e9; MUI=-1;
         const pk=new Int16Array(N).fill(-128), on=new Int32Array(N).fill(-1);
         for(let f=0;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++){ const x=Q[o+i]; if(x>pk[i]) pk[i]=x; if(x>=55&&on[i]<0) on[i]=f; } }
         // 未入電: 計測震度5.5以上に達した陸上観測点が、確率 1-0.5^(計測震度-5.5) で未入電になる（6.5で1/2）。抽選は実行ごとに1回
-        for(let i=0;i<N;i++){ if((SEA&&SEA[i])||pk[i]<55) continue;
+        for(let i=0;i<N;i++){ if(SEA&&SEA[i]) continue;
+          if(oD&&oD[i]){ MUDEC[i]=1; if(oF[i]>=0){ MUF[i]=oF[i]; MUEND[i]=oE[i]; if(MUF[i]<MUFIRST){ MUFIRST=MUF[i]; MUI=i; } } continue; }
+          if(pk[i]<55) continue; MUDEC[i]=1;
           if(Math.random()<MU_PMAX*(1-Math.pow(0.5,pk[i]/10-5.5))){ MUF[i]=on[i]; MUEND[i]=on[i]+Math.round((20+Math.random()*10)/v.dt); if(on[i]<MUFIRST){ MUFIRST=on[i]; MUI=i; } } }
         let mv=-999, mi=-1, mv2=-999, mi2=-1;   // 陸上観測点の累積最大（CUMV2は未入電の観測点を除く）
         for(let f=0;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++){ if(SEA&&SEA[i]) continue; const x=Q[o+i];
@@ -5639,7 +6309,65 @@ $('run').onclick=async()=>{
             if(MUF[i]>=0&&f>=MUF[i]) continue;
             if(x>mv2){ mv2=x; mi2=i; } }
           CUMV[f]=mv; CUMI[f]=mi; CUMV2[f]=mv2; CUMI2[f]=mi2; }
-        MUPK=pk; }
+        MUPK=pk;
+}
+// 受け取った地震1件ぶんのフレームを、全地震の最大値として Q に重ねる（Overlay.add と同じ処理）
+function qComposite(v,w){
+  const nf=Math.max(v.nf,w.d+w.n);
+  if(nf>v.nf){ const Q2=new Int8Array(nf*N); Q2.set(Q); const last=Q.subarray((v.nf-1)*N,v.nf*N); for(let f=v.nf;f<nf;f++) Q2.set(last,f*N); Q=Q2; v.nf=nf; }
+  const u=w.u, r0=u.subarray(0,N), rl=u.subarray((w.n-1)*N,w.n*N);
+  for(let f=0;f<w.d;f++){ const o=f*N; for(let i=0;i<N;i++) if(r0[i]>Q[o+i]) Q[o+i]=r0[i]; }
+  for(let f=0;f<w.n;f++){ const o=(w.d+f)*N, p=f*N; for(let i=0;i<N;i++) if(u[p+i]>Q[o+i]) Q[o+i]=u[p+i]; }
+  for(let f=w.d+w.n;f<nf;f++){ const o=f*N; for(let i=0;i<N;i++) if(rl[i]>Q[o+i]) Q[o+i]=rl[i]; }
+  PEAK=null; peakF=-1;
+}
+// まだ計算していない地震の、最も早い発生時刻。これより先は再生できない
+function pendUpdate(v,bq){
+  v.pend=bq.length-v.quakes.length; let m=Infinity;
+  for(let i=v.quakes.length;i<bq.length;i++) m=Math.min(m,Math.max(0,Math.round(bq[i].delay)));
+  v.pendT=m;
+}
+function applyAgg(v,a){
+  ['final','max','maxCls','maxLabel','areas','tsuEnd','tsuPhase','info','ett'].forEach(k=>{ v[k]=a[k]; });
+  for(const k in a.tsus){ const q=v.quakes[+k]; if(q) q.tsu=a.tsus[k]; }
+  v.hasTsuWarn=undefined;
+  v.tEnd=a.tEnd; v.tSeis=v.tEnd; v.hasTsu=(v.tsuEnd||0)>v.tEnd+1;
+  { const ext=Math.max(v.tsuEnd||0,(v.info&&v.info.end)||0); v.tsuExt=ext>v.tEnd+1; if(v.tsuExt) v.tEnd=ext; }
+  $('seek').max=v.tsuExt?2000:Math.round(v.tEnd*10);
+  v._aggNew=true; showResult(v);
+}
+function scheduleRebuild(v){      // 累積最大・未入電・情報の未入電反映は重いので、まとめて（約0.3秒に1回）作り直す
+  if(rebuildTimer) return;
+  rebuildTimer=setTimeout(()=>{ rebuildTimer=null; if(sim!==v) return;
+    cumBuild(v,true); if(v._aggNew){ v._aggNew=false; muInfoPatch(v); } },300);
+}
+async function addQuake(m,bq){
+  const v=sim; if(!v) return; const w=m.w;
+  const bin=atob(w.b); let u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
+  if(w.gz) u=new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+  if(sim!==v) return;                                  // 待っている間に再実行された
+  qComposite(v,{d:w.d,n:w.n,u:new Int8Array(u.buffer,u.byteOffset,u.length)});
+  const qk=m.qm; qk.eew={reports:[]}; qk.eewUpto=0; qk.eewDone=false; v.quakes.push(qk);
+  pendUpdate(v,bq);
+  if(m.agg) applyAgg(v,m.agg);
+  scheduleRebuild(v);
+}
+$('run').onclick=async()=>{
+  const body={quakes:allQuakes().map(q=>q.aft?{...q,parent:q.par}:q),
+              gz:(typeof DecompressionStream!=='undefined'), mode:appMode, stream:STREAM_FRAMES};
+  if(!QS.concat(AS).every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
+  if(runCtl) runCtl.abort(); const ctl=runCtl=new AbortController();
+  $('run').disabled=$('runFab').disabled=true; $('runFab').textContent='計算中…'; $('status').textContent='計算中…'; playing=false; waitFlag=false;
+  const handle=async(m)=>{
+    if(ctl!==runCtl) return;
+    const k=m.k, v=m.v;
+    if(k==='fatal'){ $('status').textContent=v; return; }
+    if(k==='base'){                                    // 震度フレーム到着 → すぐ再生開始
+      const bin=atob(v.q); let u=new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
+      if(v.gz) u=new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+      Q=new Int8Array(u.buffer,u.byteOffset,u.length);
+      cumBuild(v,false);
       muInfoPatch(v);
       PEAK=null; peakF=-1;
       v.quakes.forEach(q=>{ q.eew={reports:[]}; q.eewUpto=0; q.eewDone=false; });
@@ -5647,9 +6375,10 @@ $('run').onclick=async()=>{
       // 地震動の計算範囲(tSeis)の後ろに、津波・地震情報の発表が終わるまで時間軸を延長する
       v.tSeis=v.tEnd; v.hasTsu=(v.tsuEnd||0)>v.tEnd+1;
       { const ext=Math.max(v.tsuEnd||0,(v.info&&v.info.end)||0); v.tsuExt=ext>v.tEnd+1; if(v.tsuExt) v.tEnd=ext; }
-      infoCnt=0; infoSig=''; infoPrev=null; infoUnread=0; imFitted=false; imState=null; drawInfoMap(); renderBadge();
+      infoCnt=0; infoSig=''; infoPrev=null; infoUnread=0; imFitted=false; imState=null; drawInfoMap();
+      tsuSig=''; tsuFitted=false; lastTsu=-1e9; if(tmLayer) tmLayer.clearLayers(); renderBadge();
       simClock0=(clkOrigin!==null&&!sim)?clkOrigin:(clkOrigin!==null?clkNowMs()-tcur*1000:Date.now());
-      sim=v; tcur=0; audioReset(); buildEewCards(v.quakes.length);
+      sim=v; tcur=0; audioReset(); buildEewCards(body.quakes.length); if(STREAM_FRAMES) pendUpdate(v,body.quakes);
       $('seek').disabled=false; $('seek').max=v.tsuExt?2000:Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
       showResult(v);
       $('status').textContent=v.mode==='sim'?'再生中':'再生中（EEW演算中）';
@@ -5657,9 +6386,10 @@ $('run').onclick=async()=>{
       $('runFab').classList.remove('idle'); $('runFab').textContent='↻ もう一度実行';
       if(window.innerWidth<=700) $('panel').classList.remove('open');
     }else if(!sim){ return; }
+    else if(k==='add'){ await addQuake(m,body.quakes); }
     else{
       const qk=sim.quakes[m.q]; if(!qk) return;
-      const fin=()=>{ if(!sim.err && sim.quakes.every(x=>x.eewDone)) $('status').textContent='完了（'+sim.nf+'フレーム／リプレイ可）'; };
+      const fin=()=>{ if(!sim.err && !sim.pend && sim.quakes.every(x=>x.eewDone)) $('status').textContent='完了（'+sim.nf+'フレーム／リプレイ可）'; };
       if(k==='upto'){ qk.eewUpto=v; }
       else if(k==='report'){ qk.eew.reports.push(v); }
       else if(k==='final'){ const r=qk.eew.reports.find(x=>x.no===v); if(r) r.final=true; }
@@ -5684,10 +6414,11 @@ $('run').onclick=async()=>{
 
 function showResult(j){
   $('result').style.display='block';
-  const many=j.quakes.length>1;
+  const mq=j.quakes.filter(q=>!q.aft), aq=j.quakes.filter(q=>q.aft), many=j.quakes.length>1;
   $('srcinfo').style.whiteSpace='pre-line';
-  $('srcinfo').textContent=j.quakes.map((q,i)=>(many?'地震'+(i+1)+'：':'')+'震源タイプ: '+q.src.type+(q.src.name?'（'+q.src.name+'）':'')
-    +(q.src.L>0?' ／ 想定断層長 約'+q.src.L+'km（断層の広がりを考慮して震度を計算）':'')).join('\n');
+  $('srcinfo').textContent=mq.map((q,i)=>(mq.length>1?'地震'+(i+1)+'：':'')+'震源タイプ: '+q.src.type+(q.src.name?'（'+q.src.name+'）':'')
+    +(q.src.L>0?' ／ 想定断層長 約'+q.src.L+'km（断層の広がりを考慮して震度を計算）':'')).join('\n')
+    +(aq.length?'\n余震 '+aq.length+'件（最大M'+Math.max(...aq.map(q=>q.mag)).toFixed(1)+'）':'');
   $('areasH').textContent=many?'最終的な区域別最大震度（全地震の最大値・上位）':'最終的な区域別最大震度（シミュレーション結果・上位）';
   const t=$('areas'); t.innerHTML='';
   if(!j.areas.length){ t.innerHTML='<tr><td>震度1以上の区域はありません</td></tr>'; return; }
