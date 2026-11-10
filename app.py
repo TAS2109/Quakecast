@@ -2171,7 +2171,7 @@ def quake_unit(q, dt=1.0, monitor=True):
 def quake_unit_calc(q, dt=1.0, monitor=True):
     """地震1件ぶんの結果（震度フレーム・P/S波・津波）をまとめて返す。ほかの地震の有無で値は変わらない。
     EEWは演算に時間がかかるため、ここでは含めず、eew_stream(...) を地震ごとに別途ストリームで回す"""
-    lite = bool(q.get("aft")) and q["mag"] < AFT_LITE_MAG        # 余震のうち小さいものは軽量に計算（津波も出ない規模）
+    lite = q["mag"] < AFT_LITE_MAG                              # 小さい地震（余震に限らない）は軽量に計算（津波も出ない規模）
     core = quake_core(q["lat"], q["lon"], q["mag"], q["depth"], dt, lite=lite)
     tsu = tsunami_unit(q, core) if (monitor and not lite) else {"reports": [], "obs": [], "end": 0.0}
     return {"q": q, "core": core, "tsu": tsu}
@@ -2911,8 +2911,8 @@ def _shift_report(r, delay):
 #   乱数はシードで固定する（同じシードなら同じ余震列）。件数が多すぎるときは、GR則どおりに最小Mを上げて AFT_MAX 以内に収める
 #   ここで作るのは「地震のリスト」だけ。揺れ・EEW・地震情報の計算は、ふつうの地震と同じ経路（Overlay.add）で行う
 # =====================================================================
-AFT_MAX = int(os.environ.get("QC_AFT_MAX", 40))      # 余震の最大件数（本震の MAX_QUAKES とは別枠。メモリに余裕があれば環境変数で増やせる）
-AFT_LITE_MAG = 5.5          # 余震のうちこの規模未満は軽量に計算する（津波は出ない規模。揺れの計算を打ち切る・津波計算を省く）
+AFT_MAX = int(os.environ.get("QC_AFT_MAX", 40))      # 「余震を自動生成」1回あたりの最大件数（地震の合計の上限は MAX_QUAKES）
+AFT_LITE_MAG = 5.5          # この規模未満の地震は（余震かどうかに関わらず）軽量に計算する（津波は出ない規模。揺れの計算を打ち切る・津波計算を省く）
 AFT_INFO_MIN_M01 = 0.5      # 余震のうち、陸上の最大の計測震度がこれ未満のものは地震情報に載せない（震度1未満。上げると情報の件数が減る）
 AFT_EEW_MIN_M01 = 2.5       # 余震のうち、陸上の最大の計測震度がこれ未満（震度3未満）のものはEEWを計算しない
 AFT_REF_DAYS = 365.0        # Båthの法則で「最大余震が本震-ΔM」となる余震列の長さ[日]
@@ -3028,7 +3028,8 @@ def api_stations():
     return _json_response(_STATIONS_CACHE)
 
 
-MAX_QUAKES = 5
+MAX_QUAKES = int(os.environ.get("QC_MAX_QUAKES", 60))   # 地震（本震・余震の区別なし）の合計の上限
+MAX_HEAVY = int(os.environ.get("QC_MAX_HEAVY", 10))     # うち AFT_LITE_MAG 以上（軽量化されず、1件ごとにメモリを使う）の上限。M6.5を10件足したときのメモリ約330MB・20件で約550MB（実測）をもとにした、Render無料枠向けの既定値
 EEW_OVERLAP_S = 180.0      # 直前の地震の発生からこの秒数以内、かつ
 EEW_OVERLAP_KM = 200.0     # 震央がこの距離以内なら、直前の地震の揺れと混ざって震源を決められず、PLUM法のみで発表する
 
@@ -3170,11 +3171,11 @@ def api_simulate():
                    "parent": (int(r["parent"]) if r.get("aft") and r.get("parent") is not None else None)} for r in raw]
     except Exception:
         return _json_response({"error": "入力が不正です"}, 400)
-    n_main = sum(1 for q in quakes if not q["aft"])
-    if not (1 <= n_main <= MAX_QUAKES):
-        return _json_response({"error": "地震（本震）は1〜%d個まで指定できます" % MAX_QUAKES}, 400)
-    if len(quakes) - n_main > AFT_MAX:
-        return _json_response({"error": "余震は最大%d件まで指定できます" % AFT_MAX}, 400)
+    if not (1 <= len(quakes) <= MAX_QUAKES):
+        return _json_response({"error": "地震は1〜%d件まで指定できます" % MAX_QUAKES}, 400)
+    if sum(1 for q in quakes if q["mag"] >= AFT_LITE_MAG) > MAX_HEAVY:
+        return _json_response({"error": "M%s以上の地震は%d件までです（それより小さい地震は、合計%d件まで足せます）"
+                                        % (AFT_LITE_MAG, MAX_HEAVY, MAX_QUAKES)}, 400)
     for q in quakes:
         if not (-10.0 <= q["lat"] <= 70.0 and 90.0 <= q["lon"] <= 180.0):
             return _json_response({"error": "震源は北緯-10〜70度（負は南緯）、東経90〜180度の範囲で指定してください"}, 400)
@@ -3942,7 +3943,8 @@ def healthz():
 
 @app.get("/")
 def index():
-    return Response(INDEX_HTML.replace("__MAX_DELAY_S__", str(int(MAX_DELAY_S))).replace("__AFT_MAX__", str(int(AFT_MAX))),
+    return Response(INDEX_HTML.replace("__MAX_DELAY_S__", str(int(MAX_DELAY_S))).replace("__AFT_MAX__", str(int(AFT_MAX)))
+                    .replace("__MAX_QUAKES__", str(int(MAX_QUAKES))).replace("__MAX_HEAVY__", str(int(MAX_HEAVY))).replace("__LITE_MAG__", str(AFT_LITE_MAG)),
                     mimetype="text/html")
 
 
@@ -4123,6 +4125,17 @@ INDEX_HTML = r"""<!doctype html>
     text-shadow:0 0 3px #000,0 0 6px #000}
   .qb{border:1px solid var(--line);border-left-width:4px;border-radius:8px;padding:2px 8px 8px;margin-bottom:8px;background:#0e131c55}
   .qb.sel{background:#1d263655;border-color:#3b4a66}
+  .qb.qc{padding:3px 8px 4px;cursor:pointer}
+  .qb.qc:hover{background:#26324a55}
+  .qb.qc .qh{margin-top:2px}
+  #qlist.qmany{max-height:62vh;overflow:auto;padding-right:2px}      /* 地震が増えても、下の設定に届くようにリスト内でスクロール */
+  #qLive{display:none;position:absolute;left:0;right:0;bottom:100%;margin-bottom:6px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 12px}
+  #qLive .ql-s{font-size:11px;color:var(--sub)}
+  #qLive .ql-r{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:6px;font-size:13px}
+  #qLive input{width:74px;padding:4px 6px;font-size:13px}
+  #qLive .ql-b{display:flex;gap:8px;margin-top:8px}
+  #qLive .ql-b button{flex:1;margin:0;padding:6px 8px;font-size:13px}
+  #ctl button.on{background:#2b6cb0;border-color:#4da3ff;color:#fff}
   .qh{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:13px}
   .qh .qd{flex:1;font-size:10.5px;color:var(--sub)}
   .qh .qx{padding:1px 7px;font-size:12px}
@@ -4134,14 +4147,6 @@ INDEX_HTML = r"""<!doctype html>
   .aft input[type=number],.aft select{padding:5px 6px;font-size:13px}
   .aft .abtn{display:flex;gap:6px;margin-top:8px}
   .aft .abtn button{flex:1;margin:0;padding:6px 6px;font-size:12px}
-  #aftList{max-height:200px;overflow:auto;margin-top:8px;border:1px solid var(--line);border-radius:6px;display:none}
-  #aftList table{width:100%;border-collapse:collapse;font-size:11.5px}
-  #aftList td{padding:2px 4px;border-bottom:1px solid #ffffff12;white-space:nowrap}
-  #aftList td.n{width:18px;text-align:center}
-  #aftList tr[data-k]{cursor:pointer}
-  #aftList tr[data-k]:hover{background:#26324a55}
-  #aftList input[type=number]{width:62px;padding:2px 4px;font-size:11.5px}
-  #aftList button{padding:0 6px;font-size:11px;margin:0}
   button.sec{width:100%;margin-top:2px;font-size:13px;padding:7px 10px}
   button.sec:disabled{opacity:.45;cursor:not-allowed}
   /* 画面切替タブ（強震モニタ / 地震情報） */
@@ -4253,6 +4258,8 @@ INDEX_HTML = r"""<!doctype html>
   <h2>① 地震（複数指定できます）</h2>
   <div id="qlist"></div>
   <button id="qadd" class="sec">＋ 地震を追加</button>
+  <div style="display:flex;gap:6px;margin-top:6px"><button id="qsort" class="sec" type="button" style="margin:0;font-size:12px;padding:5px 6px" title="リストを、発生（秒後）が早い順に並べ替えます">発生の早い順に並べる</button></div>
+  <div class="hint" id="qcnt"></div>
   <div class="sl" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px;align-items:center">
     <select id="slSel" style="flex:1;min-width:110px"></select>
     <button id="slSave" class="sec" style="width:auto;margin:0;padding:5px 8px;font-size:12px">保存</button>
@@ -4265,8 +4272,8 @@ INDEX_HTML = r"""<!doctype html>
   <div class="hint">選択中の地震の震源は、地図をクリックして設定できます（北緯-10〜70°・東経90〜180°）。「発生（秒後）」で時間差を付けられます。観測点ごとの震度は、全地震の揺れのうち最大のものを表示します。緊急地震速報は地震ごとに独立して発表します。</div>
 
   <details id="aftBox" class="aft">
-    <summary>余震（事前設定）<span id="aftCnt" style="font-weight:400;color:var(--sub);margin-left:6px"></span></summary>
-    <label>余震を作る本震</label>
+    <summary>余震を自動生成<span id="aftCnt" style="font-weight:400;color:var(--sub);margin-left:6px"></span></summary>
+    <label>余震を作る地震</label>
     <select id="aftParent"></select>
     <div class="ar">
       <div><label title="Båthの法則: 最大余震は、本震よりおよそこの値だけ小さい（1年間の余震列での値。この期間に起きる分だけを作るので、実際の最大はもう少し小さくなります）">最大余震の目安（本震との差ΔM）</label><input id="aftDM" type="number" min="0" max="4" step="0.1" value="1.2"></div>
@@ -4285,11 +4292,9 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </details>
     <div class="abtn"><button id="aftGen" class="sec" type="button">余震を生成</button><button id="aftRoll" class="sec" type="button">別の乱数で生成</button></div>
-    <div class="abtn"><button id="aftAdd" class="sec" type="button" title="地図の中心に、選んだ本震の余震を1件足します">＋ 1件追加（地図の中心）</button><button id="aftClr" class="sec" type="button">全削除</button></div>
-    <label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:4px 0"><input id="aftAuto" type="checkbox" style="width:auto" title="③再生中、本震の発生に合わせて、上の設定で余震を自動で追加します（事前設定の余震がある本震は対象外）">自動余震モード（上の設定で、再生中に余震を自動追加）</label>
-    <div class="abtn"><input id="aftLiveM" type="number" min="0" max="9" step="0.1" placeholder="M（空欄=本震-1.5）" style="width:10em"><button id="aftLive" class="sec" type="button" title="再生中に、地図の中心・現在の時刻に、選んだ本震の余震を1件追加します（②実行中の追加）">⚡ 再生中に1件追加</button></div>
-    <div id="aftList"></div>
-    <div class="hint">本震ごとに生成します（同じ本震の余震は置き換え）。余震は最大__AFT_MAX__件で、多いほど計算に時間がかかります。生成後は、発生時刻とMを表で直せます（行をクリックで地図が移動）。陸上で震度3未満の余震はEEWを出さず、震度1未満の余震は地震情報にも載せません。</div>
+    <div class="abtn"><button id="aftClr" class="sec" type="button" title="「余震を自動生成」で作った地震を、すべて削除します（手で足した地震は残ります）">生成した余震を全削除</button></div>
+    <label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:4px 0"><input id="aftAuto" type="checkbox" style="width:auto" title="再生中、各地震の発生に合わせて、上の設定で余震を自動で追加します（再生バーの「余震自動」でも切り替えられます）">自動余震（再生中、上の設定で余震を自動追加）</label>
+    <div class="hint">地震を1つ選んで「余震を生成」すると、余震が上の地震リストに並びます（同じ地震から作り直すと置き換え）。リストで、発生時刻やMを直したり、1件ずつ消したりできます。生成できる件数は1回につき最大__AFT_MAX__件、M__LITE_MAG__以上の地震は合計__MAX_HEAVY__件までです。陸上で震度3未満の余震はEEWを出さず、震度1未満の余震は地震情報にも載りません。「自動余震」をONにすると、再生中に、各地震の余震を自動で足します（その地震から生成した余震がリストにあるときは対象外）。</div>
   </details>
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px">表示モード <select id="appMode" style="width:auto;flex:1"><option value="monitor" selected>強震モニタ（EEW・津波・地震情報）</option><option value="sim">地震の再現のみ（揺れだけ）</option></select></label>
@@ -4434,9 +4439,15 @@ INDEX_HTML = r"""<!doctype html>
 <div id="simClk" title="クリックで時刻を変更"><div id="clkT">--:--:--</div><div id="clkD"></div><div class="clkHint" id="clkHint">✎ タップして時刻を設定</div>
     <div class="clkCtl"><input type="datetime-local" step="1" id="clkIn"><button id="clkNow" type="button">現在時刻</button><button id="clkClose" type="button">閉じる</button></div></div>
   <div id="bar">
+  <div id="qLive">
+    <div class="ql-h"><b>＋ 地震を追加</b>　<span class="ql-s">地図をタップ、または「地図の中心に追加」。再生中は、いまの3秒後に起きます</span></div>
+    <div class="ql-r"><label>M <input id="qlM" type="number" min="0" max="15" step="0.1" value="5.0"></label><label>深さ <input id="qlD" type="number" min="0" max="699" step="5" value="10"> km</label></div>
+    <div class="ql-b"><button id="qlCenter" class="sec" type="button">地図の中心に追加</button><button id="qlClose" class="sec" type="button">閉じる</button></div>
+  </div>
   <div id="ctl">
     <button id="restart" title="最初に戻る（リセット）" style="min-width:auto;white-space:nowrap">↺ 最初から</button>
-    <button id="aftLiveBar" title="再生中に、地図の中心・現在の時刻に余震を1件追加します" style="min-width:auto;white-space:nowrap">＋余震</button>
+    <button id="qLiveBar" title="地図をタップして、地震を追加します（再生中は、いまの時刻の少し先に追加）" style="min-width:auto;white-space:nowrap">＋地震</button>
+    <button id="aftAutoBar" title="再生中、各地震の発生に合わせて余震を自動で追加する／しない" style="min-width:auto;white-space:nowrap">余震自動：OFF</button>
     <button id="play" title="再生/一時停止">►</button>
     <input id="seek" type="range" min="0" max="0" step="1" value="0" disabled>
     <span id="tlabel">0.0 s</span>
@@ -4513,165 +4524,171 @@ const imagery = L.layerGroup([esri('World_Imagery',ATTR_IMG,19),esri('Reference/
 dark.addTo(map);
 L.control.layers({'ダーク（Esri）':dark,'ライト（Esri）':light,'衛星写真（Esri）':imagery},null,{position:'topright'}).addTo(map);
 
-/* ---------- 震源（複数地震） ---------- */
-const MAX_Q=5, MAX_DELAY=__MAX_DELAY_S__;   // 発生（秒後）の上限はサーバー設定(QC_MAX_DELAY_S)に合わせる
+/* ---------- 震源（複数地震）: 本震も余震も、同じ1本のリスト QS で扱う ----------
+   各地震: {uid, lat, lon, mag, depth, delay, plum, from, col}
+   from: 「余震を自動生成」で作った地震の、親の地震の uid（手で足した地震は null） / col: 識別色の番号（余震は親と同じ色） */
+const MAX_DELAY=__MAX_DELAY_S__, MAX_TOTAL=__MAX_QUAKES__, MAX_HEAVY=__MAX_HEAVY__, LITE_MAG=__LITE_MAG__, MAX_AFT=__AFT_MAX__;   // サーバー設定（QC_MAX_DELAY_S / QC_MAX_QUAKES / QC_MAX_HEAVY / QC_AFT_MAX）に合わせる
 const QCOL=['#ff4d4d','#ffb020','#4dd2ff','#b07bff','#5fe08a'];     // 地震ごとの識別色
-let QS=[{lat:35.68,lon:139.77,mag:7.0,depth:20,delay:0}], selQ=0;
-const epiMarkers=[];
-const epiIcon=i=>L.divIcon({className:'',html:'<div class="epi" style="color:'+QCOL[i%QCOL.length]+'">✕<span class="epn">'+(i+1)+'</span></div>',iconSize:[26,26],iconAnchor:[13,13]});
-function syncMarkers(){
-  while(epiMarkers.length>QS.length) map.removeLayer(epiMarkers.pop());
+let uidN=0, colN=0;
+const plumOf=o=>(o.plum===true||o.plum===false)?o.plum:null;
+const mkQ=(o,from,col)=>({lat:o.lat,lon:o.lon,mag:o.mag,depth:o.depth,delay:o.delay,plum:plumOf(o),uid:++uidN,from:(from==null?null:from),col:(col==null?(colN++)%QCOL.length:col)});
+let QS=[mkQ({lat:35.68,lon:139.77,mag:7.0,depth:20,delay:0})], selQ=0;
+const isChild=q=>q.from!=null;
+const r2=x=>Math.round(x*100)/100, r3=x=>Math.round(x*1000)/1000;
+const mmss=s=>Math.floor(s/60)+':'+('0'+(s%60)).slice(-2);
+const heavyN=l=>l.filter(q=>q.mag>=LITE_MAG).length;          // 規模が大きく、計算が重い地震の数
+function limitMsg(l){                                          // 件数の上限チェック。問題なければ空文字
+  if(l.length>MAX_TOTAL) return '地震は合計'+MAX_TOTAL+'件までです。不要な地震を削除してください';
+  if(heavyN(l)>MAX_HEAVY) return 'M'+LITE_MAG+'以上の地震は'+MAX_HEAVY+'件までです（それより小さい地震は合計'+MAX_TOTAL+'件まで）';
+  return '';
+}
+function fitHeavy(ks,roomH){                                   // 重い地震が上限を超えるとき、小さい方から落とす
+  const hv=ks.filter(a=>a.mag>=LITE_MAG).sort((x,y)=>y.mag-x.mag), n=Math.max(0,roomH);
+  if(hv.length<=n) return {ks:ks,cut:0};
+  const drop=new Set(hv.slice(n));
+  return {ks:ks.filter(a=>!drop.has(a)),cut:drop.size};
+}
+const epiLayer=L.layerGroup().addTo(map), aftLayer=L.layerGroup().addTo(map);
+const epiIcon=(n,col)=>L.divIcon({className:'',html:'<div class="epi" style="color:'+QCOL[col%QCOL.length]+'">✕<span class="epn">'+n+'</span></div>',iconSize:[26,26],iconAnchor:[13,13]});
+function syncMarkers(){                                        // 地図の印: 手で足した地震は番号つきの✕、生成した余震は小さな丸（親と同じ色）。選択中は白い輪
+  epiLayer.clearLayers(); aftLayer.clearLayers();
   QS.forEach((q,i)=>{
-    if(!epiMarkers[i]) epiMarkers[i]=L.marker([q.lat,q.lon],{icon:epiIcon(i),interactive:false,keyboard:false}).addTo(map);
-    else{ epiMarkers[i].setLatLng([q.lat,q.lon]); epiMarkers[i].setIcon(epiIcon(i)); }
+    if(isChild(q)){ const col=QCOL[q.col%QCOL.length];
+      L.circleMarker([q.lat,q.lon],{radius:Math.max(2.5,Math.min(14,(q.mag-1.5)*2.2)),color:col,weight:1.2,fillColor:col,fillOpacity:.25,interactive:false}).addTo(aftLayer); }
+    else L.marker([q.lat,q.lon],{icon:epiIcon(i+1,q.col),interactive:false,keyboard:false}).addTo(epiLayer);
   });
+  const s=QS[selQ];
+  if(s&&QS.length>1) L.circleMarker([s.lat,s.lon],{radius:isChild(s)?Math.max(7,Math.min(18,(s.mag-1.5)*2.2+4)):17,color:'#ffffff',weight:2,fill:false,interactive:false}).addTo(aftLayer);
 }
 const clampN=(v,lo,hi)=>Math.min(Math.max(v,lo),hi);
 function selectQ(i){
-  selQ=i;
-  Array.from($('qlist').children).forEach((b,k)=>{
-    b.classList.toggle('sel',k===i);
-    b.querySelector('.qd').textContent=(k===i?'地図クリックで震源を設定':'');
-  });
+  if(selQ===i) return;
+  selQ=i; renderQuakes(); syncMarkers();
+  const q=QS[i]; if(q&&!map.getBounds().contains([q.lat,q.lon])) map.panTo([q.lat,q.lon]);
+}
+function removeQuake(q){                                       // 削除（その地震から生成した余震も一緒に消す。最低1件は残す）
+  let rm=[q].concat(QS.filter(c=>c.from===q.uid));
+  if(QS.length-rm.length<1) rm=[q];
+  const cur=QS[selQ], qi=QS.indexOf(q);
+  QS=QS.filter(x=>!rm.includes(x));
+  const k=QS.indexOf(cur); selQ=k>=0?k:Math.min(qi,QS.length-1);
+  renderQuakes(); syncMarkers();
+}
+function updateCounts(){
+  const n=QS.length, kc=QS.filter(isChild).length, hn=heavyN(QS);
+  $('qadd').disabled=n>=MAX_TOTAL;
+  $('qadd').textContent=n>=MAX_TOTAL?'地震は合計'+MAX_TOTAL+'件までです':'＋ 地震を追加';
+  $('qcnt').textContent='地震 '+n+'件（上限'+MAX_TOTAL+'件）／ M'+LITE_MAG+'以上 '+hn+'件（上限'+MAX_HEAVY+'件）'+(kc?' ／ 生成した余震 '+kc+'件':'');
+  $('aftCnt').textContent=kc?'（'+kc+'件）':'';
+  $('qlist').classList.toggle('qmany',n>6);
 }
 function renderQuakes(){
   const box=$('qlist'); box.innerHTML='';
   QS.forEach((q,i)=>{
-    const b=document.createElement('div'); b.className='qb'+(i===selQ?' sel':''); b.style.borderLeftColor=QCOL[i%QCOL.length];
-    b.innerHTML='<div class="qh"><b>地震'+(i+1)+'</b><span class="qd">'+(i===selQ?'地図クリックで震源を設定':'')+'</span>'
-      +(QS.length>1?'<button class="qx" title="この地震を削除">✕</button>':'')+'</div>'
-      +'<div class="row"><div><label>北緯（°）</label><input data-f="lat" type="number" min="-10" max="70" step="0.01"></div>'
-      +'<div><label>東経（°）</label><input data-f="lon" type="number" min="90" max="180" step="0.01"></div></div>'
-      +'<label>マグニチュード（スライダーは9.9まで／右の欄は15まで入力可）</label>'
-      +'<div class="row" style="align-items:center"><div style="flex:2.2"><input data-f="magr" type="range" min="0" max="9.9" step="0.1"></div>'
-      +'<div><input data-f="mag" type="number" min="0" max="15" step="0.1"></div></div>'
-      +'<div class="row"><div><label>震源の深さ（km）</label><input data-f="depth" type="number" min="0" max="699" step="5"></div>'
-      +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="'+MAX_DELAY+'" step="1"></div></div>'
-      +'<label>EEWの方式</label><select data-f="plum"><option value="">自動（直前に近い地震があればPLUM法のみ）</option><option value="0">通常のEEW（震源・規模を推定）</option><option value="1">PLUM法のみ</option></select>';
-    const F=f=>b.querySelector('[data-f="'+f+'"]');
-    F('lat').value=q.lat.toFixed(2); F('lon').value=q.lon.toFixed(2);
-    F('mag').value=q.mag.toFixed(1); F('magr').value=Math.min(q.mag,9.9);
-    F('depth').value=q.depth; F('delay').value=q.delay;
-    F('plum').value=(q.plum===true?'1':(q.plum===false?'0':''));
-    F('plum').addEventListener('change',()=>{ const v=F('plum').value; q.plum=(v===''?null:v==='1'); });
-    const num=(f,fn)=>F(f).addEventListener('input',()=>{ const v=parseFloat(F(f).value); if(isFinite(v)) fn(v); });
-    num('lat',v=>{ q.lat=clampN(v,-10,70); syncMarkers(); });
-    num('lon',v=>{ q.lon=clampN(v,90,180); syncMarkers(); });
-    F('lat').addEventListener('change',()=>{ F('lat').value=q.lat.toFixed(2); });
-    F('lon').addEventListener('change',()=>{ F('lon').value=q.lon.toFixed(2); });
-    num('mag',v=>{ q.mag=clampN(v,0,15); F('magr').value=Math.min(q.mag,9.9); });
-    num('depth',v=>{ q.depth=clampN(v,0,699); });
-    num('delay',v=>{ q.delay=Math.round(clampN(v,0,MAX_DELAY)); });
-    F('magr').addEventListener('input',()=>{ q.mag=parseFloat(F('magr').value); F('mag').value=q.mag.toFixed(1); });
-    F('mag').addEventListener('change',()=>{ F('mag').value=q.mag.toFixed(1); });
-    b.addEventListener('focusin',()=>{ if(selQ!==i) selectQ(i); });
-    b.addEventListener('click',()=>{ if(selQ!==i) selectQ(i); });
+    const b=document.createElement('div'); b.style.borderLeftColor=QCOL[q.col%QCOL.length];
+    const kids=QS.filter(c=>c.from===q.uid).length;
+    const del=QS.length>1?'<button class="qx" title="この地震を削除'+(kids?'（生成した余震'+kids+'件も削除）':'')+'">✕</button>':'';
+    if(i!==selQ){                                              // 選んでいない地震は1行に畳む（件数が多くても見通せるように）
+      b.className='qb qc';
+      b.innerHTML='<div class="qh"><b>地震'+(i+1)+'</b><span class="qd">M'+q.mag.toFixed(1)+' ・ 発生 '+mmss(q.delay)+' ・ '+Math.abs(q.lat).toFixed(1)+(q.lat<0?'S':'N')+' '+q.lon.toFixed(1)+'E'+(kids?' ・ 余震'+kids+'件':'')+'</span>'+del+'</div>';
+      b.addEventListener('click',()=>selectQ(i));
+    }else{
+      b.className='qb sel';
+      b.innerHTML='<div class="qh"><b>地震'+(i+1)+'</b><span class="qd">地図クリックで震源を設定</span>'+del+'</div>'
+        +'<div class="row"><div><label>北緯（°）</label><input data-f="lat" type="number" min="-10" max="70" step="0.01"></div>'
+        +'<div><label>東経（°）</label><input data-f="lon" type="number" min="90" max="180" step="0.01"></div></div>'
+        +'<label>マグニチュード（スライダーは9.9まで／右の欄は15まで入力可）</label>'
+        +'<div class="row" style="align-items:center"><div style="flex:2.2"><input data-f="magr" type="range" min="0" max="9.9" step="0.1"></div>'
+        +'<div><input data-f="mag" type="number" min="0" max="15" step="0.1"></div></div>'
+        +'<div class="row"><div><label>震源の深さ（km）</label><input data-f="depth" type="number" min="0" max="699" step="5"></div>'
+        +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="'+MAX_DELAY+'" step="1"></div></div>'
+        +'<label>EEWの方式</label><select data-f="plum"><option value="">自動（直前に近い地震があればPLUM法のみ）</option><option value="0">通常のEEW（震源・規模を推定）</option><option value="1">PLUM法のみ</option></select>';
+      const F=f=>b.querySelector('[data-f="'+f+'"]');
+      F('lat').value=q.lat.toFixed(2); F('lon').value=q.lon.toFixed(2);
+      F('mag').value=q.mag.toFixed(1); F('magr').value=Math.min(q.mag,9.9);
+      F('depth').value=q.depth; F('delay').value=q.delay;
+      F('plum').value=(q.plum===true?'1':(q.plum===false?'0':''));
+      F('plum').addEventListener('change',()=>{ const v=F('plum').value; q.plum=(v===''?null:v==='1'); });
+      const num=(f,fn)=>F(f).addEventListener('input',()=>{ const v=parseFloat(F(f).value); if(isFinite(v)) fn(v); });
+      num('lat',v=>{ q.lat=clampN(v,-10,70); syncMarkers(); });
+      num('lon',v=>{ q.lon=clampN(v,90,180); syncMarkers(); });
+      F('lat').addEventListener('change',()=>{ F('lat').value=q.lat.toFixed(2); });
+      F('lon').addEventListener('change',()=>{ F('lon').value=q.lon.toFixed(2); });
+      num('mag',v=>{ q.mag=clampN(v,0,15); F('magr').value=Math.min(q.mag,9.9); updateCounts(); });
+      num('depth',v=>{ q.depth=clampN(v,0,699); });
+      num('delay',v=>{ q.delay=Math.round(clampN(v,0,MAX_DELAY)); });
+      F('magr').addEventListener('input',()=>{ q.mag=parseFloat(F('magr').value); F('mag').value=q.mag.toFixed(1); updateCounts(); });
+      F('mag').addEventListener('change',()=>{ F('mag').value=q.mag.toFixed(1); });
+    }
     const x=b.querySelector('.qx');
-    if(x) x.onclick=ev=>{
-      ev.stopPropagation(); QS.splice(i,1); aftOnMainRemoved(i);
-      if(i<selQ) selQ--; else if(i===selQ) selQ=Math.min(selQ,QS.length-1);
-      renderQuakes(); syncMarkers();
-    };
+    if(x) x.onclick=ev=>{ ev.stopPropagation(); removeQuake(q); };
     box.appendChild(b);
   });
-  $('qadd').disabled=QS.length>=MAX_Q;
-  $('qadd').textContent=QS.length>=MAX_Q?'地震は最大'+MAX_Q+'個までです':'＋ 地震を追加';
-  renderAftParents();
+  updateCounts(); renderAftParents();
 }
 function setEpi(lat,lon,pan){
   lat=Math.round(clampN(lat,-10,70)*100)/100; lon=Math.round(clampN(lon,90,180)*100)/100;
-  const q=QS[selQ]; q.lat=lat; q.lon=lon;
-  const b=$('qlist').children[selQ];
-  if(b){ b.querySelector('[data-f="lat"]').value=lat.toFixed(2); b.querySelector('[data-f="lon"]').value=lon.toFixed(2); }
-  syncMarkers();
+  const q=QS[selQ]; q.lat=lat; q.lon=lon; q.from=null;           // 地図で動かした地震は、生成した余震ではなく、自分で置いた地震として扱う
+  renderQuakes(); syncMarkers();
   if(pan) map.panTo([lat,lon]);
 }
-map.on('click',e=>{ if(typeof playing!=='undefined'&&playing) return; setEpi(e.latlng.lat,e.latlng.lng,false); });   // 再生中は震源を動かさない
+let liveArm=false;                                             // 「＋地震」の追加モード（地図をタップすると、その場所に地震を追加）
+map.on('click',e=>{
+  if(liveArm){ quickAdd(e.latlng.lat,e.latlng.lng); return; }
+  if(typeof playing!=='undefined'&&playing) return;              // 再生中は震源を動かさない
+  setEpi(e.latlng.lat,e.latlng.lng,false); });
 $('qadd').onclick=()=>{
-  if(QS.length>=MAX_Q) return;
+  if(QS.length>=MAX_TOTAL) return;
   const c=map.getCenter();
-  QS.push({lat:Math.round(c.lat*100)/100,lon:Math.round(c.lng*100)/100,mag:6.0,depth:10,delay:0});
+  QS.push(mkQ({lat:r2(c.lat),lon:r2(c.lng),mag:(heavyN(QS)>=MAX_HEAVY?5.0:6.0),depth:10,delay:0}));
   selQ=QS.length-1; renderQuakes(); syncMarkers();
+  const e=$('qlist').children[selQ]; if(e&&e.scrollIntoView) e.scrollIntoView({block:'nearest'});
 };
-/* ---------- 余震（①事前設定）: 本震とは別のリスト AS（件数が多いので、本震の入力欄とは分けて表で扱う） ---------- */
-const MAX_AFT=__AFT_MAX__;
-let AS=[];                                              // {lat,lon,mag,depth,delay,par}  par: 親の本震（QS）の番号
-const aftLayer=L.layerGroup().addTo(map);
-const quakeBody=q=>({lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay});
-function allQuakes(){                                   // サーバーへ送る形（本震→余震の順。余震は aft:true と親の番号 par を持つ）
-  return QS.map(q=>({...quakeBody(q),plum:(q.plum===true||q.plum===false)?q.plum:null}))
-    .concat(AS.map(a=>({...quakeBody(a),aft:true,par:a.par})));
+$('qsort').onclick=()=>{ const cur=QS[selQ]; QS.sort((a,b)=>a.delay-b.delay); selQ=Math.max(0,QS.indexOf(cur)); renderQuakes(); syncMarkers(); };
+
+/* ---------- 余震を自動生成（本震から経験則で余震列を作り、地震リストに足す） ---------- */
+function allQuakes(){                                   // サーバーへ送る形。生成した余震は aft:true と、親の地震の番号 parent を持つ（par は保存データ用の同じ値）
+  const idx=new Map(QS.map((q,i)=>[q.uid,i]));
+  return QS.map(q=>{
+    const o={lat:q.lat,lon:q.lon,mag:q.mag,depth:q.depth,delay:q.delay,plum:plumOf(q),uid:q.uid,col:q.col};
+    if(isChild(q)){ o.aft=true; o.from=q.from; o.parent=idx.has(q.from)?idx.get(q.from):0; o.par=o.parent; }
+    return o;
+  });
 }
 const aftNum=(id,d)=>{ const v=parseFloat($(id).value); return isFinite(v)?v:d; };
 function renderAftParents(){
-  const sel=$('aftParent'), cur=sel.value;
-  sel.innerHTML=QS.map((q,i)=>'<option value="'+i+'">地震'+(i+1)+'（M'+q.mag.toFixed(1)+'・深さ'+Math.round(q.depth)+'km・'+q.delay+'秒後）</option>').join('');
-  sel.value=(cur!==''&&+cur<QS.length)?cur:'0';
+  const sel=$('aftParent'), cur=sel.value, mains=[];
+  QS.forEach((q,i)=>{ if(!isChild(q)) mains.push([q,i]); });
+  sel.innerHTML=mains.map(([q,i])=>'<option value="'+q.uid+'">地震'+(i+1)+'（M'+q.mag.toFixed(1)+'・深さ'+Math.round(q.depth)+'km・'+q.delay+'秒後）</option>').join('');
+  const s=QS[selQ], pick=(s&&!isChild(s))?s:(mains.length?mains[0][0]:null);
+  sel.value=mains.some(([q])=>String(q.uid)===cur)?cur:(pick?String(pick.uid):'');
 }
-function renderAftList(){
-  const box=$('aftList');
-  if(!AS.length){ box.style.display='none'; box.innerHTML=''; return; }
-  box.style.display='block';
-  const mmss=s=>Math.floor(s/60)+':'+('0'+(s%60)).slice(-2);
-  box.innerHTML='<table><tr style="color:#93a0b8"><td></td><td>発生（秒後）</td><td>M</td><td>深さ</td><td></td></tr>'
-    +AS.map((a,k)=>'<tr data-k="'+k+'"><td class="n" style="color:'+QCOL[a.par%QCOL.length]+'">●</td>'
-      +'<td><input data-f="delay" type="number" min="0" max="'+MAX_DELAY+'" step="1" value="'+a.delay+'"> <span style="color:#93a0b8">'+mmss(a.delay)+'</span></td>'
-      +'<td><input data-f="mag" type="number" min="0" max="15" step="0.1" value="'+a.mag.toFixed(1)+'"></td>'
-      +'<td>'+Math.round(a.depth)+'km</td><td><button class="qx" data-act="del" type="button" title="この余震を削除">✕</button></td></tr>').join('')+'</table>';
-}
-function syncAft(){                                     // 地図の印（小さな丸。本震と同じ色）・件数・表を更新
-  aftLayer.clearLayers();
-  AS.forEach(a=>{ const col=QCOL[a.par%QCOL.length];
-    L.circleMarker([a.lat,a.lon],{radius:Math.max(2.5,Math.min(14,(a.mag-1.5)*2.2)),color:col,weight:1.2,fillColor:col,fillOpacity:.25,interactive:false}).addTo(aftLayer); });
-  $('aftCnt').textContent=AS.length?'（'+AS.length+'件）':'';
-  renderAftParents(); renderAftList();
-}
-function aftOnMainRemoved(i){                           // 本震を消したら、その余震も消し、後ろの本震の番号を詰める
-  AS=AS.filter(a=>a.par!==i).map(a=>a.par>i?{...a,par:a.par-1}:a); syncAft();
-}
-$('aftList').addEventListener('change',e=>{
-  const tr=e.target.closest('tr[data-k]'); if(!tr) return;
-  const a=AS[+tr.dataset.k], f=e.target.dataset.f, v=parseFloat(e.target.value);
-  if(!a||!isFinite(v)) return;
-  if(f==='delay') a.delay=Math.round(clampN(v,0,MAX_DELAY)); else if(f==='mag') a.mag=clampN(Math.round(v*10)/10,0,15);
-  AS.sort((x,y)=>x.delay-y.delay); syncAft();
-});
-$('aftList').addEventListener('click',e=>{
-  const tr=e.target.closest('tr[data-k]'); if(!tr) return;
-  const k=+tr.dataset.k;
-  if(e.target.dataset.act==='del'){ AS.splice(k,1); syncAft(); }
-  else if(!e.target.matches('input')){ const a=AS[k]; if(a) map.panTo([a.lat,a.lon]); }
-});
 async function aftGenerate(roll){
-  const pi=parseInt($('aftParent').value), p=QS[pi]; if(!p) return;
+  const p=QS.find(q=>String(q.uid)===$('aftParent').value); if(!p) return;
   if(roll) $('aftSeed').value=Math.floor(Math.random()*1e6);
-  const room=MAX_AFT-AS.filter(a=>a.par!==pi).length;
-  if(room<=0){ $('status').textContent='余震は最大'+MAX_AFT+'件までです。ほかの本震の余震を減らしてください'; return; }
-  const body={parent:quakeBody(p),dM:aftNum('aftDM',1.2),mmin:aftNum('aftMmin',3),minutes:aftNum('aftMin',60),p:aftNum('aftP',1),
+  const keep=QS.filter(q=>q.from!==p.uid), room=MAX_TOTAL-keep.length;    // 同じ地震の余震は置き換える
+  if(room<=0){ $('status').textContent='地震は合計'+MAX_TOTAL+'件までです。不要な地震を削除してください'; return; }
+  const body={parent:{lat:p.lat,lon:p.lon,mag:p.mag,depth:p.depth,delay:p.delay},dM:aftNum('aftDM',1.2),mmin:aftNum('aftMmin',3),minutes:aftNum('aftMin',60),p:aftNum('aftP',1),
     c:aftNum('aftC',5),b:aftNum('aftB',1),max:Math.min(aftNum('aftMax',MAX_AFT),room),seed:Math.round(aftNum('aftSeed',1))};
   $('status').textContent='余震を生成中…';
   try{
     const r=await fetch('/api/aftershocks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const j=await r.json();
     if(!r.ok){ $('status').textContent=j.error||'余震の生成に失敗しました'; return; }
-    AS=AS.filter(a=>a.par!==pi).concat(j.aftershocks.map(a=>({lat:a.lat,lon:a.lon,mag:a.mag,depth:a.depth,delay:a.delay,par:pi}))).sort((x,y)=>x.delay-y.delay);
-    syncAft();
-    const mx=j.aftershocks.reduce((m,a)=>Math.max(m,a.mag),0);
-    $('status').textContent=j.aftershocks.length
-      ?'余震を'+j.aftershocks.length+'件生成しました（M'+j.info.mmin.toFixed(1)+'以上・最大M'+mx.toFixed(1)+'）。実行すると再現します'
+    const fit=fitHeavy(j.aftershocks,MAX_HEAVY-heavyN(keep));
+    const kids=fit.ks.map(a=>mkQ(a,p.uid,p.col));
+    const cur=QS[selQ]; QS=keep; QS.splice(QS.indexOf(p)+1,0,...kids);
+    const k=QS.indexOf(cur); selQ=k>=0?k:QS.indexOf(p);
+    renderQuakes(); syncMarkers();
+    const mx=kids.reduce((m,a)=>Math.max(m,a.mag),0);
+    $('status').textContent=kids.length
+      ?'余震を'+kids.length+'件、地震リストに追加しました（最大M'+mx.toFixed(1)+'）。実行すると再現します'+(fit.cut?'（M'+LITE_MAG+'以上は計算が重いため、大きい順に'+(kids.filter(a=>a.mag>=LITE_MAG).length)+'件に絞りました）':'')
       :'この条件では余震が出ませんでした（最小Mを下げるか、期間を延ばしてください）';
   }catch(e){ $('status').textContent='通信エラー: '+e; }
 }
 $('aftGen').onclick=()=>aftGenerate(false);
 $('aftRoll').onclick=()=>aftGenerate(true);
-$('aftAdd').onclick=()=>{
-  const k=parseInt($('aftParent').value), p=QS[k]; if(!p) return;
-  if(AS.length>=MAX_AFT){ $('status').textContent='余震は最大'+MAX_AFT+'件までです'; return; }
-  const c=map.getCenter();
-  AS.push({lat:Math.round(c.lat*1000)/1000,lon:Math.round(c.lng*1000)/1000,mag:Math.max(1,Math.round((p.mag-1.5)*10)/10),depth:p.depth,delay:Math.min(MAX_DELAY,p.delay+60),par:k});
-  AS.sort((x,y)=>x.delay-y.delay); syncAft();
-};
-$('aftClr').onclick=()=>{ AS=[]; syncAft(); };
+$('aftClr').onclick=()=>{ const cur=QS[selQ]; QS=QS.filter(q=>!isChild(q)); const k=QS.indexOf(cur); selQ=k>=0?k:0; renderQuakes(); syncMarkers(); };
 ['focus','mousedown'].forEach(ev=>$('aftParent').addEventListener(ev,renderAftParents));
 renderQuakes(); syncMarkers();
 
@@ -4679,43 +4696,47 @@ renderQuakes(); syncMarkers();
 const SL_KEY='quakeSets_v1';
 function slAll(){ try{ const o=JSON.parse(localStorage.getItem(SL_KEY)||'{}'); return (o&&typeof o==='object')?o:{}; }catch(_){ return {}; } }
 function slPut(o){ try{ localStorage.setItem(SL_KEY,JSON.stringify(o)); return true; }catch(_){ $('status').textContent='保存できませんでした（ブラウザの保存が無効）'; return false; } }
-function slClean(a){                                    // 入力検証（最大5件・範囲に丸める）
+function slClean(a){                                    // 入力検証（最大MAX_TOTAL件・範囲に丸める）。aft:true の地震は、par（リスト内の親の番号）を持つ
   if(!Array.isArray(a)) return null;
-  const out=[], afts=[];
+  const out=[];
   for(const q of a){
+    if(out.length>=MAX_TOTAL) break;
     const lat=+q.lat, lon=+q.lon, mag=+q.mag, dep=+q.depth, dl=+(q.delay||0);
     if(![lat,lon,mag,dep,dl].every(isFinite)) continue;
-    const o={lat:clampN(lat,-90,90),lon:clampN(lon,-180,180),mag:clampN(mag,0,15),depth:clampN(dep,0,699),delay:Math.round(clampN(dl,0,MAX_DELAY))};
-    if(q.aft===true){ if(afts.length<MAX_AFT) afts.push({...o,par:Math.max(0,parseInt(q.par)||0)}); }
-    else if(out.length<MAX_Q) out.push({...o,plum:(q.plum===true||q.plum===false)?q.plum:null});
+    const o={lat:clampN(lat,-90,90),lon:clampN(lon,-180,180),mag:clampN(mag,0,15),depth:clampN(dep,0,699),delay:Math.round(clampN(dl,0,MAX_DELAY)),plum:plumOf(q)};
+    if(q.aft===true){ o.aft=true; o.par=Math.max(0,parseInt(q.par)||0); }     // 旧形式（本震→余震の順で、par=本震の番号）もそのまま読める
+    out.push(o);
   }
-  if(!out.length) return null;
-  afts.forEach(x=>{ if(x.par>=out.length) x.par=0; });
-  out.afts=afts;                                        // 余震は配列の付加プロパティで返す（呼び出し側は slApply に渡すだけ）
+  if(!out.some(x=>!x.aft)) return null;
   return out;
 }
 function slRefresh(sel){
   const o=slAll(), names=Object.keys(o), box=$('slSel'); box.innerHTML='';
   if(!names.length){ const op=document.createElement('option'); op.value=''; op.textContent='（保存なし）'; box.appendChild(op); return; }
-  names.forEach(n=>{ const na=o[n].filter(x=>x&&x.aft).length; const op=document.createElement('option'); op.value=n; op.textContent=n+'（'+(o[n].length-na)+'件'+(na?'＋余震'+na:'')+'）'; box.appendChild(op); });
+  names.forEach(n=>{ const na=o[n].filter(x=>x&&x.aft).length; const op=document.createElement('option'); op.value=n; op.textContent=n+'（'+o[n].length+'件'+(na?'・うち余震'+na:'')+'）'; box.appendChild(op); });
   if(sel&&o[sel]) box.value=sel;
 }
 function slApply(list){
-  QS=list.map(q=>({...q})); selQ=0; renderQuakes(); syncMarkers();
-  AS=(list.afts||[]).map(a=>({...a})); syncAft();
+  const objs=list.map(q=>mkQ(q,null,null));
+  list.forEach((q,i)=>{                                 // 余震は、親の地震（par番号）にひも付け直す。色も親と同じにする
+    const p=(q.aft&&q.par!==i)?objs[q.par]:null;
+    if(p&&!list[q.par].aft){ objs[i].from=p.uid; objs[i].col=p.col; } });
+  QS=objs; selQ=0; renderQuakes(); syncMarkers();
   const q=QS[0]; if(q) map.panTo([q.lat,q.lon]);
 }
+const slKids=l=>l.filter(x=>x.aft).length;
+const slForm=l=>l.map(q=>{ const o={...q}; delete o.uid; delete o.col; delete o.from; return o; });
 $('slSave').onclick=()=>{
   const o=slAll(), cur=$('slSel').value;
   const nm=(prompt('保存名を入力（同じ名前は上書き）',cur||('地震セット'+(Object.keys(o).length+1)))||'').trim();
   if(!nm) return;
-  o[nm]=allQuakes();
-  if(slPut(o)){ slRefresh(nm); $('status').textContent='「'+nm+'」を保存しました（'+QS.length+'件'+(AS.length?'＋余震'+AS.length+'件':'')+'）'; }
+  o[nm]=slForm(allQuakes());
+  if(slPut(o)){ slRefresh(nm); $('status').textContent='「'+nm+'」を保存しました（'+QS.length+'件'+(slKids(allQuakes())?'（うち生成した余震'+slKids(allQuakes())+'件）':'')+'）'; }
 };
 $('slLoad').onclick=()=>{
   const o=slAll(), nm=$('slSel').value, l=slClean(o[nm]);
   if(!l){ $('status').textContent='読み込める保存データがありません'; return; }
-  slApply(l); $('status').textContent='「'+nm+'」を読み込みました（'+l.length+'件'+(l.afts.length?'＋余震'+l.afts.length+'件':'')+'）';
+  slApply(l); $('status').textContent='「'+nm+'」を読み込みました（'+l.length+'件'+(slKids(l)?'（うち余震'+slKids(l)+'件）':'')+'）';
 };
 $('slDel').onclick=()=>{
   const o=slAll(), nm=$('slSel').value; if(!nm||!o[nm]) return;
@@ -4723,7 +4744,7 @@ $('slDel').onclick=()=>{
   delete o[nm]; if(slPut(o)) slRefresh();
 };
 $('slExp').onclick=()=>{
-  const blob=new Blob([JSON.stringify({version:2,quakes:allQuakes()},null,1)],{type:'application/json'});
+  const blob=new Blob([JSON.stringify({version:3,quakes:slForm(allQuakes())},null,1)],{type:'application/json'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='quakes.json'; a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href),2000);
 };
@@ -4733,7 +4754,7 @@ $('slFile').addEventListener('change',async()=>{
   try{
     const j=JSON.parse(await f.text()), l=slClean(Array.isArray(j)?j:j.quakes);
     if(!l) throw new Error('形式が不正です');
-    slApply(l); $('status').textContent='ファイルから '+l.length+'件'+(l.afts.length?'（＋余震'+l.afts.length+'件）':'')+'を読み込みました';
+    slApply(l); $('status').textContent='ファイルから '+l.length+'件'+(slKids(l)?'（うち余震'+slKids(l)+'件）':'')+'を読み込みました';
   }catch(e){ $('status').textContent='読込エラー: '+e.message; }
 });
 slRefresh();
@@ -4818,10 +4839,10 @@ async function qsSearch(){
 function qsApply(i,mode){
   const it=qsItems[i]; if(!it) return;
   if(mode==='add'){
-    if(QS.length>=MAX_Q){ $('status').textContent='地震は最大'+MAX_Q+'個までです。不要な地震を削除してください'; return; }
-    QS.push({lat:it.lat,lon:it.lon,mag:6.0,depth:10,delay:0}); selQ=QS.length-1;
+    if(QS.length>=MAX_TOTAL){ $('status').textContent='地震は合計'+MAX_TOTAL+'件までです。不要な地震を削除してください'; return; }
+    QS.push(mkQ({lat:it.lat,lon:it.lon,mag:6.0,depth:10,delay:0})); selQ=QS.length-1;
   }
-  const q=QS[selQ]; q.lat=it.lat; q.lon=it.lon;
+  const q=QS[selQ]; q.lat=it.lat; q.lon=it.lon; q.from=null;
   const notes=[];
   if(it.mag!=null) q.mag=it.mag; else notes.push('Mが不明のため'+(mode==='add'?'6.0':'据え置き'));
   if(it.depth!=null) q.depth=it.depth; else{ q.depth=10; notes.push('深さが不明のため10km'); }
@@ -4874,8 +4895,8 @@ QS_FAMOUS.forEach(([label,f,t,c])=>{
 QS_MULTI.forEach(p=>{
   const b=document.createElement('button'); b.type='button'; b.className='qsChip'; b.textContent=p.n;
   b.onclick=()=>{
-    QS=p.q.slice(0,MAX_Q).map(x=>({lat:x.lat,lon:x.lon,mag:x.mag,depth:x.depth,delay:x.delay}));
-    selQ=0; renderQuakes(); syncMarkers(); AS=[]; syncAft();
+    QS=p.q.slice(0,MAX_TOTAL).map(x=>mkQ({lat:x.lat,lon:x.lon,mag:x.mag,depth:x.depth,delay:x.delay}));
+    selQ=0; renderQuakes(); syncMarkers();
     try{ map.fitBounds(QS.map(x=>[x.lat,x.lon]),{maxZoom:7,padding:[40,40]}); }catch(e){}
     $('status').textContent='「'+p.n+'」を'+QS.length+'個の震源としてセットしました。'+p.note;
     if($('qsAutoRun').checked) $('run').click();
@@ -5180,7 +5201,7 @@ function draw(ts){
     if(!clr) updateEew();
     
     if(!clr) sim.quakes.forEach(q=>{                    // 各地震の実際のP波・S波（発生後のみ）
-      const tl=tcur-q.delay; if(tl<0||(q.aft&&tl>q.tEnd)) return;      // 余震は、波が日本を通り過ぎたら描かない（多数の円で重くならないように）
+      const tl=tcur-q.delay; if(tl<0||((q.aft||q.mag<LITE_MAG)&&tl>q.tEnd)) return;      // 余震・小さい地震は、波が日本を通り過ぎたら描かない（多数の円で重くならないように。小さい地震は計算も打ち切っている）
       drawCircle(q.lat,q.lon,interp(q.P,tl),'rgba(90,200,255,.95)',1.6);
       drawCircle(q.lat,q.lon,interp(q.S,tl),'rgba(255,95,95,.98)',2.2);
     });
@@ -5198,8 +5219,9 @@ function draw(ts){
       ctx.moveTo(p.x-14,p.y); ctx.lineTo(p.x+14,p.y); ctx.moveTo(p.x,p.y-14); ctx.lineTo(p.x,p.y+14); ctx.stroke();
     });
     $('hT').textContent=tcur.toFixed(1);
-    const hv=f=>{                                       // 本震は常に、余震は揺れている間だけ表示（最大4件まで）
-      const act=sim.quakes.filter(q=>!q.aft||(tcur-q.delay>=0&&tcur-q.delay<=q.tEnd));
+    const hv=f=>{                                       // 大きい地震は常に、余震・小さい地震は揺れている間だけ表示（最大4件まで）
+      const act=sim.quakes.filter(q=>!(q.aft||q.mag<LITE_MAG)||(tcur-q.delay>=0&&tcur-q.delay<=q.tEnd));
+      if(!act.length) return '—';
       const s=act.slice(0,4).map(q=>{ const tl=tcur-q.delay; return tl<0?'-':interp(q[f],tl).toFixed(0); }).join('／');
       return act.length>4?s+'／…':s; };
     $('hP').textContent=clr?'—':hv('P');
@@ -6396,29 +6418,33 @@ function simMsg(m){          // EEWの各報（upto/report/final/none/done/error
       else if(k==='error'){ qk.eewDone=true; sim.err=true; $('status').textContent='EEW演算エラー（地震'+(m.q+1)+'）: '+v; }
 }
 
-/* ---------- ②実行中の余震追加（ステートレス）----------
-   再生中に、地図の中心・現在の時刻の少し先に余震を1件足す。地震リストを送り直し、have=すでにある件数 を付けると、
-   サーバーは既存の地震を足すだけ（控えから使い回す）で、新しい1件ぶんだけを送ってくる。再生は、その地震の発生時刻の手前で待つ。 */
+/* ---------- 再生中の地震の追加（ステートレス）----------
+   再生中に、いまの時刻の少し先に地震を足す（本震も余震も区別しない）。地震リストを送り直し、have=すでにある件数 を付けると、
+   サーバーは既存の地震を足すだけ（控えから使い回す）で、新しい分だけを送ってくる。再生は、その地震の発生時刻の手前で待つ。 */
 let liveCtl=null, liveBusy=false;
-const autoLayer=L.layerGroup().addTo(map);               // 自動余震の震央の印（事前設定の余震は aftLayer）
+const autoLayer=L.layerGroup().addTo(map);               // 自動余震の震央の印（リストに足した地震は syncMarkers が描く）
 const liveInflight=v=>v.bq.length>v.quakes.length;      // サーバーから届くのを待っている地震があるか
 // 地震 nqs（配列）を、再生中の sim に足す。地震リスト全体＋have を送り、新しい分だけを受け取る
+// opt.save=true: 地震リスト（QS）にも足す（次回の実行にも含まれる） / opt.auto=true: 自動余震（リストには足さない）
 async function liveInject(nqs,opt){
   const v=sim; if(!v||!v.bq||!nqs.length||liveInflight(v)||liveBusy) return false;
   liveBusy=true;
-  const n0=v.bq.length, bq=v.bq.concat(nqs); v.bq=bq;
-  if(opt.save){ nqs.forEach(nq=>AS.push({lat:nq.lat,lon:nq.lon,mag:nq.mag,depth:nq.depth,delay:nq.delay,par:nq.parent})); AS.sort((x,y)=>x.delay-y.delay); syncAft(); }   // 次回の実行にも含める
-  else nqs.forEach(nq=>{ L.circleMarker([nq.lat,nq.lon],{radius:4,color:QCOL[nq.parent%QCOL.length],weight:1,fillOpacity:.5,interactive:false}).addTo(autoLayer); });
+  const n0=v.bq.length;
+  const objs=opt.save?nqs.map(nq=>mkQ(nq,nq.from,nq.col)):null;
+  if(objs) nqs.forEach((nq,k)=>{ nq.uid=objs[k].uid; nq.col=objs[k].col; });
+  const bq=v.bq.concat(nqs); v.bq=bq;
+  if(objs){ QS.push(...objs); renderQuakes(); syncMarkers(); }
+  else nqs.forEach(nq=>{ L.circleMarker([nq.lat,nq.lon],{radius:4,color:QCOL[(nq.col||0)%QCOL.length],weight:1,fillOpacity:.5,interactive:false}).addTo(autoLayer); });
   pendUpdate(v,bq); buildEewCards(bq.length,true);
   const ctl=liveCtl=new AbortController();
-  if(!opt.auto) $('status').textContent=opt.msg||'余震を計算中…';
+  if(!opt.auto) $('status').textContent=opt.msg||'地震を計算中…';
   const undo=msg=>{ if(sim!==v) return; v.bq=v.bq.slice(0,n0);
-    if(opt.save){ AS=AS.filter(a=>!nqs.some(q=>q.delay===a.delay&&q.lat===a.lat&&q.lon===a.lon&&q.mag===a.mag)); syncAft(); }
+    if(objs){ const cur=QS[selQ]; QS=QS.filter(q=>!objs.includes(q)); const k=QS.indexOf(cur); selQ=k>=0?k:Math.max(0,QS.length-1); renderQuakes(); syncMarkers(); }
     pendUpdate(v,v.bq); $('status').textContent=msg; };
   try{
     const r=await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},signal:ctl.signal,
       body:JSON.stringify({quakes:bq,gz:(typeof DecompressionStream!=='undefined'),mode:v.mode==='sim'?'sim':'monitor',stream:true,have:n0})});
-    if(!r.ok){ let msg='余震の追加に失敗しました'; try{ msg=(await r.json()).error||msg; }catch(_){} undo(msg); return false; }
+    if(!r.ok){ let msg='地震の追加に失敗しました'; try{ msg=(await r.json()).error||msg; }catch(_){} undo(msg); return false; }
     const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
     const one=async line=>{ if(sim!==v) return; const m=JSON.parse(line);
       if(m.k==='fatal') undo(m.v); else if(m.k==='add') await addQuake(m,bq); else simMsg(m); };
@@ -6428,63 +6454,87 @@ async function liveInject(nqs,opt){
       while((k=buf.indexOf('\n'))>=0){ const line=buf.slice(0,k); buf=buf.slice(k+1); if(line.trim()) await one(line); }
     }
     if(buf.trim()) await one(buf);
-    if(!opt.auto&&sim===v&&v.bq===bq) $('status').textContent=opt.done||('余震を'+nqs.length+'件追加しました');
+    if(!opt.auto&&sim===v&&v.bq===bq) $('status').textContent=opt.done||('地震を'+nqs.length+'件追加しました');
     return true;
   }catch(e){ if(e.name!=='AbortError') undo('通信エラー: '+e); return false; }
   finally{ liveBusy=false; }
 }
-async function liveAdd(){
+/* 「＋地震」: 再生中は、いまの時刻の少し先（3秒後）に追加。再生前は、地震リストに足す（発生は0秒後） */
+async function quickAdd(lat,lon){
+  const mag=clampN(aftNum('qlM',5),0,15), dep=clampN(aftNum('qlD',10),0,699);
+  lat=r3(clampN(lat,-10,70)); lon=r3(clampN(lon,90,180));
   const v=sim;
-  if(!v||!v.bq){ $('status').textContent='先にシミュレーションを実行してください'; return; }
-  if(!STREAM_FRAMES){ $('status').textContent='再生中の追加は、逐次計算（STREAM_FRAMES）が有効なときだけ使えます'; return; }
-  if(liveInflight(v)||liveBusy){ $('status').textContent='直前の追加を計算中です。少し待ってください'; return; }
-  const par=parseInt($('aftParent').value), p=v.quakes[isFinite(par)?par:0];
-  if(!p||p.aft){ $('status').textContent='余震の親にする本震を選んでください'; return; }
-  if(v.bq.filter(q=>q.aft).length>=MAX_AFT){ $('status').textContent='余震は最大'+MAX_AFT+'件までです'; return; }
-  const c=map.getCenter(), r3=x=>Math.round(x*1000)/1000;
-  const mag=aftNum('aftLiveM',Math.max(1,Math.round((p.mag-1.5)*10)/10));
-  const delay=Math.min(MAX_DELAY,Math.ceil(tcur)+3);
-  const nq={lat:r3(c.lat),lon:r3(c.lng),mag:mag,depth:p.depth,delay:delay,aft:true,parent:isFinite(par)?par:0};
-  await liveInject([nq],{save:true,msg:'余震を計算中…（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）',done:'余震を追加しました（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）'});
+  if(v&&v.bq&&STREAM_FRAMES){
+    if(liveInflight(v)||liveBusy){ $('status').textContent='直前の追加を計算中です。少し待ってください'; return; }
+    const delay=Math.min(MAX_DELAY,Math.ceil(tcur)+3), nq={lat:lat,lon:lon,mag:mag,depth:dep,delay:delay};
+    const lm=limitMsg(v.bq.concat([nq])); if(lm){ $('status').textContent=lm; return; }
+    await liveInject([nq],{save:true,msg:'地震を計算中…（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）',done:'地震を追加しました（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）'});
+  }else{
+    const nq=mkQ({lat:lat,lon:lon,mag:mag,depth:dep,delay:0}), lm=limitMsg(QS.concat([nq])); if(lm){ $('status').textContent=lm; return; }
+    QS.push(nq); selQ=QS.length-1; renderQuakes(); syncMarkers();
+    $('status').textContent='地震を追加しました（M'+mag.toFixed(1)+'・発生0秒後。「発生（秒後）」で時間差を付けられます）';
+  }
 }
-$('aftLive').onclick=liveAdd; $('aftLiveBar').onclick=liveAdd;
+function setLiveArm(on){
+  liveArm=on; $('qLive').style.display=on?'block':'none'; $('qLiveBar').classList.toggle('on',on);
+  if(on) $('status').textContent='地図をタップすると、その場所に地震を追加します（下のMと深さで）';
+}
+$('qLiveBar').onclick=()=>setLiveArm(!liveArm);
+$('qlClose').onclick=()=>setLiveArm(false);
+$('qlCenter').onclick=()=>{ const c=map.getCenter(); quickAdd(c.lat,c.lng); };
 
-/* ---------- ③自動余震モード ----------
-   本震が sim に載ったら、余震パネルの設定で余震列を1回だけ生成して待ち行列に入れる（事前設定の余震がある本震は対象外）。
-   再生が発生時刻に近づいたものを、②と同じ経路（liveInject）でまとめて足す。再生は、次の余震の発生時刻の手前で待つ。
-   乱数のシードは「シード＋本震の番号」。連鎖（余震の余震）は扱わない。 */
+/* ---------- 自動余震（ON/OFF）----------
+   ONの間、各地震が sim に載ったら、余震パネルの設定で余震列を1回だけ生成して待ち行列に入れる（その地震から生成した余震がリストにあれば対象外）。
+   再生が発生時刻に近づいたものを、上と同じ経路（liveInject）でまとめて足す。再生は、次の余震の発生時刻の手前で待つ。
+   乱数のシードは「シード＋地震の番号」。連鎖（余震の余震）は扱わない。
+   OFFにすると待ち行列を捨てる。再びONにすると、いまより先の分だけを作り直す（すでに足した分は足さない）。 */
+function setAutoAft(on){
+  $('aftAuto').checked=on; const b=$('aftAutoBar'); b.classList.toggle('on',on); b.textContent='余震自動：'+(on?'ON':'OFF');
+  const v=sim;
+  if(!on&&v&&v.auto){ v.auto.q=[]; v.auto.gen={}; pendUpdate(v,v.bq); }
+  $('status').textContent=on?(v?'自動余震をONにしました。以降、各地震の余震を自動で足します':'自動余震をONにしました。実行すると、再生中に各地震の余震を自動で足します')
+                            :(v?'自動余震をOFFにしました。まだ起きていない余震は発生しません':'自動余震をOFFにしました');
+}
+$('aftAuto').onchange=()=>setAutoAft($('aftAuto').checked);
+$('aftAutoBar').onclick=()=>setAutoAft(!$('aftAuto').checked);
 async function autoGenerate(v,i){
-  const p=v.quakes[i];
-  const room=MAX_AFT-v.bq.filter(q=>q.aft).length-v.auto.q.length; if(room<=0) return;
+  const p=v.quakes[i], b=v.bq[i]; if(!p||!b) return;
+  const room=MAX_TOTAL-v.bq.length-v.auto.q.length; if(room<=0) return;
   const body={parent:{lat:p.lat,lon:p.lon,mag:p.mag,depth:p.depth,delay:p.delay},dM:aftNum('aftDM',1.2),mmin:aftNum('aftMmin',3),minutes:aftNum('aftMin',60),
     p:aftNum('aftP',1),c:aftNum('aftC',5),b:aftNum('aftB',1),max:Math.min(aftNum('aftMax',MAX_AFT),room),seed:Math.round(aftNum('aftSeed',1))+i};
   try{
     const r=await fetch('/api/aftershocks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const j=await r.json(); if(!r.ok||sim!==v) return;
-    j.aftershocks.forEach(a=>v.auto.q.push({lat:a.lat,lon:a.lon,mag:a.mag,depth:a.depth,delay:Math.min(MAX_DELAY,Math.round(a.delay)),aft:true,parent:i}));
+    const j=await r.json(); if(!r.ok||sim!==v||!$('aftAuto').checked) return;
+    const t0=Math.max(0,tcur-5), key=a=>a.delay+'|'+a.lat+'|'+a.lon+'|'+a.mag, have=new Set(v.bq.map(key));
+    const ks=[]; j.aftershocks.forEach(a=>{ const d=Math.min(MAX_DELAY,Math.round(a.delay));
+      if(d>=t0&&!have.has(key({...a,delay:d}))) ks.push({lat:a.lat,lon:a.lon,mag:a.mag,depth:a.depth,delay:d,aft:true,parent:i,from:b.uid,col:b.col,auto:true}); });   // すでに過ぎた分・足し済みの分は作らない
+    const fit=fitHeavy(ks,MAX_HEAVY-heavyN(v.bq)-heavyN(v.auto.q));
+    fit.ks.forEach(q=>v.auto.q.push(q));
     v.auto.q.sort((x,y)=>x.delay-y.delay); pendUpdate(v,v.bq);
-    if(j.aftershocks.length) $('status').textContent='自動余震: 本震'+(i+1)+'の余震を'+j.aftershocks.length+'件生成しました';
+    if(fit.ks.length) $('status').textContent='自動余震: 地震'+(i+1)+'の余震を'+fit.ks.length+'件生成しました'+(fit.cut?'（M'+LITE_MAG+'以上は大きい順に絞りました）':'');
   }catch(e){}
 }
 function autoAftTick(){
   const v=sim; if(!v||!v.bq||!STREAM_FRAMES||!$('aftAuto').checked) return;
   if(!v.auto) v.auto={gen:{},q:[]};
   v.quakes.forEach((q,i)=>{ if(q.aft||v.auto.gen[i]) return; v.auto.gen[i]=1;
-    if(!AS.some(a=>a.par===i)) autoGenerate(v,i); });
+    const b=v.bq[i]; if(b&&!v.bq.some(c=>c.from===b.uid&&!c.auto)) autoGenerate(v,i); });
   if(!v.auto.q.length||liveInflight(v)||liveBusy) return;
   const horizon=Math.ceil(tcur)+Math.max(20,2*(parseFloat($('speed').value)||1));
-  const room=MAX_AFT-v.bq.filter(q=>q.aft).length, ready=[];
-  while(v.auto.q.length&&v.auto.q[0].delay<=horizon&&ready.length<Math.min(8,room)) ready.push(v.auto.q.shift());
-  if(!v.auto.q.length||room<=0){ if(room<=0) v.auto.q=[]; }
+  const room=MAX_TOTAL-v.bq.length, roomH=MAX_HEAVY-heavyN(v.bq), ready=[]; let hh=0;
+  while(v.auto.q.length&&v.auto.q[0].delay<=horizon&&ready.length<Math.min(8,room)){
+    const q=v.auto.q.shift(); if(q.mag>=LITE_MAG){ if(hh>=roomH) continue; hh++; } ready.push(q); }
+  if(room<=0) v.auto.q=[];
   if(!ready.length){ pendUpdate(v,v.bq); return; }
   const t0=Math.ceil(tcur)+2; ready.forEach(q=>{ if(q.delay<t0) q.delay=t0; });     // 計算が間に合わなかった分は、いまの時刻の少し先にずらす
   liveInject(ready,{save:false,auto:true});
 }
 setInterval(autoAftTick,400);
 $('run').onclick=async()=>{
-  const body={quakes:allQuakes().map(q=>q.aft?{...q,parent:q.par}:q),
+  const body={quakes:allQuakes(),
               gz:(typeof DecompressionStream!=='undefined'), mode:appMode, stream:STREAM_FRAMES};
-  if(!QS.concat(AS).every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
+  if(!QS.every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
+  { const lm=limitMsg(QS); if(lm){ $('status').textContent=lm; return; } }
   if(runCtl) runCtl.abort(); if(liveCtl) liveCtl.abort(); autoLayer.clearLayers(); const ctl=runCtl=new AbortController();
   $('run').disabled=$('runFab').disabled=true; $('runFab').textContent='計算中…'; $('status').textContent='計算中…'; playing=false; waitFlag=false;
   const handle=async(m)=>{
