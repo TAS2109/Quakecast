@@ -2144,7 +2144,31 @@ def tsunami_phase(tsus):
     return {"t0": (round(min(ts), 1) if ts else None), "end": max([t["end"] for t in tsus] + [0.0])}
 
 
+_UNIT_CACHE = {}                                         # key -> (unit, バイト数)。挿入順＝古い順
+_UNIT_CACHE_BYTES = float(os.environ.get("QC_UNIT_CACHE_MB", 120.0)) * 1e6     # Renderの無料枠(512MB)を想定した上限
+_unit_lock = threading.Lock()
+
+
 def quake_unit(q, dt=1.0, monitor=True):
+    """quake_unit_calc の結果を、同じ条件の地震についてだけ使い回す（②実行中の追加で、既存の地震を再計算しないため）。
+    結果は他の地震に依存せず、読み取り専用で使われる。サーバーが覚えているのは計算結果の控えだけで、状態は持たない"""
+    key = (q["lat"], q["lon"], q["mag"], q["depth"], q["delay"], dt, bool(monitor), bool(q.get("aft")))
+    with _unit_lock:
+        hit = _UNIT_CACHE.pop(key, None)
+        if hit is not None:
+            _UNIT_CACHE[key] = hit                      # 最近使ったものを新しい側へ
+            return {"q": q, "core": hit[0]["core"], "tsu": hit[0]["tsu"]}
+    u = quake_unit_calc(q, dt, monitor)
+    nb = int(u["core"]["rt"].nbytes)
+    if nb <= _UNIT_CACHE_BYTES:
+        with _unit_lock:
+            _UNIT_CACHE[key] = (u, nb)
+            while sum(v[1] for v in _UNIT_CACHE.values()) > _UNIT_CACHE_BYTES and len(_UNIT_CACHE) > 1:
+                _UNIT_CACHE.pop(next(iter(_UNIT_CACHE)))
+    return u
+
+
+def quake_unit_calc(q, dt=1.0, monitor=True):
     """地震1件ぶんの結果（震度フレーム・P/S波・津波）をまとめて返す。ほかの地震の有無で値は変わらない。
     EEWは演算に時間がかかるため、ここでは含めず、eew_stream(...) を地震ごとに別途ストリームで回す"""
     lite = bool(q.get("aft")) and q["mag"] < AFT_LITE_MAG        # 余震のうち小さいものは軽量に計算（津波も出ない規模）
@@ -3061,11 +3085,12 @@ def api_aftershocks():
     return _json_response({"aftershocks": aft, "info": info})
 
 
-def _simulate_stream(quakes, gz, monitor):
+def _simulate_stream(quakes, gz, monitor, have=0):
     """再生しながら計算する方式（ステートレス）。地震を1件ずつ Overlay に足し、足すたびに送る。
     base（最初の1件ぶんの震度フレーム）→ add（以降の地震の震度フレームだけ・集計値は間引いて同送）→ EEWの各報。
     クライアントは再生しながら重ね合わせる。まだ足されていない地震の発生時刻までしか再生しない。
-    サーバーは状態を持たない（②実行中の追加も、地震リストを送り直すだけ）。"""
+    サーバーは状態を持たない（②実行中の追加は、地震リストを送り直し、have=すでにクライアントにある件数 を付ける。
+    have 件目までは Overlay に足すだけで送らず（計算結果は控えから使い回す）、それ以降だけを add として送る）。"""
     plum_flags = _plum_only_flags(quakes) if monitor else [False] * len(quakes)
 
     def gen():
@@ -3102,6 +3127,8 @@ def _simulate_stream(quakes, gz, monitor):
             except ValueError as e:
                 yield dump({"k": "fatal", "v": str(e)})
                 return
+            if i < have:
+                continue                                  # すでにクライアントにある地震（EEWも再演算しない）
             if i == 0:
                 yield dump({"k": "base", "v": ov.base(gz)})
             else:
@@ -3157,7 +3184,7 @@ def api_simulate():
     gz = bool(j.get("gz"))
     monitor = (j.get("mode") != "sim")                    # "sim": 地震の再現のみ（EEW・津波・地震情報なし） / それ以外: 強震モニタ
     if j.get("stream"):                                   # 再生しながら計算する方式（クライアントが stream:true で要求）
-        return _simulate_stream(quakes, gz, monitor)
+        return _simulate_stream(quakes, gz, monitor, have=max(0, min(int(j.get("have") or 0), len(quakes) - 1)))
     try:
         ov = Overlay(1.0, monitor)
         for q in quakes:
@@ -4259,6 +4286,7 @@ INDEX_HTML = r"""<!doctype html>
     </details>
     <div class="abtn"><button id="aftGen" class="sec" type="button">余震を生成</button><button id="aftRoll" class="sec" type="button">別の乱数で生成</button></div>
     <div class="abtn"><button id="aftAdd" class="sec" type="button" title="地図の中心に、選んだ本震の余震を1件足します">＋ 1件追加（地図の中心）</button><button id="aftClr" class="sec" type="button">全削除</button></div>
+    <div class="abtn"><input id="aftLiveM" type="number" min="0" max="9" step="0.1" placeholder="M（空欄=本震-1.5）" style="width:10em"><button id="aftLive" class="sec" type="button" title="再生中に、地図の中心・現在の時刻に、選んだ本震の余震を1件追加します（②実行中の追加）">⚡ 再生中に1件追加</button></div>
     <div id="aftList"></div>
     <div class="hint">本震ごとに生成します（同じ本震の余震は置き換え）。余震は最大__AFT_MAX__件で、多いほど計算に時間がかかります。生成後は、発生時刻とMを表で直せます（行をクリックで地図が移動）。陸上で震度3未満の余震はEEWを出さず、震度1未満の余震は地震情報にも載せません。</div>
   </details>
@@ -4407,6 +4435,7 @@ INDEX_HTML = r"""<!doctype html>
   <div id="bar">
   <div id="ctl">
     <button id="restart" title="最初に戻る（リセット）" style="min-width:auto;white-space:nowrap">↺ 最初から</button>
+    <button id="aftLiveBar" title="再生中に、地図の中心・現在の時刻に余震を1件追加します" style="min-width:auto;white-space:nowrap">＋余震</button>
     <button id="play" title="再生/一時停止">►</button>
     <input id="seek" type="range" min="0" max="0" step="1" value="0" disabled>
     <span id="tlabel">0.0 s</span>
@@ -6352,11 +6381,62 @@ async function addQuake(m,bq){
   if(m.agg) applyAgg(v,m.agg);
   scheduleRebuild(v);
 }
+function simMsg(m){          // EEWの各報（upto/report/final/none/done/error）の受け取り
+      const k=m.k, v=m.v, qk=sim.quakes[m.q]; if(!qk) return;
+      const fin=()=>{ if(!sim.err && !sim.pend && sim.quakes.every(x=>x.eewDone)) $('status').textContent='完了（'+sim.nf+'フレーム／リプレイ可）'; };
+      if(k==='upto'){ qk.eewUpto=v; }
+      else if(k==='report'){ qk.eew.reports.push(v); }
+      else if(k==='final'){ const r=qk.eew.reports.find(x=>x.no===v); if(r) r.final=true; }
+      else if(k==='none'){ qk.eew=null; qk.eewDone=true; fin(); }
+      else if(k==='done'){ qk.eewDone=true; fin(); }
+      else if(k==='error'){ qk.eewDone=true; sim.err=true; $('status').textContent='EEW演算エラー（地震'+(m.q+1)+'）: '+v; }
+}
+
+/* ---------- ②実行中の余震追加（ステートレス）----------
+   再生中に、地図の中心・現在の時刻の少し先に余震を1件足す。地震リストを送り直し、have=すでにある件数 を付けると、
+   サーバーは既存の地震を足すだけ（控えから使い回す）で、新しい1件ぶんだけを送ってくる。再生は、その地震の発生時刻の手前で待つ。 */
+let liveCtl=null;
+async function liveAdd(){
+  const v=sim;
+  if(!v||!v.bq){ $('status').textContent='先にシミュレーションを実行してください'; return; }
+  if(!STREAM_FRAMES){ $('status').textContent='再生中の追加は、逐次計算（STREAM_FRAMES）が有効なときだけ使えます'; return; }
+  if(v.pend>0){ $('status').textContent='直前の追加を計算中です。少し待ってください'; return; }
+  const par=parseInt($('aftParent').value), p=v.quakes[isFinite(par)?par:0];
+  if(!p||p.aft){ $('status').textContent='余震の親にする本震を選んでください'; return; }
+  if(v.bq.filter(q=>q.aft).length>=MAX_AFT){ $('status').textContent='余震は最大'+MAX_AFT+'件までです'; return; }
+  const c=map.getCenter(), r3=x=>Math.round(x*1000)/1000;
+  const mag=aftNum('aftLiveM',Math.max(1,Math.round((p.mag-1.5)*10)/10));
+  const delay=Math.min(MAX_DELAY,Math.ceil(tcur)+3);
+  const nq={lat:r3(c.lat),lon:r3(c.lng),mag:mag,depth:p.depth,delay:delay,aft:true,parent:parseInt($('aftParent').value)||0};
+  const bq=v.bq.concat([nq]); v.bq=bq;
+  AS.push({lat:nq.lat,lon:nq.lon,mag:nq.mag,depth:nq.depth,delay:nq.delay,par:nq.parent}); AS.sort((x,y)=>x.delay-y.delay); syncAft();   // 次回の実行にも含める
+  pendUpdate(v,bq); buildEewCards(bq.length);
+  if(liveCtl) liveCtl.abort(); const ctl=liveCtl=new AbortController();
+  $('status').textContent='余震を計算中…（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）';
+  const undo=msg=>{ if(sim!==v) return; v.bq=v.bq.slice(0,-1); AS=AS.filter(a=>!(a.delay===nq.delay&&a.lat===nq.lat&&a.lon===nq.lon&&a.mag===nq.mag)); syncAft();
+    pendUpdate(v,v.bq); buildEewCards(v.bq.length); $('status').textContent=msg; };
+  try{
+    const r=await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},signal:ctl.signal,
+      body:JSON.stringify({quakes:bq,gz:(typeof DecompressionStream!=='undefined'),mode:v.mode==='sim'?'sim':'monitor',stream:true,have:bq.length-1})});
+    if(!r.ok){ let msg='余震の追加に失敗しました'; try{ msg=(await r.json()).error||msg; }catch(_){} undo(msg); return; }
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    const one=async line=>{ if(sim!==v) return; const m=JSON.parse(line);
+      if(m.k==='fatal') undo(m.v); else if(m.k==='add') await addQuake(m,bq); else simMsg(m); };
+    for(;;){
+      const {value,done}=await rd.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true}); let k;
+      while((k=buf.indexOf('\n'))>=0){ const line=buf.slice(0,k); buf=buf.slice(k+1); if(line.trim()) await one(line); }
+    }
+    if(buf.trim()) await one(buf);
+    if(sim===v&&v.pend===0&&v.bq===bq) $('status').textContent='余震を追加しました（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）';
+  }catch(e){ if(e.name!=='AbortError') undo('通信エラー: '+e); }
+}
+$('aftLive').onclick=liveAdd; $('aftLiveBar').onclick=liveAdd;
 $('run').onclick=async()=>{
   const body={quakes:allQuakes().map(q=>q.aft?{...q,parent:q.par}:q),
               gz:(typeof DecompressionStream!=='undefined'), mode:appMode, stream:STREAM_FRAMES};
   if(!QS.concat(AS).every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
-  if(runCtl) runCtl.abort(); const ctl=runCtl=new AbortController();
+  if(runCtl) runCtl.abort(); if(liveCtl) liveCtl.abort(); const ctl=runCtl=new AbortController();
   $('run').disabled=$('runFab').disabled=true; $('runFab').textContent='計算中…'; $('status').textContent='計算中…'; playing=false; waitFlag=false;
   const handle=async(m)=>{
     if(ctl!==runCtl) return;
@@ -6379,6 +6459,7 @@ $('run').onclick=async()=>{
       tsuSig=''; tsuFitted=false; lastTsu=-1e9; if(tmLayer) tmLayer.clearLayers(); renderBadge();
       simClock0=(clkOrigin!==null&&!sim)?clkOrigin:(clkOrigin!==null?clkNowMs()-tcur*1000:Date.now());
       sim=v; tcur=0; audioReset(); buildEewCards(body.quakes.length); if(STREAM_FRAMES) pendUpdate(v,body.quakes);
+      v.bq=body.quakes.slice();
       $('seek').disabled=false; $('seek').max=v.tsuExt?2000:Math.round(v.tEnd*10); $('seek').value=0; $('tlabel').textContent='0.0 s';
       showResult(v);
       $('status').textContent=v.mode==='sim'?'再生中':'再生中（EEW演算中）';
@@ -6387,16 +6468,7 @@ $('run').onclick=async()=>{
       if(window.innerWidth<=700) $('panel').classList.remove('open');
     }else if(!sim){ return; }
     else if(k==='add'){ await addQuake(m,body.quakes); }
-    else{
-      const qk=sim.quakes[m.q]; if(!qk) return;
-      const fin=()=>{ if(!sim.err && !sim.pend && sim.quakes.every(x=>x.eewDone)) $('status').textContent='完了（'+sim.nf+'フレーム／リプレイ可）'; };
-      if(k==='upto'){ qk.eewUpto=v; }
-      else if(k==='report'){ qk.eew.reports.push(v); }
-      else if(k==='final'){ const r=qk.eew.reports.find(x=>x.no===v); if(r) r.final=true; }
-      else if(k==='none'){ qk.eew=null; qk.eewDone=true; fin(); }
-      else if(k==='done'){ qk.eewDone=true; fin(); }
-      else if(k==='error'){ qk.eewDone=true; sim.err=true; $('status').textContent='EEW演算エラー（地震'+(m.q+1)+'）: '+v; }
-    }
+    else{ simMsg(m); }
   };
   try{
     const r=await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:ctl.signal});
