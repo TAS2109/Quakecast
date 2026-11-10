@@ -4286,6 +4286,7 @@ INDEX_HTML = r"""<!doctype html>
     </details>
     <div class="abtn"><button id="aftGen" class="sec" type="button">余震を生成</button><button id="aftRoll" class="sec" type="button">別の乱数で生成</button></div>
     <div class="abtn"><button id="aftAdd" class="sec" type="button" title="地図の中心に、選んだ本震の余震を1件足します">＋ 1件追加（地図の中心）</button><button id="aftClr" class="sec" type="button">全削除</button></div>
+    <label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:4px 0"><input id="aftAuto" type="checkbox" style="width:auto" title="③再生中、本震の発生に合わせて、上の設定で余震を自動で追加します（事前設定の余震がある本震は対象外）">自動余震モード（上の設定で、再生中に余震を自動追加）</label>
     <div class="abtn"><input id="aftLiveM" type="number" min="0" max="9" step="0.1" placeholder="M（空欄=本震-1.5）" style="width:10em"><button id="aftLive" class="sec" type="button" title="再生中に、地図の中心・現在の時刻に、選んだ本震の余震を1件追加します（②実行中の追加）">⚡ 再生中に1件追加</button></div>
     <div id="aftList"></div>
     <div class="hint">本震ごとに生成します（同じ本震の余震は置き換え）。余震は最大__AFT_MAX__件で、多いほど計算に時間がかかります。生成後は、発生時刻とMを表で直せます（行をクリックで地図が移動）。陸上で震度3未満の余震はEEWを出さず、震度1未満の余震は地震情報にも載せません。</div>
@@ -4956,7 +4957,8 @@ const MU_PMAX=0.2;   // 未入電確率の上限係数（計測震度5.5で0、6
 const muOn=()=>{ const e=document.getElementById('muOn'); return !!(e&&e.checked); };
 let sim=null, Q=null, tcur=0, playing=false, lastTs=0, runCtl=null, waitFlag=false;
 // EEWの演算が追いついていない地震があれば、その地震の確定済み時刻までしか再生しない
-const limT=()=>{ if(!sim) return 0; let lim=sim.tEnd; for(const q of sim.quakes) if(!q.eewDone) lim=Math.min(lim,q.eewUpto||0); if(sim.pend>0) lim=Math.min(lim,sim.pendT); return lim; };
+const limT=()=>{ if(!sim) return 0; let lim=sim.pend>0?Math.max(sim.tEnd,sim.pendT):sim.tEnd;   // 次の余震までの静かな時間は、tEndを越えて進める
+  for(const q of sim.quakes) if(!q.eewDone) lim=Math.min(lim,q.eewUpto||0); if(sim.pend>0) lim=Math.min(lim,sim.pendT); return lim; };
 
 function valuesAt(t){
   const nf=sim.nf; let f=t/sim.dt; if(f<0)f=0; if(f>nf-1)f=nf-1;
@@ -5260,9 +5262,10 @@ function updateObs(m,i,mu){
   eewTxt($('obsA'),ANAMES[AREA[i]]||('区域'+AREA[i]));
 }
 // 地震の数だけ緊急地震速報カードを作る（報の履歴は初期状態で閉じる）
-function buildEewCards(n){
-  const box=$('eewcards'); box.innerHTML=''; eewCards=[]; eewCurs=new Array(n).fill(null);
-  for(let i=0;i<n;i++){
+function buildEewCards(n,keep){      // keep=true: 既存のカードはそのままで、足りない分だけ増やす
+  const box=$('eewcards');
+  if(keep){ while(eewCurs.length<n) eewCurs.push(null); } else { box.innerHTML=''; eewCards=[]; eewCurs=new Array(n).fill(null); }
+  for(let i=keep?eewCards.length:0;i<n;i++){
     const c=document.createElement('div'); c.className='card eewcard lv0'; c.style.display='none'; c._dsp='none';   // 最初のEEW発表まで表示しない
     c.innerHTML='<div class="eh"><span class="ett r-ett">緊急地震速報</span>'
       +'</div>'
@@ -5362,7 +5365,7 @@ function fmtT(t){ if(t<600) return t.toFixed(1)+' s'; const s=Math.floor(t), h=M
   return (h?h+':'+pad2(m):m)+':'+pad2(x); }
 function tToS(t){ if(!sim.tsuExt) return Math.round(t*10);
   if(t<=sim.tSeis) return Math.round(t/sim.tSeis*1000);
-  return Math.round(1000+(t-sim.tSeis)/(sim.tEnd-sim.tSeis)*1000); }
+  return Math.round(1000+(t-sim.tSeis)/Math.max(1e-6,sim.tEnd-sim.tSeis)*1000); }
 function sToT(s){ if(!sim.tsuExt) return s/10;
   if(s<=1000) return s/1000*sim.tSeis;
   return sim.tSeis+(s-1000)/1000*(sim.tEnd-sim.tSeis); }
@@ -6354,6 +6357,7 @@ function qComposite(v,w){
 function pendUpdate(v,bq){
   v.pend=bq.length-v.quakes.length; let m=Infinity;
   for(let i=v.quakes.length;i<bq.length;i++) m=Math.min(m,Math.max(0,Math.round(bq[i].delay)));
+  if(v.auto&&v.auto.q.length){ v.pend+=v.auto.q.length; m=Math.min(m,v.auto.q[0].delay); }     // 自動余震の待ち行列
   v.pendT=m;
 }
 function applyAgg(v,a){
@@ -6395,30 +6399,26 @@ function simMsg(m){          // EEWの各報（upto/report/final/none/done/error
 /* ---------- ②実行中の余震追加（ステートレス）----------
    再生中に、地図の中心・現在の時刻の少し先に余震を1件足す。地震リストを送り直し、have=すでにある件数 を付けると、
    サーバーは既存の地震を足すだけ（控えから使い回す）で、新しい1件ぶんだけを送ってくる。再生は、その地震の発生時刻の手前で待つ。 */
-let liveCtl=null;
-async function liveAdd(){
-  const v=sim;
-  if(!v||!v.bq){ $('status').textContent='先にシミュレーションを実行してください'; return; }
-  if(!STREAM_FRAMES){ $('status').textContent='再生中の追加は、逐次計算（STREAM_FRAMES）が有効なときだけ使えます'; return; }
-  if(v.pend>0){ $('status').textContent='直前の追加を計算中です。少し待ってください'; return; }
-  const par=parseInt($('aftParent').value), p=v.quakes[isFinite(par)?par:0];
-  if(!p||p.aft){ $('status').textContent='余震の親にする本震を選んでください'; return; }
-  if(v.bq.filter(q=>q.aft).length>=MAX_AFT){ $('status').textContent='余震は最大'+MAX_AFT+'件までです'; return; }
-  const c=map.getCenter(), r3=x=>Math.round(x*1000)/1000;
-  const mag=aftNum('aftLiveM',Math.max(1,Math.round((p.mag-1.5)*10)/10));
-  const delay=Math.min(MAX_DELAY,Math.ceil(tcur)+3);
-  const nq={lat:r3(c.lat),lon:r3(c.lng),mag:mag,depth:p.depth,delay:delay,aft:true,parent:parseInt($('aftParent').value)||0};
-  const bq=v.bq.concat([nq]); v.bq=bq;
-  AS.push({lat:nq.lat,lon:nq.lon,mag:nq.mag,depth:nq.depth,delay:nq.delay,par:nq.parent}); AS.sort((x,y)=>x.delay-y.delay); syncAft();   // 次回の実行にも含める
-  pendUpdate(v,bq); buildEewCards(bq.length);
-  if(liveCtl) liveCtl.abort(); const ctl=liveCtl=new AbortController();
-  $('status').textContent='余震を計算中…（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）';
-  const undo=msg=>{ if(sim!==v) return; v.bq=v.bq.slice(0,-1); AS=AS.filter(a=>!(a.delay===nq.delay&&a.lat===nq.lat&&a.lon===nq.lon&&a.mag===nq.mag)); syncAft();
-    pendUpdate(v,v.bq); buildEewCards(v.bq.length); $('status').textContent=msg; };
+let liveCtl=null, liveBusy=false;
+const autoLayer=L.layerGroup().addTo(map);               // 自動余震の震央の印（事前設定の余震は aftLayer）
+const liveInflight=v=>v.bq.length>v.quakes.length;      // サーバーから届くのを待っている地震があるか
+// 地震 nqs（配列）を、再生中の sim に足す。地震リスト全体＋have を送り、新しい分だけを受け取る
+async function liveInject(nqs,opt){
+  const v=sim; if(!v||!v.bq||!nqs.length||liveInflight(v)||liveBusy) return false;
+  liveBusy=true;
+  const n0=v.bq.length, bq=v.bq.concat(nqs); v.bq=bq;
+  if(opt.save){ nqs.forEach(nq=>AS.push({lat:nq.lat,lon:nq.lon,mag:nq.mag,depth:nq.depth,delay:nq.delay,par:nq.parent})); AS.sort((x,y)=>x.delay-y.delay); syncAft(); }   // 次回の実行にも含める
+  else nqs.forEach(nq=>{ L.circleMarker([nq.lat,nq.lon],{radius:4,color:QCOL[nq.parent%QCOL.length],weight:1,fillOpacity:.5,interactive:false}).addTo(autoLayer); });
+  pendUpdate(v,bq); buildEewCards(bq.length,true);
+  const ctl=liveCtl=new AbortController();
+  if(!opt.auto) $('status').textContent=opt.msg||'余震を計算中…';
+  const undo=msg=>{ if(sim!==v) return; v.bq=v.bq.slice(0,n0);
+    if(opt.save){ AS=AS.filter(a=>!nqs.some(q=>q.delay===a.delay&&q.lat===a.lat&&q.lon===a.lon&&q.mag===a.mag)); syncAft(); }
+    pendUpdate(v,v.bq); $('status').textContent=msg; };
   try{
     const r=await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},signal:ctl.signal,
-      body:JSON.stringify({quakes:bq,gz:(typeof DecompressionStream!=='undefined'),mode:v.mode==='sim'?'sim':'monitor',stream:true,have:bq.length-1})});
-    if(!r.ok){ let msg='余震の追加に失敗しました'; try{ msg=(await r.json()).error||msg; }catch(_){} undo(msg); return; }
+      body:JSON.stringify({quakes:bq,gz:(typeof DecompressionStream!=='undefined'),mode:v.mode==='sim'?'sim':'monitor',stream:true,have:n0})});
+    if(!r.ok){ let msg='余震の追加に失敗しました'; try{ msg=(await r.json()).error||msg; }catch(_){} undo(msg); return false; }
     const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
     const one=async line=>{ if(sim!==v) return; const m=JSON.parse(line);
       if(m.k==='fatal') undo(m.v); else if(m.k==='add') await addQuake(m,bq); else simMsg(m); };
@@ -6428,15 +6428,64 @@ async function liveAdd(){
       while((k=buf.indexOf('\n'))>=0){ const line=buf.slice(0,k); buf=buf.slice(k+1); if(line.trim()) await one(line); }
     }
     if(buf.trim()) await one(buf);
-    if(sim===v&&v.pend===0&&v.bq===bq) $('status').textContent='余震を追加しました（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）';
-  }catch(e){ if(e.name!=='AbortError') undo('通信エラー: '+e); }
+    if(!opt.auto&&sim===v&&v.bq===bq) $('status').textContent=opt.done||('余震を'+nqs.length+'件追加しました');
+    return true;
+  }catch(e){ if(e.name!=='AbortError') undo('通信エラー: '+e); return false; }
+  finally{ liveBusy=false; }
+}
+async function liveAdd(){
+  const v=sim;
+  if(!v||!v.bq){ $('status').textContent='先にシミュレーションを実行してください'; return; }
+  if(!STREAM_FRAMES){ $('status').textContent='再生中の追加は、逐次計算（STREAM_FRAMES）が有効なときだけ使えます'; return; }
+  if(liveInflight(v)||liveBusy){ $('status').textContent='直前の追加を計算中です。少し待ってください'; return; }
+  const par=parseInt($('aftParent').value), p=v.quakes[isFinite(par)?par:0];
+  if(!p||p.aft){ $('status').textContent='余震の親にする本震を選んでください'; return; }
+  if(v.bq.filter(q=>q.aft).length>=MAX_AFT){ $('status').textContent='余震は最大'+MAX_AFT+'件までです'; return; }
+  const c=map.getCenter(), r3=x=>Math.round(x*1000)/1000;
+  const mag=aftNum('aftLiveM',Math.max(1,Math.round((p.mag-1.5)*10)/10));
+  const delay=Math.min(MAX_DELAY,Math.ceil(tcur)+3);
+  const nq={lat:r3(c.lat),lon:r3(c.lng),mag:mag,depth:p.depth,delay:delay,aft:true,parent:isFinite(par)?par:0};
+  await liveInject([nq],{save:true,msg:'余震を計算中…（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）',done:'余震を追加しました（M'+mag.toFixed(1)+'・発生 '+delay+' 秒後）'});
 }
 $('aftLive').onclick=liveAdd; $('aftLiveBar').onclick=liveAdd;
+
+/* ---------- ③自動余震モード ----------
+   本震が sim に載ったら、余震パネルの設定で余震列を1回だけ生成して待ち行列に入れる（事前設定の余震がある本震は対象外）。
+   再生が発生時刻に近づいたものを、②と同じ経路（liveInject）でまとめて足す。再生は、次の余震の発生時刻の手前で待つ。
+   乱数のシードは「シード＋本震の番号」。連鎖（余震の余震）は扱わない。 */
+async function autoGenerate(v,i){
+  const p=v.quakes[i];
+  const room=MAX_AFT-v.bq.filter(q=>q.aft).length-v.auto.q.length; if(room<=0) return;
+  const body={parent:{lat:p.lat,lon:p.lon,mag:p.mag,depth:p.depth,delay:p.delay},dM:aftNum('aftDM',1.2),mmin:aftNum('aftMmin',3),minutes:aftNum('aftMin',60),
+    p:aftNum('aftP',1),c:aftNum('aftC',5),b:aftNum('aftB',1),max:Math.min(aftNum('aftMax',MAX_AFT),room),seed:Math.round(aftNum('aftSeed',1))+i};
+  try{
+    const r=await fetch('/api/aftershocks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json(); if(!r.ok||sim!==v) return;
+    j.aftershocks.forEach(a=>v.auto.q.push({lat:a.lat,lon:a.lon,mag:a.mag,depth:a.depth,delay:Math.min(MAX_DELAY,Math.round(a.delay)),aft:true,parent:i}));
+    v.auto.q.sort((x,y)=>x.delay-y.delay); pendUpdate(v,v.bq);
+    if(j.aftershocks.length) $('status').textContent='自動余震: 本震'+(i+1)+'の余震を'+j.aftershocks.length+'件生成しました';
+  }catch(e){}
+}
+function autoAftTick(){
+  const v=sim; if(!v||!v.bq||!STREAM_FRAMES||!$('aftAuto').checked) return;
+  if(!v.auto) v.auto={gen:{},q:[]};
+  v.quakes.forEach((q,i)=>{ if(q.aft||v.auto.gen[i]) return; v.auto.gen[i]=1;
+    if(!AS.some(a=>a.par===i)) autoGenerate(v,i); });
+  if(!v.auto.q.length||liveInflight(v)||liveBusy) return;
+  const horizon=Math.ceil(tcur)+Math.max(20,2*(parseFloat($('speed').value)||1));
+  const room=MAX_AFT-v.bq.filter(q=>q.aft).length, ready=[];
+  while(v.auto.q.length&&v.auto.q[0].delay<=horizon&&ready.length<Math.min(8,room)) ready.push(v.auto.q.shift());
+  if(!v.auto.q.length||room<=0){ if(room<=0) v.auto.q=[]; }
+  if(!ready.length){ pendUpdate(v,v.bq); return; }
+  const t0=Math.ceil(tcur)+2; ready.forEach(q=>{ if(q.delay<t0) q.delay=t0; });     // 計算が間に合わなかった分は、いまの時刻の少し先にずらす
+  liveInject(ready,{save:false,auto:true});
+}
+setInterval(autoAftTick,400);
 $('run').onclick=async()=>{
   const body={quakes:allQuakes().map(q=>q.aft?{...q,parent:q.par}:q),
               gz:(typeof DecompressionStream!=='undefined'), mode:appMode, stream:STREAM_FRAMES};
   if(!QS.concat(AS).every(q=>[q.lat,q.lon,q.mag,q.depth,q.delay].every(isFinite))){ $('status').textContent='入力値を確認してください'; return; }
-  if(runCtl) runCtl.abort(); if(liveCtl) liveCtl.abort(); const ctl=runCtl=new AbortController();
+  if(runCtl) runCtl.abort(); if(liveCtl) liveCtl.abort(); autoLayer.clearLayers(); const ctl=runCtl=new AbortController();
   $('run').disabled=$('runFab').disabled=true; $('runFab').textContent='計算中…'; $('status').textContent='計算中…'; playing=false; waitFlag=false;
   const handle=async(m)=>{
     if(ctl!==runCtl) return;
