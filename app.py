@@ -5404,7 +5404,7 @@ function infoCutT(qk){
     }
   }
   if(!isFinite(v)) return endT+60;                           // 震度1未満などで地震情報が出ない地震: 最後の報の1分後に消す
-  return Math.max(v,endT);                                   // 地震情報が出たあとも、最終報までは表示する
+  return Math.max(v,endT+60);                                // 地震情報が出たあとも、最終報から1分経つまでは表示する
 }
 function updateEewCard(qk,i){
   const C=eewCards[i]; if(!C) return;
