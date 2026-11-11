@@ -1565,6 +1565,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False, occ=None)
     tp_n = tp + rng.normal(0.0, 0.1, N_ST)            # P波ピックの誤差
     amp_noise = rng.normal(0.0, 0.25, N_ST)           # 振幅の観測ノイズ（観測点ごとに固定。続報ごとに引き直すとMが毎回ばらつく）
     po = bool(plum_only)                                # 現在PLUM法のみで発表しているか（分離できたら False に切り替わる）
+    was_plum = None                                     # None: まだ一度もPLUM法のみにしていない / True: PLUM法のみ中 / False: 切り替え済み
     switched = False                                    # この回でPLUM法のみ→通常の推定に切り替えた（直ちに続報を出す）
     mag_s = None                                      # 推定Mの平滑値（報ごとの±0.3〜0.5のばらつきを抑える）
     order = np.argsort(tp_n)
@@ -1600,13 +1601,24 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False, occ=None)
         t_data = T - EEW_DELAY
         avail_all = order[tp_n[order] <= t_data]
         avail = avail_all
+        amp_bad = None                                # 先行地震の揺れが混ざった観測点（振幅を規模の推定に使わない）
         if occ is not None and len(avail_all):
-            # 直前の地震の揺れの最中にP波を検知した観測点は、この地震の検知として使えない（震源・規模の推定から除く）
+            # 先行する地震の揺れの最中にP波を検知した観測点は、この地震の検知として使えない（震源・規模の推定から除く）
             frs = np.minimum(np.floor(np.maximum(tp_n[avail_all], 0.0)).astype(int), occ.shape[0] - 1)
-            avail = avail_all[~occ[frs, avail_all]]
-            if po and not is_last and len(avail) >= EEW_SEP_MIN_ST:
-                po = False                            # 分離できた: 通常の震源推定に切り替える
-                switched = True
+            clean = avail_all[~occ[frs, avail_all]]
+            sep_ok = (len(clean) >= EEW_SEP_MIN_ST and
+                      float(_planar_km(ST_LAT[clean[0]], ST_LON[clean[0]], ST_LAT[clean], ST_LON[clean]).max()) >= EEW_SEP_APERTURE_KM)
+            contam = len(clean) < len(avail_all)
+            if po and sep_ok and not is_last:
+                po = False; was_plum = False; switched = True      # 分離できた: 通常の震源推定に切り替える
+            elif (not po) and was_plum is None and contam and not sep_ok and (last is None or last["plumOnly"]):
+                po = True; was_plum = True                          # 先行地震の揺れと混ざって震源を決められない: PLUM法のみ
+            avail = clean
+            if not po:
+                f_now = min(int(math.floor(t_data)), occ.shape[0] - 1)
+                rows = np.arange(f_now + 1)[:, None]
+                amp_bad = ((occ[:f_now + 1][:, avail] & (rows >= frs[~occ[frs, avail_all]][None, :])).any(axis=0)
+                           if len(avail) else np.zeros(0, dtype=bool))
         if po:
             avail = avail_all
         n = len(avail)
@@ -1636,8 +1648,9 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False, occ=None)
                     lat_e, lon_e, dep_e, t0_e, cost_e = _locate(
                         tp_n[use], ST_LAT[use], ST_LON[use], ST_LAT[unt], ST_LON[unt],
                         t_data, n >= 4, 0.002 if n < 4 else 0.0001)
-                est = _estimate_mag(avail, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
-                                    T - t_first, rng, amp_noise)
+                av_m = avail if amp_bad is None else avail[~amp_bad]      # 先行地震の揺れが混ざった観測点の振幅は使わない
+                est = (_estimate_mag(av_m, tp_n, lat_e, lon_e, dep_e, t0_e, t_data, rt,
+                                     T - t_first, rng, amp_noise) if len(av_m) else None)
                 # 規模がまだ推定できない間（P波検知直後で振幅が得られない）は、仮の固定値を
                 # 発表せず、直前の報の値を引き継ぐ。最初の報は規模が推定できてから発表する。
                 lastn = last if (last is not None and not last["plumOnly"]) else None     # PLUM法の仮定震源（M1.0）は引き継がない
@@ -3076,7 +3089,8 @@ def api_stations():
 MAX_QUAKES = int(os.environ.get("QC_MAX_QUAKES", 60))   # 地震（本震・余震の区別なし）の合計の上限
 MAX_HEAVY = int(os.environ.get("QC_MAX_HEAVY", 10))     # うち AFT_LITE_MAG 以上（軽量化されず、1件ごとにメモリを使う）の上限。M6.5を10件足したときのメモリ約330MB・20件で約550MB（実測）をもとにした、Render無料枠向けの既定値
 EEW_OVERLAP_S = 180.0      # 直前の地震の発生からこの秒数以内、かつ
-EEW_SEP_MIN_ST = 4         # 直前の地震の揺れと分離してP波を検知できた観測点がこの数に達したら、PLUM法のみ → 通常の震源推定に切り替える
+EEW_SEP_MIN_ST = 8         # 先行する地震の揺れと分離してP波を検知できた観測点が、この数以上（かつ下の広がり以上）になったら、PLUM法のみ → 通常の震源推定に切り替える
+EEW_SEP_APERTURE_KM = 30.0  # 分離できた検知点の広がり（最初の点から最も遠い点まで）。固まった少数の点では震源が決まらない
 EEW_OVERLAP_KM = 200.0     # 震央がこの距離以内なら、直前の地震の揺れと混ざって震源を決められず、PLUM法のみで発表する
 
 
@@ -3098,27 +3112,43 @@ def _plum_only_flag(q, quakes, i):
 
 
 
-def _eew_occ(quakes, rts, i):
-    """quakes[i] の EEW が PLUM 法のみで始まる場合の、直前の地震による揺れの占有 (フレーム×観測点, bool)。無ければ None。
-    直前（EEW_OVERLAP_S秒以内・EEW_OVERLAP_KM以内）の地震の、観測点ごとの震度が 0.5 以上（震度1以上）の時刻を、
-    この地震の時間軸にずらして重ねる。rts[j]: 地震jの観測点ごとのリアルタイム震度（フレーム×観測点）"""
+def _eew_shake_win(tp, rt):
+    """地震ごとに、観測点ごとの「この地震の揺れで他の地震のP波が読み取れなくなる区間」(開始, 終了)[自分の時間軸の秒]。
+    開始=P波の到達、終了=震度1以上（0.5以上）の最後のフレーム。震度1に達しない観測点は (inf, -inf)（影響なし）"""
+    hi = np.nan_to_num(rt.astype(np.float32), nan=-9.0, neginf=-9.0, posinf=-9.0) >= 0.5
+    anyhi = hi.any(axis=0)
+    last = hi.shape[0] - 1 - np.argmax(hi[::-1], axis=0)
+    st = np.where(anyhi & np.isfinite(tp), np.floor(np.nan_to_num(tp, nan=1e9, posinf=1e9)), np.inf)
+    en = np.where(anyhi, last.astype(np.float64), -np.inf)
+    return st, en
+
+
+def _eew_win_of(u):
+    """Overlay の1件ぶん（u["core"]）の揺れの区間。1回だけ計算して使い回す"""
+    w = u.get("_win")
+    if w is None:
+        w = u["_win"] = _eew_shake_win(u["core"]["tp"], u["core"]["rt"])
+    return w
+
+
+def _eew_occ(quakes, wins, rt_n, i):
+    """quakes[i] のEEWで、先行する地震（発生が同時かそれ以前）の揺れのためにP波を読み取れない観測点・時刻 (フレーム×観測点, bool)。
+    距離や時間の目安ではなく、実際に先行地震の揺れが観測点にある間（P波到達〜震度1以上が続く間）を重ねる。影響が無ければ None。
+    wins[j]: _eew_shake_win の結果、rt_n: この地震のフレーム数"""
     q = quakes[i]
-    rt_i = rts[i]
     occ = None
+    fr = None
     for j, p in enumerate(quakes):
-        gap = q["delay"] - p["delay"]
-        if j == i or not (0.0 < gap <= EEW_OVERLAP_S):
+        if j == i or p["delay"] > q["delay"] or (p["delay"] == q["delay"] and j > i):
             continue
-        if float(hubeny_km(p["lat"], p["lon"], q["lat"], q["lon"])) > EEW_OVERLAP_KM:
-            continue
-        g = int(round(gap))
-        seg = rts[j][g:g + rt_i.shape[0]]
-        if seg.shape[0] == 0:
-            continue
-        m = np.nan_to_num(seg.astype(np.float32), nan=-9.0, neginf=-9.0, posinf=-9.0) >= 0.5
-        if occ is None:
-            occ = np.zeros((rt_i.shape[0], rt_i.shape[1]), dtype=bool)
-        occ[:m.shape[0]] |= m
+        g = float(q["delay"] - p["delay"])
+        st, en = wins[j]
+        if not (np.isfinite(en).any() and float(en.max()) - g >= 0.0):
+            continue                                   # もう揺れは終わっている
+        if fr is None:
+            fr = np.arange(rt_n, dtype=np.float64)[:, None]
+        m = (fr >= (st - g)[None, :]) & (fr <= (en - g)[None, :])
+        occ = m if occ is None else (occ | m)
     return occ
 
 def _plum_only_flags(quakes):
@@ -3213,8 +3243,8 @@ def _simulate_stream(quakes, gz, monitor, have=0):
             if monitor and not (q.get("aft") and float(u["core"]["m01"][ST_LAND].max()) < AFT_EEW_MIN_M01):
                 c = u["core"]
                 streams[i] = eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], c["tp"], c["rt"], c["t_end"],
-                                        plum_only=plum_flags[i],
-                                        occ=_eew_occ(quakes, [x["core"]["rt"] for x in ov.units], i) if plum_flags[i] else None)
+                                        occ=_eew_occ(quakes, [_eew_win_of(x) for x in ov.units],
+                                                     c["rt"].shape[0], i))
             else:
                 yield dump({"k": "none", "q": i, "v": None})
             for b in pump():                              # 次の地震を計算する合間に、EEWも少し進める
@@ -3280,9 +3310,9 @@ def api_simulate():
         for i in skip:
             yield dump({"k": "none", "q": i, "v": None})
         # 各地震のEEWを交互に1ステップずつ進め、演算できた順に送る（時刻は全体の時間軸へずらす）
-        rts = [c_[1] for c_ in cores]
-        streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end, plum_only=plum_flags[i],
-                                 occ=_eew_occ(quakes, rts, i) if plum_flags[i] else None)
+        wins = [_eew_shake_win(c_[0], c_[1]) for c_ in cores]
+        streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end,
+                                 occ=_eew_occ(quakes, wins, rt.shape[0], i))
                    for i, (q, (tp, rt, t_end)) in enumerate(zip(quakes, cores)) if i not in skip}
         while streams:
             for i in list(streams):
