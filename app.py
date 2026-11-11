@@ -5272,7 +5272,8 @@ function draw(ts){
     if(!clr) updateEew();
     
     if(!clr) sim.quakes.forEach(q=>{                    // 各地震の実際のP波・S波（発生後のみ）
-      const tl=tcur-q.delay; if(tl<0||((q.aft||q.mag<LITE_MAG)&&tl>q.tEnd)) return;      // 余震・小さい地震は、波が日本を通り過ぎたら描かない（多数の円で重くならないように。小さい地震は計算も打ち切っている）
+      const tl=tcur-q.delay; if(tl<0||((q.aft||q.mag<LITE_MAG)&&tl>q.tEnd)) return;
+      if(q.eew&&q.eew.reports.length&&tcur>=infoCutT(q)) return;      // EEWが消えたら、実際のP波・S波の円も消す      // 余震・小さい地震は、波が日本を通り過ぎたら描かない（多数の円で重くならないように。小さい地震は計算も打ち切っている）
       drawCircle(q.lat,q.lon,interp(q.P,tl),'rgba(90,200,255,.95)',1.6);
       drawCircle(q.lat,q.lon,interp(q.S,tl),'rgba(255,95,95,.98)',2.2);
     });
