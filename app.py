@@ -1606,7 +1606,10 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False, occ=None)
             # 先行する地震の揺れの最中にP波を検知した観測点は、この地震の検知として使えない（震源・規模の推定から除く）
             frs = np.minimum(np.floor(np.maximum(tp_n[avail_all], 0.0)).astype(int), occ.shape[0] - 1)
             clean = avail_all[~occ[frs, avail_all]]
-            sep_ok = (len(clean) >= EEW_SEP_MIN_ST and
+            # 分離できた検知点が、震央に近い（P波が早く届いた）観測点を含んでいること。遠方の点だけでは震源が決まらない
+            first_k = avail_all[:EEW_SEP_FIRST_K]
+            near_ok = int((~occ[np.minimum(np.floor(np.maximum(tp_n[first_k], 0.0)).astype(int), occ.shape[0] - 1), first_k]).sum()) >= EEW_SEP_FIRST_MIN
+            sep_ok = (near_ok and len(clean) >= EEW_SEP_MIN_ST and
                       float(_planar_km(ST_LAT[clean[0]], ST_LON[clean[0]], ST_LAT[clean], ST_LON[clean]).max()) >= EEW_SEP_APERTURE_KM)
             contam = len(clean) < len(avail_all)
             if po and sep_ok and not is_last:
@@ -1627,7 +1630,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False, occ=None)
             use = avail[:20] if n <= 20 else np.concatenate(
                 [avail[:20], avail[20:][::max(1, (n - 20) // 40)][:40]])
             mask = np.ones(N_ST, dtype=bool)
-            mask[avail] = False
+            mask[avail_all] = False      # 先行地震の揺れで使えない検知点も「未検知の点」には入れない（P波は届いている。入れると震源がずれる）
             cand = np.where(mask)[0]
             dc = _planar_km(ST_LAT[use[0]], ST_LON[use[0]], ST_LAT[cand], ST_LON[cand])
             unt = cand[np.argsort(dc)[:50]]
@@ -3090,6 +3093,8 @@ MAX_QUAKES = int(os.environ.get("QC_MAX_QUAKES", 60))   # 地震（本震・余�
 MAX_HEAVY = int(os.environ.get("QC_MAX_HEAVY", 10))     # うち AFT_LITE_MAG 以上（軽量化されず、1件ごとにメモリを使う）の上限。M6.5を10件足したときのメモリ約330MB・20件で約550MB（実測）をもとにした、Render無料枠向けの既定値
 EEW_OVERLAP_S = 180.0      # 直前の地震の発生からこの秒数以内、かつ
 EEW_SEP_MIN_ST = 8         # 先行する地震の揺れと分離してP波を検知できた観測点が、この数以上（かつ下の広がり以上）になったら、PLUM法のみ → 通常の震源推定に切り替える
+EEW_SEP_FIRST_K = 10       # 最初に検知した観測点のうち、この数の中に
+EEW_SEP_FIRST_MIN = 4      # 先行地震の揺れに邪魔されていない点が、これ以上あること（震央付近の点が使えないまま震源を決めない）
 EEW_SEP_APERTURE_KM = 30.0  # 分離できた検知点の広がり（最初の点から最も遠い点まで）。固まった少数の点では震源が決まらない
 EEW_OVERLAP_KM = 200.0     # 震央がこの距離以内なら、直前の地震の揺れと混ざって震源を決められず、PLUM法のみで発表する
 
