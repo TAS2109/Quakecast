@@ -5386,16 +5386,24 @@ function eewTitle(i,cur,lvmax){
 // この地震のEEWを消す時刻: EEWの発表が始まったあと、最初に発表される地震情報（震度速報など）の時刻。無ければ消さない
 function infoCutT(qk){
   const info=sim&&sim.info, e=qk.eew; if(!e||!e.reports.length) return Infinity;
-  if(!info) return e.reports[e.reports.length-1].t+60;
-  const t0=e.reports[0].t, c=qk._cut; if(c&&c.info===info&&c.t0===t0) return c.v;
+  const lastR=e.reports[e.reports.length-1];
+  if(!lastR.final && !qk.eewDone) return Infinity;           // 続報が来る間は消さない（最終報より前に消えないように）
+  const endT=lastR.t;                                        // この地震のEEWの最後の報の時刻
   let v=Infinity;
-  for(const g of info.groups){
-    // 地震情報の震源・Mは丸めた値（緯度経度は小数第2位、Mは第1位）なので、丸め誤差ぶんの許容を持たせて照合する（余震は座標が丸まっていない）
-    if(!g.members.some(m=>Math.abs(m.delay-qk.delay)<0.5&&Math.abs(m.lat-qk.lat)<0.0051&&Math.abs(m.lon-qk.lon)<0.0051&&Math.abs(m.mag-qk.mag)<0.051)) continue;
-    for(const r of g.releases) if(r.t>t0&&r.t<v) v=r.t;
+  if(info){
+    const t0=e.reports[0].t, c=qk._cut;
+    if(c&&c.info===info&&c.t0===t0) v=c.v;
+    else{
+      for(const g of info.groups){
+        // 地震情報の震源・Mは丸めた値（緯度経度は小数第2位、Mは第1位）なので、丸め誤差ぶんの許容を持たせて照合する（余震は座標が丸まっていない）
+        if(!g.members.some(m=>Math.abs(m.delay-qk.delay)<0.5&&Math.abs(m.lat-qk.lat)<0.0051&&Math.abs(m.lon-qk.lon)<0.0051&&Math.abs(m.mag-qk.mag)<0.051)) continue;
+        for(const r of g.releases) if(r.t>t0&&r.t<v) v=r.t;
+      }
+      qk._cut={info:info,t0:t0,v:v};
+    }
   }
-  if(!isFinite(v)) v=e.reports[e.reports.length-1].t+60;   // 震度1未満などで地震情報が発表されない地震: 最後の報の1分後に消す
-  qk._cut={info:info,t0:t0,v:v}; return v;
+  if(!isFinite(v)) return endT+60;                           // 震度1未満などで地震情報が出ない地震: 最後の報の1分後に消す
+  return Math.max(v,endT);                                   // 地震情報が出たあとも、最終報までは表示する
 }
 function updateEewCard(qk,i){
   const C=eewCards[i]; if(!C) return;
