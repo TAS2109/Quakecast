@@ -1552,15 +1552,20 @@ def _eew_period(mag, e):
     return 4.0 if mag < 5.5 else (3.0 if mag < 6.5 else 2.0)
 
 
-def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
+def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False, occ=None):
     """緊急地震速報を演算できた順に返すジェネレータ。
     ("upto", T): T秒までの速報は確定 / ("report", 報) / ("final", 報番号) / ("done"|"none", None)
     plum_only=True: 震源・規模を推定せず、PLUM法（観測された揺れ→周囲30km）だけで発表する。
       実際の気象庁も、直前の地震と時間・場所が重なって震源を決められないとき（2022年3月16日の福島県沖M6.1→M7.4）
-      PLUM法のみで発表した。震源要素は「仮定震源要素」で、PLUM法で最初に揺れを検知した観測点の位置・深さ10km・M1.0。"""
+      PLUM法のみで発表した。震源要素は「仮定震源要素」で、PLUM法で最初に揺れを検知した観測点の位置・深さ10km・M1.0。
+    occ: (フレーム×観測点) の bool。直前の地震の揺れ（震度1以上）が続いていて、この地震のP波を読み取れない観測点・時刻。
+      plum_only=True のとき、occ の影響を受けていない観測点のP波検知が4点そろった（＝直前の地震の揺れと分離して震源を推定できる）
+      時点で、PLUM法のみ → 通常の震源推定に切り替える（実際の気象庁も、震源が決まれば通常の報に戻る）。"""
     rng = np.random.default_rng(int(abs(lat0) * 1000 + abs(lon0) * 100 + mag * 10 + depth) % (2 ** 31))
     tp_n = tp + rng.normal(0.0, 0.1, N_ST)            # P波ピックの誤差
     amp_noise = rng.normal(0.0, 0.25, N_ST)           # 振幅の観測ノイズ（観測点ごとに固定。続報ごとに引き直すとMが毎回ばらつく）
+    po = bool(plum_only)                                # 現在PLUM法のみで発表しているか（分離できたら False に切り替わる）
+    switched = False                                    # この回でPLUM法のみ→通常の推定に切り替えた（直ちに続報を出す）
     mag_s = None                                      # 推定Mの平滑値（報ごとの±0.3〜0.5のばらつきを抑える）
     order = np.argsort(tp_n)
     n_fin = int(np.isfinite(tp_n).sum())
@@ -1593,7 +1598,17 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
         step = 1.0 if T < T0 + 60 else (2.0 if T < T0 + 180 else 4.0)
         is_last = (T + step > T_stop)                 # この回が最後 → 最終報
         t_data = T - EEW_DELAY
-        avail = order[tp_n[order] <= t_data]
+        avail_all = order[tp_n[order] <= t_data]
+        avail = avail_all
+        if occ is not None and len(avail_all):
+            # 直前の地震の揺れの最中にP波を検知した観測点は、この地震の検知として使えない（震源・規模の推定から除く）
+            frs = np.minimum(np.floor(np.maximum(tp_n[avail_all], 0.0)).astype(int), occ.shape[0] - 1)
+            avail = avail_all[~occ[frs, avail_all]]
+            if po and not is_last and len(avail) >= EEW_SEP_MIN_ST:
+                po = False                            # 分離できた: 通常の震源推定に切り替える
+                switched = True
+        if po:
+            avail = avail_all
         n = len(avail)
         if n >= 1:
             # 最初の20点＋広く散らばった検知点（開口が広いほど遠地の距離が決まる）
@@ -1604,7 +1619,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
             cand = np.where(mask)[0]
             dc = _planar_km(ST_LAT[use[0]], ST_LON[use[0]], ST_LAT[cand], ST_LON[cand])
             unt = cand[np.argsort(dc)[:50]]
-            if plum_only:
+            if po:
                 # 仮定震源: 最初にP波を検知した陸上観測点の位置・深さ10km・M1.0（最初の検知で固定）
                 if plum_src is None:
                     lnd = [int(k) for k in order if ST_LAND[k]]
@@ -1625,9 +1640,14 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
                                     T - t_first, rng, amp_noise)
                 # 規模がまだ推定できない間（P波検知直後で振幅が得られない）は、仮の固定値を
                 # 発表せず、直前の報の値を引き継ぐ。最初の報は規模が推定できてから発表する。
-                mag_known = (est is not None) or (last is not None)
+                lastn = last if (last is not None and not last["plumOnly"]) else None     # PLUM法の仮定震源（M1.0）は引き継がない
+                if est is None and switched and lastn is None:
+                    if is_last:
+                        po = True; switched = False; continue   # 最終報の回まで規模が推定できなかった: PLUM法のままこの回をやり直し、最終報を出す
+                    T += step; yield ("upto", T - 0.001); continue    # 切り替え直後で規模がまだ推定できない: 次の回に持ち越す（PLUM法の報はここまで）
+                mag_known = (est is not None) or (lastn is not None)
                 if est is None:
-                    mag_e, capped = (last["mag"] if last else 3.0), False
+                    mag_e, capped = (lastn["mag"] if lastn else 3.0), False
                 else:
                     mag_e, capped = est
                     # 規模が成長中（頭打ち）や大きな変化はそのまま採用し、小さな変動は平滑化する
@@ -1639,7 +1659,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
 
             # 推定震源が観測点直下でも式が発散しないよう、震源距離に下限(10km)を設ける
             m01_p, _, _, _ = final_intensity(mag_e, dep_e, lat_e, lon_e, min_x=10.0, anomaly=False)
-            if plum_only:
+            if po:
                 m01_p = np.full(N_ST, -9.0)             # 震源・規模からの予測はしない（PLUM法の予測だけ）
             # 深発地震と推定された場合（気象庁: 深さ150km以上と推定された時点から震度予測を発表しない）:
             # 推定震源・規模からの予想震度は出さない。予想震度を出すのはPLUM法（観測された揺れの周辺30kmへの予測）のみ。
@@ -1658,7 +1678,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
                     m01_p = np.where(upm, pl, m01_p)
                     plum_mask = upm
                     plum_used = bool((pl[upm] >= 3.45).any())   # 震度4以上の予測に効いたときだけ「PLUM報」
-            if plum_only:
+            if po:
                 plum_used = True
             # 警報・特別警報の判定と警報対象地域に使う予測震度（深発地震ではPLUM法の予測のみ）
             m01_w = np.where(plum_mask, m01_p, -9.0) if deep_est else m01_p
@@ -1669,7 +1689,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
             pq_vals = np.where(ST_SEA, -9.0, amx_all[ST_AREA])    # 海域は予想震度の塗りつぶしの対象外
             vmax_e = float(m01_p[ST_LAND].max())
             cls_e, lb_max = shindo_class(vmax_e)
-            if plum_only and vmax_e < 2.5:                    # まだ揺れを観測していない（P波の検知のみ）: 「最大震度3程度以上」
+            if po and vmax_e < 2.5:                    # まだ揺れを観測していない（P波の検知のみ）: 「最大震度3程度以上」
                 cls_e, lb_max, vmax_e = 3, "3", 2.5
             if deep_est and not plum_used:                    # 予想震度なし（M・深さのみ発表）
                 cls_e, lb_max = 0, "－"
@@ -1682,7 +1702,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
                 lv = 1
             else:
                 lv = 0
-            if n == 1 and not plum_only:
+            if n == 1 and not po:
                 lv = min(lv, 1)                       # 1点検知では警報は出さない
             if not mag_known:
                 lv = 0                                # 規模未確定の間は発表しない
@@ -1695,7 +1715,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
                 np.maximum.at(amx, ST_AREA[ST_LAND], m01_w[ST_LAND])
                 de = hubeny_km(lat_e, lon_e, ST_LAT, ST_LON)
                 ts_all = t0_e + np.interp(de, _tt(dep_e)[1], TG, right=600.0)
-                if plum_only:
+                if po:
                     ts_all = np.full(N_ST, np.inf)            # PLUM法には震源がないので主要動の到達予想時刻は出さない
                 ats = np.full(max_a + 1, np.inf)
                 np.minimum.at(ats, ST_AREA[ST_LAND], ts_all[ST_LAND])
@@ -1715,8 +1735,8 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
 
             if lv >= 1:
                 after_peak = is_last                  # 発表終了の目安に達した → 最終報
-                if last is None:
-                    changed = True
+                if last is None or switched:
+                    changed = True                        # 切り替えの回は直ちに続報（震源・規模の推定が始まる）
                 else:
                     # 発表基準: 規模が大きい/成長中、または震源の推定が不確か（検知点が少ない・
                     # 走時残差が大きい）なほど細かく更新。確定的な推定では更新しない。
@@ -1756,7 +1776,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
                             "epiName": epi_name,
                             "lon": round(lon_e, 2), "depth": int(dep_e), "mag": round(mag_e, 1),
                             "nSt": int(n), "t0": round(float(t0_e), 2), "max": round(vmax_e, 1), "maxLabel": lb_max,
-                            "maxCls": cls_e, "plum": bool(plum_used), "plumOnly": bool(plum_only), "deepEst": deep_est, "noInt": bool(deep_est and not plum_used), "lv": lv, "areas": areas, "wtxt": _eew_warn_text(areas), "final": after_peak,
+                            "maxCls": cls_e, "plum": bool(plum_used), "plumOnly": bool(po), "deepEst": deep_est, "noInt": bool(deep_est and not plum_used), "lv": lv, "areas": areas, "wtxt": _eew_warn_text(areas), "final": after_peak,
                             # 観測点ごとの予想震度（×10, int8, base64）: 地図の塗りつぶし用
                             "pq": base64.b64encode(np.clip(np.round(np.nan_to_num(pq_vals, nan=-9.0) * 10.0), -127, 127)
                                                    .astype(np.int8).tobytes()).decode("ascii")}
@@ -1766,6 +1786,7 @@ def eew_stream(mag, depth, lat0, lon0, tp, rt, t_end, plum_only=False):
                     last_sig = sig
                     if after_peak:
                         break
+        switched = False
         T += step
         yield ("upto", T - 0.001)
 
@@ -3055,6 +3076,7 @@ def api_stations():
 MAX_QUAKES = int(os.environ.get("QC_MAX_QUAKES", 60))   # 地震（本震・余震の区別なし）の合計の上限
 MAX_HEAVY = int(os.environ.get("QC_MAX_HEAVY", 10))     # うち AFT_LITE_MAG 以上（軽量化されず、1件ごとにメモリを使う）の上限。M6.5を10件足したときのメモリ約330MB・20件で約550MB（実測）をもとにした、Render無料枠向けの既定値
 EEW_OVERLAP_S = 180.0      # 直前の地震の発生からこの秒数以内、かつ
+EEW_SEP_MIN_ST = 4         # 直前の地震の揺れと分離してP波を検知できた観測点がこの数に達したら、PLUM法のみ → 通常の震源推定に切り替える
 EEW_OVERLAP_KM = 200.0     # 震央がこの距離以内なら、直前の地震の揺れと混ざって震源を決められず、PLUM法のみで発表する
 
 
@@ -3074,6 +3096,30 @@ def _plum_only_flag(q, quakes, i):
                 break
     return bool(f)
 
+
+
+def _eew_occ(quakes, rts, i):
+    """quakes[i] の EEW が PLUM 法のみで始まる場合の、直前の地震による揺れの占有 (フレーム×観測点, bool)。無ければ None。
+    直前（EEW_OVERLAP_S秒以内・EEW_OVERLAP_KM以内）の地震の、観測点ごとの震度が 0.5 以上（震度1以上）の時刻を、
+    この地震の時間軸にずらして重ねる。rts[j]: 地震jの観測点ごとのリアルタイム震度（フレーム×観測点）"""
+    q = quakes[i]
+    rt_i = rts[i]
+    occ = None
+    for j, p in enumerate(quakes):
+        gap = q["delay"] - p["delay"]
+        if j == i or not (0.0 < gap <= EEW_OVERLAP_S):
+            continue
+        if float(hubeny_km(p["lat"], p["lon"], q["lat"], q["lon"])) > EEW_OVERLAP_KM:
+            continue
+        g = int(round(gap))
+        seg = rts[j][g:g + rt_i.shape[0]]
+        if seg.shape[0] == 0:
+            continue
+        m = np.nan_to_num(seg.astype(np.float32), nan=-9.0, neginf=-9.0, posinf=-9.0) >= 0.5
+        if occ is None:
+            occ = np.zeros((rt_i.shape[0], rt_i.shape[1]), dtype=bool)
+        occ[:m.shape[0]] |= m
+    return occ
 
 def _plum_only_flags(quakes):
     return [_plum_only_flag(q, quakes, i) for i, q in enumerate(quakes)]
@@ -3167,7 +3213,8 @@ def _simulate_stream(quakes, gz, monitor, have=0):
             if monitor and not (q.get("aft") and float(u["core"]["m01"][ST_LAND].max()) < AFT_EEW_MIN_M01):
                 c = u["core"]
                 streams[i] = eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], c["tp"], c["rt"], c["t_end"],
-                                        plum_only=plum_flags[i])
+                                        plum_only=plum_flags[i],
+                                        occ=_eew_occ(quakes, [x["core"]["rt"] for x in ov.units], i) if plum_flags[i] else None)
             else:
                 yield dump({"k": "none", "q": i, "v": None})
             for b in pump():                              # 次の地震を計算する合間に、EEWも少し進める
@@ -3190,7 +3237,7 @@ def api_simulate():
         quakes = [{"lat": float(r["lat"]), "lon": float(r["lon"]),
                    "mag": float(r["mag"]), "depth": float(r["depth"]),
                    "delay": float(r.get("delay") or 0.0),
-                   "plum": (None if r.get("plum") is None else bool(r.get("plum"))),
+                   "plum": None,                                  # EEWの方式は常に自動判定（変更不可）
                    "aft": bool(r.get("aft")),                    # 余震（本震とは別枠で数え、小さいものは軽量に計算する）
                    "parent": (int(r["parent"]) if r.get("aft") and r.get("parent") is not None else None)} for r in raw]
     except Exception:
@@ -3233,7 +3280,9 @@ def api_simulate():
         for i in skip:
             yield dump({"k": "none", "q": i, "v": None})
         # 各地震のEEWを交互に1ステップずつ進め、演算できた順に送る（時刻は全体の時間軸へずらす）
-        streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end, plum_only=plum_flags[i])
+        rts = [c_[1] for c_ in cores]
+        streams = {i: eew_stream(q["mag"], q["depth"], q["lat"], q["lon"], tp, rt, t_end, plum_only=plum_flags[i],
+                                 occ=_eew_occ(quakes, rts, i) if plum_flags[i] else None)
                    for i, (q, (tp, rt, t_end)) in enumerate(zip(quakes, cores)) if i not in skip}
         while streams:
             for i in list(streams):
@@ -4323,7 +4372,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px">表示モード <select id="appMode" style="width:auto;flex:1"><option value="monitor" selected>強震モニタ（EEW・津波・地震情報）</option><option value="sim">地震の再現のみ（揺れだけ）</option></select></label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px">強震モニタの稼働時間 <select id="monHours" style="width:auto;flex:1"><option value="0">自動（津波・情報の終了まで）</option><option value="3" selected>3時間</option><option value="6">6時間</option><option value="12">12時間</option><option value="24">24時間</option></select></label>
-  <div class="hint">地震が収まったあとも、強震モニタは画面を消さずに動き続けます。地震のあとの静かな時間は、再生バーの「地震後×」の速度で進みます（再生中に変えても反映されます）。</div>
+  <div class="hint">地震が収まったあとも、強震モニタは画面を消さずに動き続けます。地震のあとの静かな時間も、再生バーの「×」の速度で進みます。既定の「自動」では、地震のあと300秒までは×1、それ以降は×30で進みます（再生中に変えても反映されます）。</div>
   <div class="hint" id="appModeHint" style="display:none">モードを変えたら、もう一度シミュレーションを実行してください。</div>
   <label style="display:flex;align-items:center;gap:6px;margin-top:10px">地図の塗りつぶし <select id="fillMode" style="width:auto;flex:1"><option value="both" selected>警報対象＋予想震度</option><option value="pred">予想震度</option><option value="warn">警報対象範囲</option><option value="off">塗りつぶさない</option></select></label>
   <label style="display:flex;align-items:center;gap:6px;margin-top:6px"><input id="showObs" type="checkbox" style="width:auto"> その時点で観測された最大震度を表示（各観測点の最大値を保持）</label>
@@ -4477,12 +4526,11 @@ INDEX_HTML = r"""<!doctype html>
     <button id="play" title="再生/一時停止">►</button>
     <input id="seek" type="range" min="0" max="0" step="1" value="0" disabled>
     <span id="tlabel">0.0 s</span>
-    <select id="speed" title="再生速度">
-      <option value="0.5">×0.5</option><option value="1" selected>×1</option>
+    <select id="speed" title="再生速度（自動: 地震のあと300秒までは×1、それ以降は×30。固定の速度を選ぶと、いつでもその速度で進みます）">
+      <option value="auto" selected>自動</option>
+      <option value="0.5">×0.5</option><option value="1">×1</option>
       <option value="2">×2</option><option value="5">×5</option><option value="10">×10</option>
-    </select>
-    <select id="tsuSpeed" title="地震動の計算範囲を過ぎた後（地震のあとの静かな時間・津波フェーズ）の再生速度">
-      <option value="1">地震後×1</option><option value="5">地震後×5</option><option value="10">地震後×10</option><option value="30">地震後×30</option><option value="60" selected>地震後×60</option><option value="300">地震後×300</option><option value="1800">地震後×1800</option>
+      <option value="30">×30</option><option value="60">×60</option><option value="300">×300</option><option value="1800">×1800</option>
     </select>
   </div>
   <div id="legend"><canvas id="lgc" width="600" height="12"></canvas>
@@ -4556,7 +4604,7 @@ L.control.layers({'ダーク（Esri）':dark,'ライト（Esri）':light,'衛星
 const MAX_DELAY=__MAX_DELAY_S__, MAX_TOTAL=__MAX_QUAKES__, MAX_HEAVY=__MAX_HEAVY__, LITE_MAG=__LITE_MAG__, MAX_AFT=__AFT_MAX__;   // サーバー設定（QC_MAX_DELAY_S / QC_MAX_QUAKES / QC_MAX_HEAVY / QC_AFT_MAX）に合わせる
 const QCOL=['#ff4d4d','#ffb020','#4dd2ff','#b07bff','#5fe08a'];     // 地震ごとの識別色
 let uidN=0, colN=0;
-const plumOf=o=>(o.plum===true||o.plum===false)?o.plum:null;
+const plumOf=o=>null;                                  // EEWの方式は常に自動（直前に近い地震があればPLUM法のみ）。変更不可
 const mkQ=(o,from,col)=>({lat:o.lat,lon:o.lon,mag:o.mag,depth:o.depth,delay:o.delay,plum:plumOf(o),uid:++uidN,from:(from==null?null:from),col:(col==null?(colN++)%QCOL.length:col)});
 let QS=[mkQ({lat:35.68,lon:139.77,mag:7.0,depth:20,delay:0})], selQ=0;
 const isChild=q=>q.from!=null;
@@ -4627,14 +4675,11 @@ function renderQuakes(){
         +'<div class="row" style="align-items:center"><div style="flex:2.2"><input data-f="magr" type="range" min="0" max="9.9" step="0.1"></div>'
         +'<div><input data-f="mag" type="number" min="0" max="15" step="0.1"></div></div>'
         +'<div class="row"><div><label>震源の深さ（km）</label><input data-f="depth" type="number" min="0" max="699" step="5"></div>'
-        +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="'+MAX_DELAY+'" step="1"></div></div>'
-        +'<label>EEWの方式</label><select data-f="plum"><option value="">自動（直前に近い地震があればPLUM法のみ）</option><option value="0">通常のEEW（震源・規模を推定）</option><option value="1">PLUM法のみ</option></select>';
+        +'<div><label>発生（秒後）</label><input data-f="delay" type="number" min="0" max="'+MAX_DELAY+'" step="1"></div></div>';
       const F=f=>b.querySelector('[data-f="'+f+'"]');
       F('lat').value=q.lat.toFixed(2); F('lon').value=q.lon.toFixed(2);
       F('mag').value=q.mag.toFixed(1); F('magr').value=Math.min(q.mag,9.9);
       F('depth').value=q.depth; F('delay').value=q.delay;
-      F('plum').value=(q.plum===true?'1':(q.plum===false?'0':''));
-      F('plum').addEventListener('change',()=>{ const v=F('plum').value; q.plum=(v===''?null:v==='1'); });
       const num=(f,fn)=>F(f).addEventListener('input',()=>{ const v=parseFloat(F(f).value); if(isFinite(v)) fn(v); });
       num('lat',v=>{ q.lat=clampN(v,-10,70); syncMarkers(); });
       num('lon',v=>{ q.lon=clampN(v,90,180); syncMarkers(); });
@@ -5340,13 +5385,16 @@ function eewTitle(i,cur,lvmax){
 }
 // この地震のEEWを消す時刻: EEWの発表が始まったあと、最初に発表される地震情報（震度速報など）の時刻。無ければ消さない
 function infoCutT(qk){
-  const info=sim&&sim.info, e=qk.eew; if(!info||!e||!e.reports.length) return Infinity;
+  const info=sim&&sim.info, e=qk.eew; if(!e||!e.reports.length) return Infinity;
+  if(!info) return e.reports[e.reports.length-1].t+60;
   const t0=e.reports[0].t, c=qk._cut; if(c&&c.info===info&&c.t0===t0) return c.v;
   let v=Infinity;
   for(const g of info.groups){
-    if(!g.members.some(m=>Math.abs(m.delay-qk.delay)<0.5&&Math.abs(m.lat-qk.lat)<1e-6&&Math.abs(m.lon-qk.lon)<1e-6&&Math.abs(m.mag-qk.mag)<1e-6)) continue;
+    // 地震情報の震源・Mは丸めた値（緯度経度は小数第2位、Mは第1位）なので、丸め誤差ぶんの許容を持たせて照合する（余震は座標が丸まっていない）
+    if(!g.members.some(m=>Math.abs(m.delay-qk.delay)<0.5&&Math.abs(m.lat-qk.lat)<0.0051&&Math.abs(m.lon-qk.lon)<0.0051&&Math.abs(m.mag-qk.mag)<0.051)) continue;
     for(const r of g.releases) if(r.t>t0&&r.t<v) v=r.t;
   }
+  if(!isFinite(v)) v=e.reports[e.reports.length-1].t+60;   // 震度1未満などで地震情報が発表されない地震: 最後の報の1分後に消す
   qk._cut={info:info,t0:t0,v:v}; return v;
 }
 function updateEewCard(qk,i){
@@ -6307,7 +6355,7 @@ function idleSkipSpeed(base,selSp){
   const ev=evTimes(); let nx=Infinity, pv=-Infinity;
   for(const e of ev){ if(e>tcur){ nx=e; break; } pv=e; }
   if(tcur-pv<=15) return selSp;                     // 発表の直後は等倍（内容を読める）
-  if(!isFinite(nx)) return Math.max(selSp,10,base);     // もう発表は無い: 終了まで、地震後の速度（既定×60）で急ぐ
+  if(!isFinite(nx)) return Math.max(selSp,10,base);     // もう発表は無い: 終了まで、地震後の速度（自動では×30）で急ぐ
   const gap=nx-tcur;
   if(gap<=20) return selSp;                         // 次の発表が近い: 等倍
   return Math.max(selSp,(gap-10)/3);                // 発表の約10秒前に着くよう、約3秒で飛ばす
@@ -6317,11 +6365,13 @@ function tick(ts){
     const d=Math.min((ts-lastTs)/1000,0.1);
     const inTsu=tcur>=sim.tSeis;                       // 地震動の計算範囲を過ぎたら津波フェーズの速度で進める
     const lim=limT();                                  // EEWの演算が確定している時刻（これ以降は再生できない）
-    const selSp=parseFloat($('speed').value);
-    const inInfo=inTsu && sim.info && tcur<(sim.info.end0||sim.info.end);     // 震度速報・地震情報の発表が続く間は、津波フェーズでも速度を上げすぎない
-    let speed=inInfo?Math.max(10,selSp*5):(inTsu?parseFloat($('tsuSpeed').value):selSp);
+    const spV=$('speed').value, isAuto=(spV==='auto');
+    const selSp=isAuto?1:parseFloat(spV);              // 自動: 地震動のあいだは等倍
+    let speed=selSp;
     const done=!sim.pend&&lim>=sim.tEnd-0.01;
-    if(inTsu) speed=idleSkipSpeed(speed,selSp);       // 津波の警報等が無い地震: 次の発表までの「何も起きない時間」は飛ばし、発表の前後は等倍で進める
+    if(isAuto&&inTsu){                                 // 自動: 地震のあと300秒は×1、それ以降は×30
+      if(tcur>=sim.tSeis+300){ speed=30; speed=idleSkipSpeed(speed,selSp); }   // 津波の警報等が無い地震: 次の発表までの「何も起きない時間」は飛ばし、発表の前後は等倍で進める
+    }
     if(waitFlag){
       // 演算待ちで止まっている間は、先読みが少し貯まる（または演算完了）まで再開しない。
       // 1フレームごとに止まったり進んだりを繰り返さず、まとめて待ってから滑らかに再生する。
@@ -6565,7 +6615,7 @@ function autoAftTick(){
   v.quakes.forEach((q,i)=>{ if(q.aft||v.auto.gen[i]) return; v.auto.gen[i]=1;
     const b=v.bq[i]; if(b&&!v.bq.some(c=>c.from===b.uid&&!c.auto)) autoGenerate(v,i); });
   if(!v.auto.q.length||liveInflight(v)||liveBusy) return;
-  const horizon=Math.ceil(tcur)+Math.max(20,2*(parseFloat($('speed').value)||1));
+  const horizon=Math.ceil(tcur)+Math.max(20,2*(($('speed').value==='auto'?30:parseFloat($('speed').value))||1));
   const room=MAX_TOTAL-v.bq.length, roomH=MAX_HEAVY-heavyN(v.bq), ready=[]; let hh=0;
   while(v.auto.q.length&&v.auto.q[0].delay<=horizon&&ready.length<Math.min(8,room)){
     const q=v.auto.q.shift(); if(q.mag>=LITE_MAG){ if(hh>=roomH) continue; hh++; } ready.push(q); }
